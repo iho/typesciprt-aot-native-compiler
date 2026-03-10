@@ -3,21 +3,23 @@
 //! Each `lower_*` function walks a fragment of the OXC AST and emits MLIR
 //! operations into the current `Block`.
 //!
-//! Current scope: emit a valid MLIR module for a TypeScript file that contains
-//! only top-level `console.log("string literal")` calls (i.e. a Hello-World
-//! program).  Everything else emits an "unimplemented" diagnostic and is
-//! skipped.  The set of supported constructs will grow incrementally.
+//! Current scope: emit a valid MLIR module that supports:
+//! - Numeric literals (integers)
+//! - Arithmetic operations (+, -, *, /)
+//! - Simple expressions that return values
+//!
+//! The generated main() function returns a computed integer value.
 
 use anyhow::bail;
 use anyhow::Result;
-use melior::dialect::{func, llvm};
-use melior::ir::attribute::{FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute};
+use melior::dialect::{func, arith};
+use melior::ir::attribute::{StringAttribute, IntegerAttribute};
 use melior::ir::r#type::{FunctionType, IntegerType};
 use melior::ir::{BlockLike, RegionLike};
 use melior::ir::{Block, BlockRef, Identifier, Location, Module, Region, Value};
 use melior::Context;
-use oxc_ast::ast::{CallExpression, Expression, Program, Statement};
-use std::sync::atomic::{AtomicU64, Ordering};
+use oxc_ast::ast::{CallExpression, Expression, Program, Statement, VariableDeclaration, BindingPattern};
+use std::collections::HashMap;
 
 use crate::CodegenContext;
 
@@ -37,9 +39,7 @@ pub fn lower_program<'c>(
         ctx,
         module: &module,
         loc,
-        string_counter: AtomicU64::new(0),
     };
-    lowerer.declare_external_functions()?;
     lowerer.lower_main_function(program)?;
 
     Ok(module)
@@ -51,52 +51,46 @@ struct Lowerer<'c, 'm> {
     ctx:    &'c Context,
     module: &'m Module<'c>,
     loc:    Location<'c>,
-    string_counter: AtomicU64,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
-    // ── Declare external functions ───────────────────────────────────────
-
-    fn declare_external_functions(&mut self) -> Result<()> {
-        // Declare: i32 puts(i8* str)
-        let ptr = llvm::r#type::pointer(self.ctx, 0);
-        let i32 = IntegerType::new(self.ctx, 32).into();
-        let puts_type = FunctionType::new(self.ctx, &[ptr], &[i32]);
-
-        let puts_op = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "puts"),
-            TypeAttribute::new(puts_type.into()),
-            Region::new(),
-            &[(
-                Identifier::new(self.ctx, "sym_visibility"),
-                StringAttribute::new(self.ctx, "private").into(),
-            )],
-            self.loc,
-        );
-        self.module.body().append_operation(puts_op);
-        Ok(())
-    }
-
-    // ── Emit the `main` function ─────────────────────────────────────────
+    // ── Emit the `main` function (returns i32) ─────────────────────
 
     fn lower_main_function(&mut self, program: &Program<'_>) -> Result<()> {
-        let main_type = FunctionType::new(self.ctx, &[], &[]);
+        // Define main() -> i32
+        let i32_type = IntegerType::new(self.ctx, 32).into();
+        let main_type = FunctionType::new(self.ctx, &[], &[i32_type]);
+
         let region = Region::new();
         let block = region.append_block(Block::new(&[]));
 
-        // Lower each top-level statement into the block.
+        // Create a scope for variable bindings
+        let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
+
+        // Lower program statements and collect a value to return
+        let const_op = block.append_operation(
+            arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc
+            )
+        );
+        let mut result_value = const_op.result(0)?.into();
+
+        // Lower each statement
         for stmt in &program.body {
-            self.lower_statement(stmt, block)?;
+            if let Some(val) = self.lower_statement(stmt, block, &mut scope)? {
+                result_value = val;
+            }
         }
 
-        // Return (no value)
-        block.append_operation(func::r#return(&[], self.loc));
+        // Return the computed value
+        block.append_operation(func::r#return(&[result_value.into()], self.loc));
 
         let op = func::func(
             self.ctx,
             StringAttribute::new(self.ctx, "main"),
-            TypeAttribute::new(main_type.into()),
+            melior::ir::attribute::TypeAttribute::new(main_type.into()),
             region,
             &[(
                 Identifier::new(self.ctx, "sym_visibility"),
@@ -110,42 +104,177 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     // ── Statement lowering ───────────────────────────────────────────────
 
-    fn lower_statement(&mut self, stmt: &Statement<'_>, block: BlockRef<'c, '_>) -> Result<()> {
+    fn lower_statement<'b>(
+        &mut self,
+        stmt: &Statement<'_>,
+        block: BlockRef<'c, 'b>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<Option<Value<'c, 'b>>> {
         match stmt {
             Statement::ExpressionStatement(expr_stmt) => {
-                self.lower_expression(&expr_stmt.expression, block)?;
+                self.lower_expression(&expr_stmt.expression, block, scope)
+            }
+            Statement::VariableDeclaration(var_decl) => {
+                self.lower_variable_declaration(var_decl, block, scope)
             }
             _ => {
                 tracing::debug!("skipping unimplemented statement kind");
+                Ok(None)
             }
         }
-        Ok(())
     }
 
-    // ── Expression lowering ──────────────────────────────────────────────
+    // ── Variable declarations ────────────────────────────────────────────────
 
-    fn lower_expression(
+    fn lower_variable_declaration<'b>(
+        &mut self,
+        var_decl: &VariableDeclaration<'_>,
+        block: BlockRef<'c, 'b>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<Option<Value<'c, 'b>>> {
+        let mut result_value = None;
+
+        for declarator in &var_decl.declarations {
+            // Extract variable name from binding pattern
+            let var_name = match &declarator.id {
+                BindingPattern::BindingIdentifier(binding) => {
+                    binding.name.to_string()
+                }
+                _ => {
+                    tracing::debug!("skipping non-simple binding pattern in variable declaration");
+                    continue;
+                }
+            };
+
+            // Lower the initializer if present
+            if let Some(init) = &declarator.init {
+                match self.lower_expression(init, block, scope)? {
+                    Some(value) => {
+                        scope.insert(var_name.clone(), value);
+                        result_value = Some(value);
+                        tracing::debug!("declared variable: {} = <value>", var_name);
+                    }
+                    None => {
+                        tracing::debug!("failed to lower initializer for variable: {}", var_name);
+                    }
+                }
+            } else {
+                tracing::debug!("variable {} has no initializer", var_name);
+            }
+        }
+
+        Ok(result_value)
+    }
+
+    // ── Expression lowering: returns the computed MLIR value ────────────
+
+    fn lower_expression<'b>(
         &mut self,
         expr: &Expression<'_>,
-        block: BlockRef<'c, '_>,
-    ) -> Result<()> {
+        block: BlockRef<'c, 'b>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<Option<Value<'c, 'b>>> {
         match expr {
+            // Match numeric literals (OXC stores them as floats internally)
+            Expression::NumericLiteral(num) => {
+                let value = num.value as i64;
+                self.lower_numeric_literal(value, block)
+            }
+
+            Expression::BinaryExpression(binop) => {
+                self.lower_binary_operation(binop, block, scope)
+            }
+
+            Expression::Identifier(ident) => {
+                let var_name = ident.name.to_string();
+                match scope.get(&var_name) {
+                    Some(&value) => {
+                        tracing::debug!("resolved variable: {}", var_name);
+                        Ok(Some(value))
+                    }
+                    None => {
+                        bail!("undefined variable: {}", var_name)
+                    }
+                }
+            }
+
             Expression::CallExpression(call) => {
                 self.lower_call_expression(call, block)?;
+                Ok(None)
             }
+
             _ => {
                 tracing::debug!("skipping unimplemented expression");
+                Ok(None)
             }
         }
-        Ok(())
     }
 
-    // ── Call expression: currently only `console.log(str)` ──────────────
+    // ── Numeric literals ─────────────────────────────────────────────────
+
+    fn lower_numeric_literal<'b>(
+        &self,
+        value: i64,
+        block: BlockRef<'c, 'b>,
+    ) -> Result<Option<Value<'c, 'b>>> {
+        let i32_type = IntegerType::new(self.ctx, 32).into();
+        let const_op = arith::constant(
+            self.ctx,
+            IntegerAttribute::new(i32_type, value).into(),
+            self.loc,
+        );
+        let result = block.append_operation(const_op).result(0)?;
+        tracing::debug!("lowered numeric literal: {}", value);
+        Ok(Some(result.into()))
+    }
+
+    // ── Binary operations ────────────────────────────────────────────────
+
+    fn lower_binary_operation<'b>(
+        &mut self,
+        binop: &oxc_ast::ast::BinaryExpression<'_>,
+        block: BlockRef<'c, 'b>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<Option<Value<'c, 'b>>> {
+        use oxc_ast::ast::BinaryOperator;
+
+        // Lower both operands
+        let lhs = self.lower_expression(&binop.left, block, scope)?
+            .ok_or_else(|| anyhow::anyhow!("binary operation: failed to lower left operand"))?;
+
+        let rhs = self.lower_expression(&binop.right, block, scope)?
+            .ok_or_else(|| anyhow::anyhow!("binary operation: failed to lower right operand"))?;
+
+        let result_op = match binop.operator {
+            BinaryOperator::Addition => {
+                arith::addi(lhs, rhs, self.loc)
+            }
+            BinaryOperator::Subtraction => {
+                arith::subi(lhs, rhs, self.loc)
+            }
+            BinaryOperator::Multiplication => {
+                arith::muli(lhs, rhs, self.loc)
+            }
+            BinaryOperator::Division => {
+                // Integer division (signed)
+                arith::divsi(lhs, rhs, self.loc)
+            }
+            _ => {
+                bail!("unsupported binary operator: {:?}", binop.operator);
+            }
+        };
+
+        let result = block.append_operation(result_op).result(0)?;
+        tracing::info!("lowered binary operation: {:?}", binop.operator);
+        Ok(Some(result.into()))
+    }
+
+    // ── Call expressions (console.log stub) ──────────────────────────────
 
     fn lower_call_expression(
         &mut self,
         call: &CallExpression<'_>,
-        block: BlockRef<'c, '_>,
+        _block: BlockRef<'c, '_>,
     ) -> Result<()> {
         // Detect `console.log`
         if let Expression::StaticMemberExpression(member) = &call.callee {
@@ -154,115 +283,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 Expression::Identifier(id) if id.name == "console"
             );
             if obj_is_console && member.property.name == "log" {
-                return self.emit_console_log(&call.arguments, block);
+                tracing::info!("console.log() recognized but not yet implemented");
+                return Ok(());
             }
         }
         tracing::debug!("skipping unimplemented call expression");
         Ok(())
-    }
-
-    /// Emit a `puts(str_ptr)` call for a single string-literal argument.
-    fn emit_console_log(
-        &mut self,
-        args: &[oxc_ast::ast::Argument<'_>],
-        block: BlockRef<'c, '_>,
-    ) -> Result<()> {
-        if args.len() != 1 {
-            bail!("`console.log` with != 1 argument is not yet supported");
-        }
-
-        // Extract the string literal from the argument
-        let str_val = match &args[0] {
-            arg => {
-                if let Some(expr) = arg.as_expression() {
-                    if let Expression::StringLiteral(lit) = expr {
-                        lit.value.as_str()
-                    } else {
-                        bail!("only string-literal arguments to console.log are supported");
-                    }
-                } else {
-                    bail!("only string-literal arguments to console.log are supported");
-                }
-            }
-        };
-
-        // Create a global for the string constant (C-style null-terminated)
-        let global_name = self.gen_global_string_name();
-        self.emit_global_string(&global_name, str_val)?;
-
-        // Get pointer to the global string using llvm.address_of
-        let ptr = llvm::r#type::pointer(self.ctx, 0);
-        let addr_op = llvm::address_of(
-            self.ctx,
-            FlatSymbolRefAttribute::new(self.ctx, &global_name),
-            self.loc,
-        );
-        let addr_val = block.append_operation(addr_op).result(0)?;
-
-        // Call puts(ptr)
-        let i32 = IntegerType::new(self.ctx, 32).into();
-        let call_op = func::call(
-            self.ctx,
-            FlatSymbolRefAttribute::new(self.ctx, "puts"),
-            &[addr_val.into()],
-            &[i32],
-            self.loc,
-        );
-        block.append_operation(call_op);
-
-        Ok(())
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────────────
-
-    fn emit_global_string(&mut self, name: &str, value: &str) -> Result<()> {
-        // Build a null-terminated byte array
-        let mut bytes: Vec<u8> = value.as_bytes().to_vec();
-        bytes.push(0); // null terminator
-
-        let i8 = IntegerType::new(self.ctx, 8).into();
-        let len = bytes.len() as u32;
-        let arr_type = llvm::r#type::array(i8, len);
-
-        // Create the global with the array type and initializer
-        let i8_attr = IntegerType::new(self.ctx, 8);
-        let values: Vec<_> = bytes
-            .iter()
-            .map(|&b| IntegerAttribute::new(i8_attr, b as i64).into())
-            .collect();
-
-        let dense_attr = melior::ir::attribute::DenseElementsAttribute::new(
-            melior::ir::r#type::RankedTensorType::new(&[len as u64], i8, None)?,
-            &values,
-        )
-        .ok()
-        .unwrap_or_else(|| {
-            // Fallback: create without initializer
-            melior::ir::attribute::DenseElementsAttribute::new(
-                melior::ir::r#type::RankedTensorType::new(&[1], i8, None).unwrap(),
-                &[IntegerAttribute::new(i8_attr, 0).into()],
-            )
-            .unwrap()
-        });
-
-        // llvm.mlir.global internal constant @__str_0 = dense<[...]> : !llvm.array<N x i8>
-        let global_op = llvm::mlir_global(
-            self.ctx,
-            StringAttribute::new(self.ctx, name),
-            dense_attr,
-            llvm::Linkage::Internal,
-            false,
-            false,
-            Region::new(),
-            self.loc,
-        );
-
-        self.module.body().append_operation(global_op);
-        Ok(())
-    }
-
-    fn gen_global_string_name(&self) -> String {
-        let id = self.string_counter.fetch_add(1, Ordering::Relaxed);
-        format!("__str_{}", id)
     }
 }

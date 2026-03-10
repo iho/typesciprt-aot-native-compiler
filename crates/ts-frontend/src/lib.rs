@@ -64,6 +64,8 @@ pub fn parse_typescript<'src>(
             messages,
         });
     }
+    dbg!("parsed {file_name} successfully");
+    dbg!("AST root: {program:#?}");
 
     Ok(program)
 }
