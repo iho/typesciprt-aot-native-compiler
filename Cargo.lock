@@ -1076,6 +1076,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "melior",
+ "oxc_allocator",
  "oxc_ast",
  "oxc_span",
  "thiserror",

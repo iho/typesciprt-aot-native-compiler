@@ -13,6 +13,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::BinaryOperator;
 
+        // `instanceof` — rhs is always a class-name identifier, not a runtime value;
+        // lower only the lhs so we don't error on "undefined variable: Dog".
+        if binop.operator == BinaryOperator::Instanceof {
+            return self.lower_instanceof(binop, block, region, scope);
+        }
+
         let (lhs_opt, nb) = self.lower_expression(&binop.left, block, region, scope)?;
         block = nb;
         let lhs = lhs_opt
@@ -22,23 +28,54 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let rhs = rhs_opt
             .ok_or_else(|| anyhow::anyhow!("binary op: no right value"))?;
 
-        // Polymorphic + (String concatenation)
-        if binop.operator == BinaryOperator::Addition && lhs.r#type() == self.i64_type() && rhs.r#type() == self.i64_type() {
+        // Polymorphic + : runtime dispatch via ts_add (integer add or string concat).
+        if binop.operator == BinaryOperator::Addition
+            && (lhs.r#type() == self.i64_type() || rhs.r#type() == self.i64_type())
+        {
+            let lhs_i64 = self.ensure_i64(lhs, block)?;
+            let rhs_i64 = self.ensure_i64(rhs, block)?;
             let res: Value<'c, 'b> = block
                 .append_operation(func::call(
                     self.ctx,
-                    FlatSymbolRefAttribute::new(self.ctx, "ts_string_concat"),
-                    &[lhs, rhs],
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_add"),
+                    &[lhs_i64, rhs_i64],
                     &[self.i64_type()],
                     self.loc,
                 ))
-                .result(0)?
-                .into();
-            
-            // ARC: Release operands.
-            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs], &[], self.loc));
-            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs], &[], self.loc));
-            
+                .result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+            return Ok((Some(res), block));
+        }
+
+        // Equality / inequality on TsVal (i64) must use runtime dispatch to handle
+        // string content comparison (two equal strings have different heap addresses).
+        let is_eq_op = matches!(binop.operator,
+            BinaryOperator::Equality | BinaryOperator::StrictEquality |
+            BinaryOperator::Inequality | BinaryOperator::StrictInequality);
+        if is_eq_op && (lhs.r#type() == self.i64_type() || rhs.r#type() == self.i64_type()) {
+            let lhs_i64 = self.ensure_i64(lhs, block)?;
+            let rhs_i64 = self.ensure_i64(rhs, block)?;
+            let eq_i32: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_val_strict_eq"),
+                &[lhs_i64, rhs_i64],
+                &[self.i32_type()],
+                self.loc,
+            )).result(0)?.into();
+            let zero_i32: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
+            )).result(0)?.into();
+            let pred = if matches!(binop.operator,
+                BinaryOperator::Inequality | BinaryOperator::StrictInequality)
+            { arith::CmpiPredicate::Eq } else { arith::CmpiPredicate::Ne };
+            // Ne → eq_i32 != 0 → true; Eq → eq_i32 == 0 → false when using Eq pred for !=
+            // Simpler: for == use Ne(eq,0), for != use Eq(eq,0)
+            let res = block.append_operation(arith::cmpi(
+                self.ctx, pred, eq_i32, zero_i32, self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
             return Ok((Some(res), block));
         }
 
@@ -69,6 +106,89 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
 
         Ok((Some(res), block))
+    }
+
+    // ── instanceof ────────────────────────────────────────────────────────
+
+    fn lower_instanceof<'b>(
+        &mut self,
+        binop: &BinaryExpression<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let Expression::Identifier(class_id) = &binop.right else {
+            bail!("instanceof: right-hand side must be a class name identifier");
+        };
+        let target = class_id.name.to_string();
+
+        // Lower lhs only (rhs is a compile-time class name).
+        let (lhs_opt, nb) = self.lower_expression(&binop.left, block, region, scope)?;
+        block = nb;
+        let lhs = lhs_opt.ok_or_else(|| anyhow::anyhow!("instanceof: lhs produced no value"))?;
+        let lhs_i64 = self.ensure_i64(lhs, block)?;
+
+        // Read __class__ string from the object.
+        let class_key_ptr = self.get_string_ptr("__class__", block)?;
+        let class_val: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+            &[lhs_i64, class_key_ptr],
+            &[self.i64_type()],
+            self.loc,
+        )).result(0)?.into();
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[lhs_i64], &[], self.loc,
+        ));
+
+        // Build the set of class names that satisfy `instanceof target`
+        // (target itself + all classes that transitively extend target).
+        let matching: Vec<String> = {
+            let all: Vec<String> = self.classes.keys().cloned().collect();
+            let mut m: Vec<String> = all.into_iter()
+                .filter(|n| self.is_subclass_of(n, &target))
+                .collect();
+            // If target is unknown (e.g. built-in), still check it directly.
+            if m.is_empty() { m.push(target.clone()); }
+            m
+        };
+
+        // OR-chain: result |= (class_val === "ClassName") for each matching name.
+        let zero_i32: Value<'c, 'b> = block.append_operation(arith::constant(
+            self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
+        )).result(0)?.into();
+        let mut result_i32 = zero_i32;
+
+        for class_name in &matching {
+            let target_str = self.lower_string_literal(class_name, block)?;
+            let eq: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_val_strict_eq"),
+                &[class_val, target_str],
+                &[self.i32_type()],
+                self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[target_str], &[], self.loc,
+            ));
+            result_i32 = block.append_operation(
+                arith::ori(result_i32, eq, self.loc)
+            ).result(0)?.into();
+        }
+
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[class_val], &[], self.loc,
+        ));
+
+        // Convert i32 result to i1 boolean.
+        let is_instance: Value<'c, 'b> = block.append_operation(arith::cmpi(
+            self.ctx, arith::CmpiPredicate::Ne, result_i32, zero_i32, self.loc,
+        )).result(0)?.into();
+
+        Ok((Some(is_instance), block))
     }
 
 
@@ -185,6 +305,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block = nb;
         let operand = operand_opt
             .ok_or_else(|| anyhow::anyhow!("unary op: no operand"))?;
+
+        // `typeof` — handled before the generic ARC-release path below.
+        if unary.operator == UnaryOperator::Typeof {
+            let val_i64 = self.ensure_i64(operand, block)?;
+            let result: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_typeof"),
+                &[val_i64],
+                &[self.i64_type()],
+                self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[val_i64], &[], self.loc,
+            ));
+            return Ok((Some(result), block));
+        }
 
         let res = match unary.operator {
             UnaryOperator::UnaryNegation => {
@@ -353,6 +491,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             AssignmentTarget::ComputedMemberExpression(m) => {
                 self.lower_computed_member_assignment(&**m, assign.operator, rhs, block, region, scope)
             }
+            AssignmentTarget::PrivateFieldExpression(priv_member) => {
+                self.lower_private_field_assignment(&**priv_member, assign.operator, rhs, block, region, scope)
+            }
             _ => bail!("unsupported assignment target: {:?}", assign.left),
         }
     }
@@ -375,8 +516,43 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block = nb;
         let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("member assignment: object produced no value"))?;
         let obj_i64 = self.ensure_i64(obj, block)?;
-        
-        let key_ptr = self.get_string_ptr(&member.property.name, block)?;
+
+        // Check for setter dispatch
+        let prop_name = member.property.name.to_string();
+        let setter_mangled: Option<String> = if let Expression::Identifier(id) = &member.object {
+            self.var_class_types.get(id.name.as_str())
+                .cloned()
+                .and_then(|cn| {
+                    self.classes.get(&cn).and_then(|sig| {
+                        if sig.setters.contains(&prop_name) {
+                            Some(format!("__class_{}_set_{}", cn, prop_name))
+                        } else {
+                            None
+                        }
+                    })
+                })
+        } else {
+            None
+        };
+
+        if let Some(setter_name) = setter_mangled {
+            let val_i64 = self.ensure_i64(rhs, block)?;
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, &setter_name),
+                &[obj_i64, val_i64],
+                &[self.i64_type()],
+                self.loc,
+            ));
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[obj_i64], &[], self.loc,
+            ));
+            return Ok((Some(rhs), block));
+        }
+
+        let key_ptr = self.get_string_ptr(&prop_name, block)?;
         let val_i64 = self.ensure_i64(rhs, block)?;
 
         // ts_obj_set(obj, key, val)
@@ -387,10 +563,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             &[],
             self.loc,
         ));
-        
+
         // ARC: release obj after ts_obj_set
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
-        
+
         Ok((Some(rhs), block))
     }
 
@@ -433,6 +609,40 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let idx_i64 = self.ensure_i64(idx, block)?;
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[idx_i64], &[], self.loc));
 
+        Ok((Some(rhs), block))
+    }
+
+    fn lower_private_field_assignment<'b>(
+        &mut self,
+        member: &oxc_ast::ast::PrivateFieldExpression<'_>,
+        operator: oxc_ast::ast::AssignmentOperator,
+        rhs: Value<'c, 'b>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        use oxc_ast::ast::AssignmentOperator;
+        if operator != AssignmentOperator::Assign {
+            bail!("compound assignment to private fields is not supported");
+        }
+        let field_key = format!("__priv_{}", member.field.name.as_str());
+        let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+        block = nb;
+        let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("private field assignment: object produced no value"))?;
+        let obj_i64 = self.ensure_i64(obj, block)?;
+        let key_ptr = self.get_string_ptr(&field_key, block)?;
+        let val_i64 = self.ensure_i64(rhs, block)?;
+        block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+            &[obj_i64, key_ptr, val_i64],
+            &[], self.loc,
+        ));
+        block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[obj_i64], &[], self.loc,
+        ));
         Ok((Some(rhs), block))
     }
 }

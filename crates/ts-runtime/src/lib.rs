@@ -9,6 +9,7 @@
 
 pub mod alloc;
 pub mod console;
+pub mod exceptions;
 pub mod string;
 pub mod value;
 

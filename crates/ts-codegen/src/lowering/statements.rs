@@ -155,8 +155,53 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     bail!("continue statement outside of loop");
                 }
             }
+            Statement::ThrowStatement(throw) => {
+                self.lower_throw_statement(throw, block, region, scope)
+            }
+            Statement::TryStatement(try_stmt) => {
+                self.lower_try_statement(try_stmt, block, region, scope, loops)
+            }
             Statement::ClassDeclaration(_) => {
                 Ok((None, block)) // Already lowered in the dedicated pass.
+            }
+            Statement::TSInterfaceDeclaration(_)
+            | Statement::TSTypeAliasDeclaration(_)
+            | Statement::TSModuleDeclaration(_) => {
+                Ok((None, block)) // pure type information, no runtime representation
+            }
+            Statement::TSEnumDeclaration(enum_decl) => {
+                self.lower_enum_declaration(enum_decl, block, region, scope)
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(decl) = &export.declaration {
+                    match decl {
+                        Declaration::FunctionDeclaration(_) | Declaration::ClassDeclaration(_) => {
+                            Ok((None, block)) // already handled in hoisting passes
+                        }
+                        Declaration::VariableDeclaration(vd) => {
+                            self.lower_variable_declaration(vd, block, region, scope)
+                        }
+                        Declaration::TSEnumDeclaration(enum_decl) => {
+                            self.lower_enum_declaration(enum_decl, block, region, scope)
+                        }
+                        _ => Ok((None, block)),
+                    }
+                } else {
+                    Ok((None, block))
+                }
+            }
+            Statement::ExportDefaultDeclaration(export) => {
+                use oxc_ast::ast::ExportDefaultDeclarationKind;
+                match &export.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(_)
+                    | ExportDefaultDeclarationKind::ClassDeclaration(_) => {
+                        Ok((None, block)) // already handled in hoisting passes
+                    }
+                    _ => Ok((None, block)),
+                }
+            }
+            Statement::ImportDeclaration(_) => {
+                Ok((None, block)) // handled in the import pre-pass in lower_program
             }
             _ => {
                 tracing::debug!("skipping unimplemented statement kind");
@@ -216,6 +261,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 IntegerAttribute::new(self.i32_type(), 0).into(),
                 self.loc,
             )).result(0)?.into()
+        };
+
+        // For async functions, wrap the return value in a resolved Promise.
+        let val = if self.is_async {
+            let val_i64 = self.ensure_i64(val, block)?;
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
+                &[val_i64],
+                &[self.i64_type()],
+                self.loc,
+            )).result(0)?.into()
+        } else {
+            val
         };
 
         // ARC: Release all variables in the current scope before returning.
@@ -454,6 +513,210 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         Ok((None, exit_block))
+    }
+
+    // ── throw statement ───────────────────────────────────────────────────
+
+    pub(super) fn lower_throw_statement<'b>(
+        &mut self,
+        throw: &oxc_ast::ast::ThrowStatement<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let (val_opt, nb) = self.lower_expression(&throw.argument, block, region, scope)?;
+        block = nb;
+        let val = val_opt.ok_or_else(|| anyhow::anyhow!("throw: expression produced no value"))?;
+        let val_i64 = self.ensure_i64(val, block)?;
+
+        block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_throw"),
+            &[val_i64],
+            &[],
+            self.loc,
+        ));
+
+        // Return the SAME block so the enclosing try-body loop can emit
+        // an exception check here.  Any code after the throw is unreachable
+        // in practice (the check always branches away), but semantically fine.
+        Ok((None, block))
+    }
+
+    // ── try / catch / finally ─────────────────────────────────────────────
+
+    pub(super) fn lower_try_statement<'b>(
+        &mut self,
+        try_stmt: &oxc_ast::ast::TryStatement<'_>,
+        block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let i32_type = self.i32_type();
+        let i64_type = self.i64_type();
+
+        // Snapshot the outer scope before entering the try body.
+        // These keys/types are used for all phi-node blocks.
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+
+        let has_catch   = try_stmt.handler.is_some();
+        let has_finally = try_stmt.finalizer.is_some();
+
+        // Allocate the destination blocks that different paths converge into.
+        let catch_block   = has_catch.then(|| region.append_block(Block::new(&phi_types)));
+        let finally_block = has_finally.then(|| region.append_block(Block::new(&phi_types)));
+        let merge_block   = region.append_block(Block::new(&phi_types));
+
+        // Helper: find the "error" target (catch → finally → merge).
+        let error_block: &Block<'c> = catch_block.as_ref()
+            .map(|b| &**b)
+            .or(finally_block.as_ref().map(|b| -> &Block<'c> { &**b }))
+            .unwrap_or(&*merge_block);
+
+        // Helper: where normal-path flow goes after the try body.
+        let normal_block: &Block<'c> = finally_block.as_ref()
+            .map(|b| -> &Block<'c> { &**b })
+            .unwrap_or(&*merge_block);
+
+        // ── Try body ─────────────────────────────────────────────────────
+        let mut try_scope = scope.clone();
+        let mut cur = block;
+
+        for stmt in &try_stmt.block.body {
+            if matches!(stmt, Statement::FunctionDeclaration(_)) { continue; }
+
+            let (_, nb) = self.lower_statement(stmt, cur, region, &mut try_scope, loops)?;
+            cur = nb;
+
+            // Check exception flag after each statement.
+            let exc_i32: Value<'c, 'b> = cur.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_check_exception"),
+                &[],
+                &[i32_type],
+                self.loc,
+            )).result(0)?.into();
+
+            let zero: Value<'c, 'b> = cur.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )).result(0)?.into();
+
+            let is_exc: Value<'c, 'b> = cur.append_operation(arith::cmpi(
+                self.ctx, arith::CmpiPredicate::Ne, exc_i32, zero, self.loc,
+            )).result(0)?.into();
+
+            // Current values of pre-try scope vars to pass to the error target.
+            // Coerce to expected phi types to handle e.g. i64 assigned to an i32 var.
+            let exc_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+                .map(|(i, k)| {
+                    let v = *try_scope.get(k).unwrap_or_else(|| &scope[k]);
+                    self.coerce_val_to_type(v, phi_types[i].0, cur)
+                })
+                .collect::<Result<_>>()?;
+
+            // Continuation block for the no-exception path (no args needed).
+            let cont = region.append_block(Block::new(&[]));
+            cur.append_operation(cf::cond_br(
+                self.ctx, is_exc, error_block, &cont, &exc_vals, &[], self.loc,
+            ));
+            cur = cont;
+        }
+
+        // Try completed without exception → jump to finally/merge.
+        let ok_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+            .map(|(i, k)| {
+                let v = *try_scope.get(k).unwrap_or_else(|| &scope[k]);
+                self.coerce_val_to_type(v, phi_types[i].0, cur)
+            })
+            .collect::<Result<_>>()?;
+        self.terminate_with_br(cur, normal_block, &ok_vals);
+
+        // ── Catch block ───────────────────────────────────────────────────
+        if let (Some(ref cb), Some(handler)) = (&catch_block, &try_stmt.handler) {
+            let mut catch_scope = scope.clone();
+            // Rebuild scope from the phi block-arguments.
+            for (i, k) in scope_keys.iter().enumerate() {
+                catch_scope.insert(k.clone(), cb.argument(i)?.into());
+            }
+
+            // Retrieve the thrown value (clears the exception flag).
+            let exc_val: Value<'c, 'b> = cb.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_catch_exception"),
+                &[],
+                &[i64_type],
+                self.loc,
+            )).result(0)?.into();
+
+            // Bind the catch parameter (e.g. `catch (e)`).
+            if let Some(param) = &handler.param {
+                let param_name = match &param.pattern {
+                    BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                    _ => "_err".to_string(),
+                };
+                catch_scope.insert(param_name, exc_val);
+            }
+
+            let mut catch_cur: BlockRef<'c, 'b> = *cb;
+            for stmt in &handler.body.body {
+                let (_, nb) = self.lower_statement(stmt, catch_cur, region, &mut catch_scope, loops)?;
+                catch_cur = nb;
+            }
+
+            // Release catch-local variables before leaving the block.
+            for (k, v) in &catch_scope {
+                if !scope_keys.contains(k) {
+                    let v_i64 = self.ensure_i64(*v, catch_cur)?;
+                    catch_cur.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[v_i64], &[], self.loc,
+                    ));
+                }
+            }
+
+            let catch_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+                .map(|(i, k)| {
+                    let v = *catch_scope.get(k).unwrap_or_else(|| &scope[k]);
+                    self.coerce_val_to_type(v, phi_types[i].0, catch_cur)
+                })
+                .collect::<Result<_>>()?;
+            self.terminate_with_br(catch_cur, normal_block, &catch_vals);
+        }
+
+        // ── Finally block ─────────────────────────────────────────────────
+        if let (Some(ref fb), Some(finalizer)) = (&finally_block, &try_stmt.finalizer) {
+            let mut fin_scope = scope.clone();
+            for (i, k) in scope_keys.iter().enumerate() {
+                fin_scope.insert(k.clone(), fb.argument(i)?.into());
+            }
+
+            let mut fin_cur: BlockRef<'c, 'b> = *fb;
+            for stmt in &finalizer.body {
+                let (_, nb) = self.lower_statement(stmt, fin_cur, region, &mut fin_scope, loops)?;
+                fin_cur = nb;
+            }
+
+            let fin_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+                .map(|(i, k)| {
+                    let v = *fin_scope.get(k).unwrap_or_else(|| &scope[k]);
+                    self.coerce_val_to_type(v, phi_types[i].0, fin_cur)
+                })
+                .collect::<Result<_>>()?;
+            self.terminate_with_br(fin_cur, &merge_block, &fin_vals);
+        }
+
+        // ── Update outer scope from merge block ───────────────────────────
+        for (i, k) in scope_keys.iter().enumerate() {
+            scope.insert(k.clone(), merge_block.argument(i)?.into());
+        }
+
+        Ok((None, merge_block))
     }
 
 }

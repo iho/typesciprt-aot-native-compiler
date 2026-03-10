@@ -258,3 +258,88 @@ fn console_log_integers() {
     // Exit code = x = 42
     assert_eq!(run.status.code().unwrap(), 42);
 }
+
+// ── v0.5 – async/await with real Tokio sleep and Promise.race ────────────────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn async_sleep_and_await() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/async_sleep.ts"),
+        &root.join("target/test-async-sleep"),
+        7, // delayedAdd(3,4) after 10ms sleep → 7
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn async_promise_race() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/async_select.ts"),
+        &root.join("target/test-async-select"),
+        1, // fast (10ms) beats slow (500ms) → 1
+    );
+}
+
+// ── v0.8 – typeof, instanceof, string === ────────────────────────────────────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn typeof_and_instanceof() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/typeof_instanceof.ts"),
+        &root.join("target/test-typeof-instanceof"),
+        6, // t_num+t_str+t_bool+t_wrong + tri_is_tri+tri_is_shape+shp_is_shape+shp_is_tri
+    );
+}
+
+// ── v0.7 – class inheritance, super, static, getters/setters, private fields ──
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn classes_full_features() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/classes_full.ts"),
+        &root.join("target/test-classes-full"),
+        38, // age(3)+code(5)+desc(3)+gotten(5)+after(10)+doubled(12)
+    );
+}
+
+// ── v0.6 – try / catch / finally ─────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn try_catch_basic() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/try_catch.ts"),
+        &root.join("target/test-try-catch"),
+        42, // throw 42 → catch(e) { result = e } → exit 42
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn try_finally_basic() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/try_finally.ts"),
+        &root.join("target/test-try-finally"),
+        15, // result=10 in try, +5 in finally → 15
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn try_catch_finally() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/try_catch_finally.ts"),
+        &root.join("target/test-try-catch-finally"),
+        7, // throw 7 → catch(e){result=e} → finally{result+0} → 7
+    );
+}

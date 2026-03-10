@@ -16,4 +16,4 @@ edition.workspace = true
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }

@@ -29,10 +29,13 @@ use melior::ir::{
 use melior::ir::operation::OperationBuilder;
 use melior::Context;
 use oxc_ast::ast::{
-    AssignmentTarget, BinaryExpression, BindingPattern, CallExpression, Class, ClassBody,
-    ClassElement, Expression, ForStatement, ForStatementInit, Function, IfStatement,
-    LogicalExpression, MethodDefinition, MethodDefinitionKind, NewExpression, Program,
-    PropertyDefinition, Statement, ThisExpression, UnaryExpression, VariableDeclaration,
+    AssignmentTarget, BinaryExpression, BindingPattern, CallExpression, CatchClause, Class,
+    ClassBody, ClassElement, Declaration, Expression, ExportDefaultDeclaration,
+    ExportNamedDeclaration, ForStatement, ForStatementInit, Function, IfStatement,
+    ImportDeclaration, ImportDeclarationSpecifier, LogicalExpression, MethodDefinition,
+    MethodDefinitionKind, NewExpression, PrivateFieldExpression, Program, PropertyDefinition,
+    Statement, ThisExpression, ThrowStatement, TSAsExpression, TSEnumDeclaration,
+    TSSatisfiesExpression, TSTypeAssertion, TryStatement, UnaryExpression, VariableDeclaration,
     WhileStatement,
 };
 use std::collections::HashMap;
@@ -44,6 +47,7 @@ mod expressions;
 mod literals;
 mod operators;
 mod classes;
+mod enums;
 
 // ── Function signature table ──────────────────────────────────────────────────
 
@@ -59,15 +63,29 @@ struct FuncSig<'c> {
 #[derive(Clone)]
 struct ClassSig {
     constructor_name: String,
-    methods: HashMap<String, String>,
+    methods:  HashMap<String, String>,                  // instance method name → mangled
+    statics:  HashMap<String, String>,                  // static method name → mangled
+    getters:  std::collections::HashSet<String>,        // property names with getters
+    setters:  std::collections::HashSet<String>,        // property names with setters
+    parent:   Option<String>,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// Parse a local import file and return its Program with 'static lifetime.
+/// Uses Box::leak so the allocator lives for the process lifetime (acceptable for a compiler).
+fn load_import_static(path: &std::path::Path) -> Option<oxc_ast::ast::Program<'static>> {
+    let source = std::fs::read_to_string(path).ok()?;
+    let source: &'static str = Box::leak(source.into_boxed_str());
+    let alloc: &'static oxc_allocator::Allocator =
+        Box::leak(Box::new(oxc_allocator::Allocator::default()));
+    ts_frontend::parse_typescript(alloc, source, &path.display().to_string()).ok()
+}
+
 pub fn lower_program<'c>(
     cg: &'c CodegenContext,
     program: &Program<'_>,
-    _file_name: &str,
+    file_name: &str,
 ) -> Result<Module<'c>> {
     let ctx = &cg.mlir;
     let loc = Location::unknown(ctx);
@@ -83,26 +101,141 @@ pub fn lower_program<'c>(
         string_count: 0,
         var_class_types: HashMap::new(),
         fn_return_type: i32_type,
+        is_async: false,
+        enums: HashMap::new(),
+        current_class: None,
+        super_ctor: None,
     };
-
-    // Pass 1 – collect function signatures and class definitions.
-    lowerer.collect_function_signatures(program);
-    lowerer.collect_class_definitions(program);
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
     lowerer.emit_runtime_declarations();
 
-    // Pass 2a – lower class declarations (constructors + methods).
+    // Pre-pass: resolve and inline local imports.
+    let base_dir = std::path::Path::new(file_name)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    // Collect all local import paths first (avoid borrow issues)
+    let mut local_imports: Vec<(std::path::PathBuf, Vec<String>)> = Vec::new();
     for stmt in &program.body {
-        if let Statement::ClassDeclaration(class) = stmt {
-            lowerer.lower_class_declaration(class)?;
+        if let Statement::ImportDeclaration(import) = stmt {
+            let src = import.source.value.as_str();
+            if src.starts_with("./") || src.starts_with("../") {
+                // Resolve .ts extension
+                let mut path = base_dir.join(src);
+                if path.extension().is_none() {
+                    path.set_extension("ts");
+                } else if path.extension().map_or(false, |e| e != "ts") {
+                    // Non-ts import (e.g., .js), try adding .ts
+                    let ts_path = path.with_extension("ts");
+                    if ts_path.exists() { path = ts_path; }
+                }
+                // Collect imported names
+                let names: Vec<String> = if let Some(specs) = &import.specifiers {
+                    specs.iter().filter_map(|spec| {
+                        match spec {
+                            ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                                Some(s.local.name.to_string())
+                            }
+                            ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                                Some(s.local.name.to_string())
+                            }
+                            _ => None,
+                        }
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+                local_imports.push((path, names));
+            }
+            // External imports (node:, npm packages) are silently skipped.
+        }
+    }
+
+    for (import_path, _names) in &local_imports {
+        if let Some(imported) = load_import_static(import_path) {
+            lowerer.collect_function_signatures(&imported);
+            lowerer.collect_class_definitions(&imported);
+            lowerer.collect_enum_definitions(&imported);
+            // Lower imported class declarations.
+            for stmt in &imported.body {
+                match stmt {
+                    Statement::ClassDeclaration(class) => {
+                        lowerer.lower_class_declaration(class)?;
+                    }
+                    Statement::ExportNamedDeclaration(exp) => {
+                        if let Some(Declaration::ClassDeclaration(class)) = &exp.declaration {
+                            lowerer.lower_class_declaration(class)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Lower imported function declarations.
+            for stmt in &imported.body {
+                match stmt {
+                    Statement::FunctionDeclaration(func) => {
+                        lowerer.lower_function_declaration(func)?;
+                    }
+                    Statement::ExportNamedDeclaration(exp) => {
+                        if let Some(Declaration::FunctionDeclaration(func)) = &exp.declaration {
+                            lowerer.lower_function_declaration(func)?;
+                        }
+                    }
+                    Statement::ExportDefaultDeclaration(exp) => {
+                        use oxc_ast::ast::ExportDefaultDeclarationKind;
+                        if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &exp.declaration {
+                            lowerer.lower_function_declaration(func)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            tracing::warn!("failed to resolve import: {}", import_path.display());
+        }
+    }
+
+    // Pass 1 – collect function signatures and class definitions.
+    lowerer.collect_function_signatures(program);
+    lowerer.collect_class_definitions(program);
+    lowerer.collect_enum_definitions(program);
+
+    // Pass 2a – lower class declarations (constructors + methods).
+    // TODO: Apply class decorators: @dec class Foo {} → Foo = dec(Foo)
+    // Decorators require first-class function support, not yet implemented.
+    for stmt in &program.body {
+        match stmt {
+            Statement::ClassDeclaration(class) => {
+                lowerer.lower_class_declaration(class)?;
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(Declaration::ClassDeclaration(class)) = &export.declaration {
+                    lowerer.lower_class_declaration(class)?;
+                }
+            }
+            _ => {}
         }
     }
 
     // Pass 2b – lower every top-level function declaration.
     for stmt in &program.body {
-        if let Statement::FunctionDeclaration(func) = stmt {
-            lowerer.lower_function_declaration(func)?;
+        match stmt {
+            Statement::FunctionDeclaration(func) => {
+                lowerer.lower_function_declaration(func)?;
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
+                    lowerer.lower_function_declaration(func)?;
+                }
+            }
+            Statement::ExportDefaultDeclaration(export) => {
+                use oxc_ast::ast::ExportDefaultDeclarationKind;
+                if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
+                    lowerer.lower_function_declaration(func)?;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -127,6 +260,12 @@ struct Lowerer<'c, 'm> {
     /// Return type of the function currently being lowered.
     /// `i32` for regular functions/main; `i64` for class methods.
     fn_return_type: melior::ir::Type<'c>,
+    /// Whether the function currently being lowered is `async`.
+    is_async: bool,
+    /// Maps enum name → (member name → integer value) for compile-time resolution.
+    enums: HashMap<String, HashMap<String, i64>>,
+    current_class: Option<String>,
+    super_ctor: Option<String>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
@@ -196,6 +335,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         if ty == self.i64_type() {
             Ok(val)
         } else if ty == self.i32_type() {
+            // Integer: NAN_MASK | TAG_INT | (u32 value)
             let extended = block.append_operation(arith::extui(val, self.i64_type(), self.loc)).result(0)?.into();
             let mask = block.append_operation(arith::constant(
                 self.ctx,
@@ -203,9 +343,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.loc,
             )).result(0)?.into();
             Ok(block.append_operation(arith::ori(extended, mask, self.loc)).result(0)?.into())
+        } else if ty == self.i1_type() {
+            // Boolean: NAN_MASK | TAG_BOOL | (0 or 1)
+            // NAN_MASK=0x7FF8… TAG_BOOL=0x0002… → combined=0x7FFA_0000_0000_0000
+            let extended = block.append_operation(arith::extui(val, self.i64_type(), self.loc)).result(0)?.into();
+            let bool_mask = block.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(self.i64_type(), 0x7FFA_0000_0000_0000u64 as i64).into(),
+                self.loc,
+            )).result(0)?.into();
+            Ok(block.append_operation(arith::ori(extended, bool_mask, self.loc)).result(0)?.into())
         } else {
-            // Boolean or existing pointer tag?
-            // For now, just extend and hope for the best.
             Ok(block.append_operation(arith::extui(val, self.i64_type(), self.loc)).result(0)?.into())
         }
     }
@@ -244,6 +392,28 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) {
         if block.terminator().is_none() {
             block.append_operation(cf::br(dest, args, self.loc));
+        }
+    }
+
+    /// Coerce `val` to `expected` type using existing ensure_* helpers.
+    /// Used to normalise scope values before passing them as phi-block arguments.
+    pub(super) fn coerce_val_to_type<'b>(
+        &self,
+        val: Value<'c, 'b>,
+        expected: melior::ir::Type<'c>,
+        block: BlockRef<'c, 'b>,
+    ) -> Result<Value<'c, 'b>> {
+        if val.r#type() == expected {
+            return Ok(val);
+        }
+        if expected == self.i64_type() {
+            self.ensure_i64(val, block)
+        } else if expected == self.i32_type() {
+            self.ensure_i32(val, block)
+        } else if expected == self.i1_type() {
+            self.ensure_i1(val, block)
+        } else {
+            Ok(val)
         }
     }
 
@@ -288,6 +458,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         add_func("ts_string_new", &[ptr_type], &[i64_type]);
         add_func("ts_string_concat", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_add", &[i64_type, i64_type], &[i64_type]);
+
+        add_func("ts_promise_resolve", &[i64_type], &[i64_type]);
+        add_func("ts_promise_await",   &[i64_type], &[i64_type]);
+
+        add_func("ts_throw",            &[i64_type], &[]);
+        add_func("ts_check_exception",  &[], &[i32_type]);
+        add_func("ts_catch_exception",  &[], &[i64_type]);
+
+        add_func("ts_sleep",           &[i32_type], &[i64_type]);
+        add_func("ts_promise_race",    &[i64_type, i64_type], &[i64_type]);
+
+        add_func("ts_async_spawn0",    &[ptr_type], &[i64_type]);
+        add_func("ts_async_spawn1",    &[ptr_type, i32_type], &[i64_type]);
+        add_func("ts_async_spawn2",    &[ptr_type, i32_type, i32_type], &[i64_type]);
+        add_func("ts_async_spawn3",    &[ptr_type, i32_type, i32_type, i32_type], &[i64_type]);
+        add_func("ts_async_spawn4",    &[ptr_type, i32_type, i32_type, i32_type, i32_type], &[i64_type]);
+
+        add_func("ts_typeof",          &[i64_type], &[i64_type]);
+        add_func("ts_val_strict_eq",   &[i64_type, i64_type], &[i32_type]);
+    }
+
+    /// Returns true if `class` is `target` or transitively inherits from `target`.
+    pub(super) fn is_subclass_of(&self, class: &str, target: &str) -> bool {
+        if class == target { return true; }
+        if let Some(sig) = self.classes.get(class) {
+            if let Some(parent) = &sig.parent {
+                return self.is_subclass_of(parent, target);
+            }
+        }
+        false
     }
 
 
@@ -295,66 +496,159 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     pub(super) fn collect_function_signatures(&mut self, program: &Program<'_>) {
         let i32_type = self.i32_type();
-        // Polymorphic + (String concatenation)
-        // if binop.operator == BinaryOperator::Addition && lhs.r#type() == self.i64_type() && rhs.r#type() == self.i64_type() {
+        let i64_type = self.i64_type();
         for stmt in &program.body {
-            if let Statement::FunctionDeclaration(func) = stmt {
-                let Some(id) = &func.id else { continue };
-                let name = id.name.to_string();
-                let param_types = vec![i32_type; func.params.items.len()];
-                self.funcs.insert(name, FuncSig {
-                    param_types,
-                    return_type: Some(i32_type),
-                });
+            match stmt {
+                Statement::FunctionDeclaration(func) => {
+                    let Some(id) = &func.id else { continue };
+                    let name = id.name.to_string();
+                    let return_type = if func.r#async { i64_type } else { i32_type };
+                    self.funcs.insert(name, FuncSig {
+                        param_types: vec![i32_type; func.params.items.len()],
+                        return_type: Some(return_type),
+                    });
+                }
+                Statement::ExportNamedDeclaration(export) => {
+                    if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
+                        if let Some(id) = &func.id {
+                            let name = id.name.to_string();
+                            let return_type = if func.r#async { i64_type } else { i32_type };
+                            self.funcs.insert(name, FuncSig {
+                                param_types: vec![i32_type; func.params.items.len()],
+                                return_type: Some(return_type),
+                            });
+                        }
+                    }
+                }
+                Statement::ExportDefaultDeclaration(export) => {
+                    use oxc_ast::ast::ExportDefaultDeclarationKind;
+                    if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
+                        if let Some(id) = &func.id {
+                            let name = id.name.to_string();
+                            let return_type = if func.r#async { i64_type } else { i32_type };
+                            self.funcs.insert(name, FuncSig {
+                                param_types: vec![i32_type; func.params.items.len()],
+                                return_type: Some(return_type),
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
 
     pub(super) fn collect_class_definitions(&mut self, program: &Program<'_>) {
-        for stmt in &program.body {
-            if let Statement::ClassDeclaration(class) = stmt {
-                let Some(id) = &class.id else { continue };
-                let class_name = id.name.to_string();
+        // Pass 1: collect own members for each class
+        let mut own_members: Vec<(String, ClassSig)> = Vec::new();
 
-                let mut methods = HashMap::new();
-                for element in &class.body.body {
-                    if let ClassElement::MethodDefinition(method) = element {
-                        if let Some(name) = method.key.static_name() {
-                            let mangled = format!("__class_{}_{}", class_name, name);
-                            methods.insert(name.to_string(), mangled);
-                        }
+        for stmt in &program.body {
+            let class_opt: Option<&Class<'_>> = match stmt {
+                Statement::ClassDeclaration(class) => Some(class),
+                Statement::ExportNamedDeclaration(export) => {
+                    if let Some(Declaration::ClassDeclaration(class)) = &export.declaration {
+                        Some(class)
+                    } else {
+                        None
                     }
                 }
+                Statement::ExportDefaultDeclaration(export) => {
+                    use oxc_ast::ast::ExportDefaultDeclarationKind;
+                    if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &export.declaration {
+                        Some(class)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
 
-                self.classes.insert(class_name.clone(), ClassSig {
-                    constructor_name: format!("__class_{}_constructor", class_name),
-                    methods,
-                });
+            let Some(class) = class_opt else { continue };
+            let Some(id) = &class.id else { continue };
+            let class_name = id.name.to_string();
+
+            let mut methods: HashMap<String, String> = HashMap::new();
+            let mut statics: HashMap<String, String> = HashMap::new();
+            let mut getters: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut setters: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for element in &class.body.body {
+                let ClassElement::MethodDefinition(method) = element else { continue };
+                if method.kind == MethodDefinitionKind::Constructor { continue; }
+                let Some(name) = method.key.static_name() else { continue };
+                let name = name.to_string();
+
+                match (method.kind, method.r#static) {
+                    (MethodDefinitionKind::Get, false) => {
+                        getters.insert(name);
+                    }
+                    (MethodDefinitionKind::Set, false) => {
+                        setters.insert(name);
+                    }
+                    (MethodDefinitionKind::Method, true) => {
+                        let mangled = format!("__class_{}_static_{}", class_name, name);
+                        statics.insert(name, mangled);
+                    }
+                    (MethodDefinitionKind::Method, false) => {
+                        let mangled = format!("__class_{}_{}", class_name, name);
+                        methods.insert(name, mangled);
+                    }
+                    _ => {}
+                }
             }
+
+            let parent = class.super_class.as_ref().and_then(|e| {
+                if let Expression::Identifier(id) = e { Some(id.name.to_string()) } else { None }
+            });
+
+            own_members.push((class_name.clone(), ClassSig {
+                constructor_name: format!("__class_{}_constructor", class_name),
+                methods,
+                statics,
+                getters,
+                setters,
+                parent,
+            }));
+        }
+
+        // Pass 2: insert in order; inherit from parent (already inserted if declared first)
+        for (class_name, mut sig) in own_members {
+            if let Some(parent_name) = sig.parent.clone() {
+                if let Some(parent_sig) = self.classes.get(&parent_name).cloned() {
+                    for (n, m) in &parent_sig.methods {
+                        sig.methods.entry(n.clone()).or_insert_with(|| m.clone());
+                    }
+                    for n in &parent_sig.getters {
+                        if !sig.getters.contains(n) { sig.getters.insert(n.clone()); }
+                    }
+                    for n in &parent_sig.setters {
+                        if !sig.setters.contains(n) { sig.setters.insert(n.clone()); }
+                    }
+                }
+            }
+            self.classes.insert(class_name, sig);
         }
     }
 
     // ── Function declarations ─────────────────────────────────────────────
 
-  pub  fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {
+    pub fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {
         let Some(id) = &func.id else { return Ok(()) };
         let name = id.name.to_string();
         let i32_type = self.i32_type();
+        let i64_type = self.i64_type();
+        // Async functions return a Promise<T> (i64); regular functions return i32.
+        let return_type = if func.r#async { i64_type } else { i32_type };
 
-        // Build parameter list.
-        let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> = func
-            .params
-            .items
-            .iter()
-            .map(|_| (i32_type, self.loc))
-            .collect();
-        let return_type = i32_type;
-        let func_type = FunctionType::new(self.ctx, &vec![i32_type; param_specs.len()], &[return_type]);
+        let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+            func.params.items.iter().map(|_| (i32_type, self.loc)).collect();
+        let func_type = FunctionType::new(
+            self.ctx, &vec![i32_type; param_specs.len()], &[return_type],
+        );
 
         let region = Region::new();
-        let entry = region.append_block(Block::new(&param_specs));
+        let entry  = region.append_block(Block::new(&param_specs));
 
-        // Populate scope from block arguments.
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
         for (i, param) in func.params.items.iter().enumerate() {
             if let BindingPattern::BindingIdentifier(id) = &param.pattern {
@@ -363,41 +657,50 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         let mut current_block = entry;
-        let mut result_value: Value<'_, '_> = {
-            entry
-                .append_operation(arith::constant(
-                    self.ctx,
-                    IntegerAttribute::new(i32_type, 0).into(),
-                    self.loc,
-                ))
-                .result(0)?
-                .into()
-        };
+        let mut result_value: Value<'_, '_> = entry
+            .append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(return_type, 0).into(),
+                self.loc,
+            ))
+            .result(0)?.into();
 
+        self.fn_return_type = return_type;
+        self.is_async = func.r#async;
         if let Some(body) = &func.body {
             for stmt in &body.statements {
                 let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
                 current_block = next;
-                if let Some(v) = val {
-                    result_value = v;
-                }
+                if let Some(v) = val { result_value = v; }
             }
         }
+        self.is_async = false;
+        self.fn_return_type = i32_type;
 
-        // ARC: Release all variables in the function scope before final return.
+        // ARC: release scope variables before final return.
         for (_, v) in &scope {
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
                 FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                &[v_i64],
-                &[],
-                self.loc,
+                &[v_i64], &[], self.loc,
             ));
         }
 
-        // Add a default return if the last block isn't terminated yet.
-        self.terminate_with_return(current_block, result_value)?;
+        // Async: wrap the implicit return value in a resolved Promise.
+        if current_block.terminator().is_none() && func.r#async {
+            let val_i64 = self.ensure_i64(result_value, current_block)?;
+            let promise: Value<'_, '_> = current_block
+                .append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
+                    &[val_i64], &[i64_type], self.loc,
+                ))
+                .result(0)?.into();
+            current_block.append_operation(func::r#return(&[promise], self.loc));
+        } else {
+            self.terminate_with_return(current_block, result_value)?;
+        }
 
         let op = func::func(
             self.ctx,
@@ -408,6 +711,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.loc,
         );
         self.module.body().append_operation(op);
+
+        self.funcs.insert(name, FuncSig {
+            param_types: vec![i32_type; param_specs.len()],
+            return_type: Some(return_type),
+        });
         Ok(())
     }
 }

@@ -6,8 +6,9 @@ edition.workspace = true
 [dependencies]
 ts-frontend.path = "../ts-frontend"
 
-oxc_ast.workspace   = true
-oxc_span.workspace  = true
+oxc_ast.workspace        = true
+oxc_allocator.workspace  = true
+oxc_span.workspace       = true
 
 melior.workspace    = true
 
