@@ -298,6 +298,10 @@ lower_program()
 - Linear control flow before loops/recursion
 - Basic functions before closures
 
+### 3. Out of Scope / Future Considerations
+- **Garbage Collection (GC)**: Not required. Current implementation uses stack allocation (`llvm.alloca`). Future dynamic memory management for objects/arrays will likely rely on Automatic Reference Counting (ARC) or Arena Allocators rather than a heavy tracing GC.
+- **HTTP / Networking Libraries**: Out of scope for the native standard library. The focus is on implementing core language features (control flow, arrays, strings) rather than supporting web backends.
+
 ### 3. Incremental Compilation
 - Each version adds self-contained features
 - Backward compatibility within major versions
@@ -363,8 +367,8 @@ lower_program()
 ## Success Metrics (v1.0)
 
 ✓ **Feature Completeness**
-- [ ] Variables and functions
-- [ ] Control flow (if/else, loops)
+- [x] Variables and functions (including recursive)
+- [x] Control flow (if/else, loops)
 - [ ] Basic data types (int, bool, string, array)
 - [ ] Object-oriented features (classes, methods)
 

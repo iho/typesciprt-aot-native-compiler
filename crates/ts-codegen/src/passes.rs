@@ -21,8 +21,14 @@ pub fn run_lowering_pipeline<'c>(ctx: &'c Context, module: &mut Module<'c>) -> R
     // Convert arith to llvm dialect.
     pm.add_pass(pass::conversion::create_arith_to_llvm());
 
+    // Convert cf (control-flow) dialect to llvm dialect.
+    pm.add_pass(pass::conversion::create_control_flow_to_llvm());
+
     // Convert func to llvm dialect.
     pm.add_pass(pass::conversion::create_func_to_llvm());
+
+    // Resolve any remaining unrealized casts inserted by dialect conversions.
+    pm.add_pass(pass::conversion::create_reconcile_unrealized_casts());
 
     // Run all passes.
     pm.enable_verifier(true);

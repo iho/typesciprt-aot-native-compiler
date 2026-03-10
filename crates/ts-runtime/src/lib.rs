@@ -2,15 +2,30 @@
 //!
 //! This library is linked into every compiled TypeScript binary.  It provides
 //! the low-level support routines that the compiler emits calls to.
-
-#![no_std]
-// Allow std for now during early development.
-// Remove when we switch to a freestanding / no_std runtime.
-extern crate std;
+//!
+//! The Tokio multi-thread runtime is started lazily on the first call that
+//! needs it (e.g. `__ts_console_log_i32`).  Future async TS features will
+//! schedule tasks onto this executor via `ts_runtime()`.
 
 pub mod alloc;
+pub mod console;
 pub mod string;
 pub mod value;
 
+use std::sync::OnceLock;
+use tokio::runtime::Runtime;
+
 /// Version string embedded by the compiler into generated binaries.
 pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── Global Tokio runtime ─────────────────────────────────────────────────────
+
+static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
+
+/// Return a reference to the shared Tokio runtime, initialising it on first
+/// call.  The runtime lives for the entire process lifetime.
+pub fn ts_runtime() -> &'static Runtime {
+    TOKIO_RT.get_or_init(|| {
+        Runtime::new().expect("failed to start tokio runtime")
+    })
+}

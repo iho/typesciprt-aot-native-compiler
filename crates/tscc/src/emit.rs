@@ -3,7 +3,7 @@
 //! These functions shell out to `mlir-translate` and `llc` / `clang` from the
 //! LLVM installation.  We use the Homebrew LLVM at `/opt/homebrew/opt/llvm`.
 
-use std::{path::Path, process::Command};
+use std::{path::{Path, PathBuf}, process::Command};
 
 use anyhow::{bail, Context, Result};
 use melior::ir::Module;
@@ -61,18 +61,70 @@ pub fn llvm_ir_to_object(ll: &Path, out: &Path, opt: u8) -> Result<()> {
     Ok(())
 }
 
+// ── Rust runtime ─────────────────────────────────────────────────────────────
+
+/// Build the `ts-runtime` Rust crate and return the path to its static
+/// archive (`libts_runtime.a`).
+///
+/// The runtime is built in the same profile (debug/release) as the running
+/// `tscc` binary.  Its location is determined from the executable path:
+///   `<exe_dir>/libts_runtime.a`
+/// which is exactly where `cargo build` places it.
+pub fn build_runtime() -> Result<PathBuf> {
+    let exe_path = std::env::current_exe().context("locate tscc executable")?;
+    // target/{debug,release}/tscc  →  target/{debug,release}
+    let target_dir = exe_path
+        .parent()
+        .context("tscc executable has no parent directory")?;
+    // Walk up to the workspace root: target/{debug,release} → target → root
+    let workspace_root = target_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .context("cannot determine workspace root from executable path")?;
+
+    let status = Command::new("cargo")
+        .args(["build", "-p", "ts-runtime"])
+        .current_dir(workspace_root)
+        .status()
+        .context("spawn `cargo build -p ts-runtime`")?;
+
+    if !status.success() {
+        bail!("`cargo build -p ts-runtime` failed");
+    }
+
+    let lib = target_dir.join("libts_runtime.a");
+    if !lib.exists() {
+        bail!("expected {} but it was not produced", lib.display());
+    }
+    Ok(lib)
+}
+
 // ── Object file → native binary ───────────────────────────────────────────────
 
-/// Link the object file using `clang` (which drives `lld`/`ld`).
-pub fn link_binary(obj: &Path, out: &Path) -> Result<()> {
-    let status = Command::new(llvm_bin("clang"))
-        .arg(obj)
-        .arg("-o")
-        .arg(out)
-        // Link the TS runtime static library once it exists.
-        // .arg("-L").arg("target/release").arg("-lts_runtime")
-        .status()
-        .context("spawn clang (linker)")?;
+/// Link the object files using `clang` (which drives `lld`/`ld`).
+///
+/// On macOS, linking a Rust staticlib requires a few extra system frameworks
+/// and libraries that Rust's std/tokio depend on at a lower level.
+pub fn link_binary(objs: &[&Path], out: &Path) -> Result<()> {
+    let mut cmd = Command::new(llvm_bin("clang"));
+    for obj in objs {
+        cmd.arg(obj);
+    }
+    cmd.arg("-o").arg(out);
+
+    // macOS: extra libraries required by the Rust std + tokio runtime.
+    // (-lSystem is implicit via clang, so we omit it to avoid the "duplicate
+    //  libraries" linker warning.)
+    if cfg!(target_os = "macos") {
+        cmd.args([
+            "-liconv",
+            "-lc++",
+            "-framework", "CoreFoundation",
+            "-framework", "Security",
+        ]);
+    }
+
+    let status = cmd.status().context("spawn clang (linker)")?;
 
     if !status.success() {
         bail!("clang linker exited with {status}");

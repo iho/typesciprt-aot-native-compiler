@@ -60,25 +60,26 @@ undefined_var.ts: Error: undefined variable → proper error ✓
 ### 🚀 Not Yet Implemented
 
 #### Control Flow (Priority: High)
-- [ ] `if`/`else` statements
+- [x] `if`/`else` statements
 - [ ] Ternary operator (`? :`)
 - [ ] Boolean expressions and short-circuit evaluation
 
 #### Comparison & Boolean Operators (Priority: High)
-- [ ] Comparison operators: `<`, `>`, `<=`, `>=`, `==`, `!=`
-- [ ] Boolean operators: `&&`, `||`, `!`
+- [x] Comparison operators: `<`, `>`, `<=`, `>=`, `==`, `!=`
+- [x] Boolean operators: `&&`, `||`, `!`
 - [ ] Boolean type support
 
 #### Loops (Priority: Medium)
-- [ ] `for` loops
-- [ ] `while` loops
+- [x] `for` loops
+- [x] `while` loops
 - [ ] Loop control: `break`, `continue`
 
 #### Functions (Priority: Medium)
-- [ ] Function declarations
-- [ ] Function calls with arguments
-- [ ] Return statements
-- [ ] Local scoping for parameters
+- [x] Function declarations
+- [x] Function calls with arguments
+- [x] Return statements
+- [x] Local scoping for parameters
+- [x] Recursive functions (supported via MLIR stack allocation)
 
 #### Type System (Priority: Medium)
 - [ ] Type annotations parsing
@@ -92,6 +93,10 @@ undefined_var.ts: Error: undefined variable → proper error ✓
 - [ ] Classes and methods
 - [ ] Async/await
 - [ ] String literals and operations
+
+#### Out of Scope / Future Considerations
+- **Garbage Collection**: Planned memory management via ARC or Arena Allocators instead of a heavy GC.
+- **HTTP Libraries**: Not planned for the core native standard library.
 
 ### 🔧 Technical Details
 

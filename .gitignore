@@ -7,3 +7,4 @@ target
 *.dylib
 *.dll
 *.exe
+.cargo/config.toml

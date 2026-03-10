@@ -3,13 +3,17 @@ name = "ts-runtime"
 version.workspace = true
 edition.workspace = true
 
-# The runtime is compiled separately (as a static library) and linked into
-# the generated binary.  It will eventually provide:
-#   - GC (mark-and-sweep / Boehm)
+# The runtime is compiled as a static library and linked into every generated
+# TypeScript binary.  It provides:
+#   - console.log (I/O via tokio)
+#   - Async task executor (tokio rt-multi-thread)
+#   - GC (mark-and-sweep / Boehm) – planned
 #   - string interning & concatenation
 #   - dynamic dispatch / vtables
-#   - exception / try-catch support
 #   - basic JS built-ins (Number, String, Array, Object, …)
 
 [lib]
 crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }

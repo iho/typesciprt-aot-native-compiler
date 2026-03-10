@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     let ll_path  = out_dir.join(format!("{}.ll",  stem.to_string_lossy()));
     let obj_path = out_dir.join(format!("{}.o",   stem.to_string_lossy()));
     let bin_path = cli.output.clone().unwrap_or_else(|| {
-        out_dir.join(stem.to_string_lossy().to_string())
+        out_dir.join(format!("{}.exe", stem.to_string_lossy()))
     });
 
     emit::mlir_to_llvm_ir(&module, &ll_path)
@@ -125,10 +125,13 @@ fn main() -> Result<()> {
     emit::llvm_ir_to_object(&ll_path, &obj_path, cli.opt_level)
         .context("LLVM IR → object compilation failed")?;
 
+    // Build the Rust runtime (ts-runtime crate) and get the static archive.
+    let runtime_obj = emit::build_runtime().context("runtime build failed")?;
+
     // ── 7. Link → native binary ───────────────────────────────────────────
 
     info!("linking → {}", bin_path.display());
-    emit::link_binary(&obj_path, &bin_path)
+    emit::link_binary(&[&obj_path, &runtime_obj], &bin_path)
         .context("linking failed")?;
 
     println!("✓  compiled to {}", bin_path.display());
