@@ -1,0 +1,9 @@
+# Point mlir-sys and llvm-sys to the Homebrew LLVM 21 installation
+[env]
+MLIR_SYS_210_PREFIX  = "/opt/homebrew/opt/llvm"
+LLVM_SYS_210_PREFIX  = "/opt/homebrew/opt/llvm"
+TABLEGEN_210_PREFIX  = "/opt/homebrew/opt/llvm"
+
+[build]
+# Use lld from Homebrew LLVM for faster linking (optional)
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

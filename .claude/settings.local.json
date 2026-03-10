@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://crates.io/api/v1/crates/melior/0.26.7/dependencies\" 2>/dev/null | python3 -c \"import sys,json; deps=json.load\\(sys.stdin\\); [print\\(d['crate_id'], d.get\\('req',''\\)\\) for d in deps['dependencies'] if 'mlir' in d['crate_id'].lower\\(\\) or 'llvm' in d['crate_id'].lower\\(\\)]\")"
+    ]
+  }
+}

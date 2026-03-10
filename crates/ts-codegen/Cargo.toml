@@ -1,0 +1,16 @@
+[package]
+name = "ts-codegen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ts-frontend.path = "../ts-frontend"
+
+oxc_ast.workspace   = true
+oxc_span.workspace  = true
+
+melior.workspace    = true
+
+anyhow.workspace    = true
+thiserror.workspace = true
+tracing.workspace   = true

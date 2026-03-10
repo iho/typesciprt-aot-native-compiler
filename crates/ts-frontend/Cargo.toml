@@ -1,0 +1,12 @@
+[package]
+name = "ts-frontend"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+oxc_allocator.workspace = true
+oxc_parser.workspace    = true
+oxc_ast.workspace       = true
+oxc_span.workspace      = true
+anyhow.workspace        = true
+thiserror.workspace     = true

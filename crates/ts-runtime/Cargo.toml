@@ -1,0 +1,15 @@
+[package]
+name = "ts-runtime"
+version.workspace = true
+edition.workspace = true
+
+# The runtime is compiled separately (as a static library) and linked into
+# the generated binary.  It will eventually provide:
+#   - GC (mark-and-sweep / Boehm)
+#   - string interning & concatenation
+#   - dynamic dispatch / vtables
+#   - exception / try-catch support
+#   - basic JS built-ins (Number, String, Array, Object, …)
+
+[lib]
+crate-type = ["staticlib", "rlib"]

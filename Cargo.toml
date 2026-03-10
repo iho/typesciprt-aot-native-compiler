@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tscc",
+    "crates/ts-frontend",
+    "crates/ts-codegen",
+    "crates/ts-runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# TypeScript parsing (OXC - fastest Rust TS/JS parser)
+oxc_allocator = "0.117"
+oxc_parser    = "0.117"
+oxc_ast       = "0.117"
+oxc_span      = "0.117"
+
+# MLIR / LLVM bindings (LLVM 21)
+melior = { version = "0.26", features = ["ods-dialects"] }
+
+# CLI / utilities
+clap                 = { version = "4", features = ["derive"] }
+anyhow               = "1"
+thiserror            = "2"
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["env-filter"] }

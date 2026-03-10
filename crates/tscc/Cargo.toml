@@ -1,0 +1,22 @@
+[package]
+name = "tscc"
+version.workspace = true
+edition.workspace = true
+description = "TypeScript AOT native compiler"
+
+[[bin]]
+name = "tscc"
+path = "src/main.rs"
+
+[dependencies]
+ts-frontend  = { path = "../ts-frontend" }
+ts-codegen   = { path = "../ts-codegen" }
+
+oxc_allocator.workspace = true
+
+melior.workspace        = true
+
+clap.workspace          = true
+anyhow.workspace        = true
+tracing.workspace       = true
+tracing-subscriber.workspace = true
