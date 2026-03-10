@@ -1,8 +1,9 @@
-function sum(n) {
-    if (n <= 1) {
-        return n;
-    }
-    return n + sum(n - 1);
+function add(a, b) {
+  return a + b;
 }
 
-sum(5);
+function multiply(a, b) {
+  return a * b;
+}
+
+multiply(3, add(5, 2));

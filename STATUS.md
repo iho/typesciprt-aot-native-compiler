@@ -61,8 +61,8 @@ undefined_var.ts: Error: undefined variable → proper error ✓
 
 #### Control Flow (Priority: High)
 - [x] `if`/`else` statements
-- [ ] Ternary operator (`? :`)
-- [ ] Boolean expressions and short-circuit evaluation
+- [x] Ternary operator (`? :`)
+- [x] Boolean expressions and short-circuit evaluation (`&&`, `||`)
 
 #### Comparison & Boolean Operators (Priority: High)
 - [x] Comparison operators: `<`, `>`, `<=`, `>=`, `==`, `!=`

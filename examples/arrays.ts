@@ -1,17 +1,9 @@
-// Beta v0.1 – array literals, indexing, length
-let arr = [10, 20, 30, 40, 50];
-
-// print each element
-console.log(arr[0]); // 10
-console.log(arr[2]); // 30
-console.log(arr[4]); // 50
-
-// print length
-console.log(arr.length); // 5
-
-// use an element in arithmetic
-let doubled = arr[1] * 2;
-console.log(doubled); // 40
-
-// exit code = arr[3] = 40
-arr[3];
+const a = [10, 20, 30];
+console.log(a[0]);
+console.log(a[1]);
+console.log(a[2]);
+a[1] = 42;
+console.log(a[1]);
+const b = a[1];
+console.log(b);
+console.log(a.length);

@@ -240,7 +240,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     // ── Function declarations ─────────────────────────────────────────────
 
-    fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {
+  pub  fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {
         let Some(id) = &func.id else { return Ok(()) };
         let name = id.name.to_string();
         let i32_type = self.i32_type();
@@ -280,7 +280,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         if let Some(body) = &func.body {
             for stmt in &body.statements {
-                let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope)?;
+                let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
                 current_block = next;
                 if let Some(v) = val {
                     result_value = v;
@@ -328,7 +328,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             if matches!(stmt, Statement::FunctionDeclaration(_)) {
                 continue;
             }
-            let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope)?;
+            let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
             current_block = next;
             if let Some(v) = val {
                 result_value = v;
@@ -360,6 +360,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         match stmt {
             Statement::ExpressionStatement(es) => {
@@ -375,20 +376,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.lower_return_statement(ret, block, region, scope)
             }
             Statement::IfStatement(if_stmt) => {
-                self.lower_if_statement(if_stmt, block, region, scope)
+                self.lower_if_statement(if_stmt, block, region, scope, loops)
             }
             Statement::WhileStatement(w) => {
-                self.lower_while_statement(w, block, region, scope)
+                self.lower_while_statement(w, block, region, scope, loops)
             }
             Statement::ForStatement(f) => {
-                self.lower_for_statement(f, block, region, scope)
+                self.lower_for_statement(f, block, region, scope, loops)
             }
             Statement::BlockStatement(bs) => {
                 let mut cur = block;
                 let mut last = None;
                 let mut inner = scope.clone();
                 for s in &bs.body {
-                    let (v, nb) = self.lower_statement(s, cur, region, &mut inner)?;
+                    let (v, nb) = self.lower_statement(s, cur, region, &mut inner, loops)?;
                     cur = nb;
                     if let Some(v) = v { last = Some(v); }
                 }
@@ -396,6 +397,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if scope.contains_key(k) { scope.insert(k.clone(), *v); }
                 }
                 Ok((last, cur))
+            }
+            Statement::BreakStatement(_) => {
+                if let Some((_, exit_block, scope_keys)) = loops.last() {
+                    let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+                    self.terminate_with_br(block, exit_block, &vals);
+                    let dead = region.append_block(Block::new(&[]));
+                    Ok((None, dead))
+                } else {
+                    bail!("break statement outside of loop");
+                }
+            }
+            Statement::ContinueStatement(_) => {
+                if let Some((header_block, _, scope_keys)) = loops.last() {
+                    let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+                    self.terminate_with_br(block, header_block, &vals);
+                    let dead = region.append_block(Block::new(&[]));
+                    Ok((None, dead))
+                } else {
+                    bail!("continue statement outside of loop");
+                }
             }
             _ => {
                 tracing::debug!("skipping unimplemented statement kind");
@@ -525,6 +546,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Expression::CallExpression(call) => {
                 self.lower_call_expression(call, block, region, scope)
             }
+            Expression::ConditionalExpression(cond) => {
+                self.lower_conditional_expression(cond, block, region, scope)
+            }
+            Expression::ParenthesizedExpression(pe) => {
+                self.lower_expression(&pe.expression, block, region, scope)
+            }
             _ => {
                 tracing::debug!("skipping unimplemented expression kind");
                 Ok(None)
@@ -616,6 +643,35 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             _ => bail!("unsupported logical operator: {:?}", logical.operator),
         };
 
+        Ok(Some(block.append_operation(op).result(0)?.into()))
+    }
+
+    // ── Conditional expression (? :) ──────────────────────────────────────
+
+    fn lower_conditional_expression<'b>(
+        &mut self,
+        cond: &oxc_ast::ast::ConditionalExpression<'_>,
+        block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<Option<Value<'c, 'b>>> {
+        let test_val = self.lower_expression(&cond.test, block, region, scope)?
+            .ok_or_else(|| anyhow::anyhow!("conditional ?: no test value"))?;
+        let test_i1 = self.ensure_i1(test_val, block)?;
+
+        // For simplicity and matching current eager logical op behavior,
+        // we eagerly evaluate both branches and use `arith::select`.
+        // A true short-circuiting ?: would require a block split like `if/else`.
+        let cons_val = self.lower_expression(&cond.consequent, block, region, scope)?
+            .ok_or_else(|| anyhow::anyhow!("conditional ?: no consequent value"))?;
+        let alt_val = self.lower_expression(&cond.alternate, block, region, scope)?
+            .ok_or_else(|| anyhow::anyhow!("conditional ?: no alternate value"))?;
+
+        // Ensure both branches return the same type (i32).
+        let cons_i32 = self.ensure_i32(cons_val, block)?;
+        let alt_i32 = self.ensure_i32(alt_val, block)?;
+
+        let op = arith::select(test_i1, cons_i32, alt_i32, self.loc);
         Ok(Some(block.append_operation(op).result(0)?.into()))
     }
 
@@ -736,6 +792,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let cond_val = self
             .lower_expression(&if_stmt.test, block, region, scope)?
@@ -756,7 +813,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Then branch
         let mut then_scope = scope.clone();
-        let (_, then_end) = self.lower_statement(&if_stmt.consequent, then_block, region, &mut then_scope)?;
+        let (_, then_end) = self.lower_statement(&if_stmt.consequent, then_block, region, &mut then_scope, loops)?;
         let then_vals: Vec<Value<'c, 'b>> =
             scope_keys.iter().map(|k| *then_scope.get(k).unwrap_or(&scope[k])).collect();
         self.terminate_with_br(then_end, &merge_block, &then_vals);
@@ -764,7 +821,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Else branch
         let mut else_scope = scope.clone();
         if let Some(alt) = &if_stmt.alternate {
-            let (_, else_end) = self.lower_statement(alt, else_block, region, &mut else_scope)?;
+            let (_, else_end) = self.lower_statement(alt, else_block, region, &mut else_scope, loops)?;
             let else_vals: Vec<Value<'c, 'b>> =
                 scope_keys.iter().map(|k| *else_scope.get(k).unwrap_or(&scope[k])).collect();
             self.terminate_with_br(else_end, &merge_block, &else_vals);
@@ -789,6 +846,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
@@ -825,8 +883,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Lower the loop body.
         let mut body_scope = header_scope.clone();
+        let mut inner_loops = loops.to_vec();
+        inner_loops.push((header_block, exit_block, scope_keys.clone()));
         let (_, body_end) =
-            self.lower_statement(&while_stmt.body, body_block, region, &mut body_scope)?;
+            self.lower_statement(&while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
         let body_vals: Vec<Value<'c, 'b>> =
             scope_keys.iter().map(|k| *body_scope.get(k).unwrap_or(&header_scope[k])).collect();
         self.terminate_with_br(body_end, &header_block, &body_vals);
@@ -847,6 +907,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Lower init (may introduce new variables into scope).
         let mut current = block;
@@ -900,8 +961,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Lower body, then update expression.
         let mut body_scope = header_scope.clone();
+        let mut inner_loops = loops.to_vec();
+        inner_loops.push((header_block, exit_block, scope_keys.clone()));
         let (_, body_end) =
-            self.lower_statement(&for_stmt.body, body_block, region, &mut body_scope)?;
+            self.lower_statement(&for_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
 
         // Lower update in the body-end block.
         if let Some(update) = &for_stmt.update {

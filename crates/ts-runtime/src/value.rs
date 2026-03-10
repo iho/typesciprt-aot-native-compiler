@@ -100,3 +100,158 @@ impl TsVal {
         (self.0 & 0x0000_FFFF_FFFF_FFFF) as *mut u8
     }
 }
+
+// ── Heap Objects ──────────────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+use crate::alloc::{ts_alloc_rc, ts_release};
+
+/// A heap-allocated TypeScript object.
+pub struct TsObject {
+    pub properties: HashMap<String, TsVal>,
+}
+
+/// A heap-allocated TypeScript array.
+pub struct TsArray {
+    pub elements: Vec<TsVal>,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_new() -> TsVal {
+    let size = std::mem::size_of::<TsObject>();
+    let ptr = ts_alloc_rc(size, 0) as *mut TsObject; // tag 0 = Object
+    if ptr.is_null() {
+        return NULL;
+    }
+    unsafe {
+        std::ptr::write(ptr, TsObject {
+            properties: HashMap::new(),
+        });
+    }
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_new(capacity: i32) -> TsVal {
+    let size = std::mem::size_of::<TsArray>();
+    let ptr = ts_alloc_rc(size, 1) as *mut TsArray; // tag 1 = Array
+    if ptr.is_null() {
+        return NULL;
+    }
+    unsafe {
+        std::ptr::write(ptr, TsArray {
+            elements: Vec::with_capacity(capacity as usize),
+        });
+        // Initialize with undefined.
+        for _ in 0..capacity {
+            (&mut *ptr).elements.push(UNDEFINED);
+        }
+    }
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_get(arr_val: TsVal, idx: i32) -> TsVal {
+    let ptr = arr_val.as_ptr();
+    if !ptr.is_null() && idx >= 0 {
+        let arr = ptr as *mut TsArray;
+        let idx = idx as usize;
+        if idx < (&*arr).elements.len() {
+            let val = (&*arr).elements[idx];
+            ts_retain_val(val);
+            return val;
+        }
+    }
+    UNDEFINED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_set(arr_val: TsVal, idx: i32, val: TsVal) {
+    let ptr = arr_val.as_ptr();
+    if !ptr.is_null() && idx >= 0 {
+        let arr = ptr as *mut TsArray;
+        let idx = idx as usize;
+
+        // ARC: Retain new value.
+        ts_retain_val(val);
+
+        if idx < (&*arr).elements.len() {
+            let old_val = std::mem::replace(&mut (&mut *arr).elements[idx], val);
+            ts_release_val(old_val);
+        } else {
+            // A real JS array would resize/pad.
+            if idx == (&*arr).elements.len() {
+                (&mut *arr).elements.push(val);
+            } else {
+                // Pad with undefined.
+                while (&*arr).elements.len() < idx {
+                    (&mut *arr).elements.push(UNDEFINED);
+                }
+                (&mut *arr).elements.push(val);
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_len(arr_val: TsVal) -> TsVal {
+    let ptr = arr_val.as_ptr();
+    if !ptr.is_null() {
+        let arr = ptr as *mut TsArray;
+        return TsVal::from_i32((&*arr).elements.len() as i32);
+    }
+    TsVal::from_i32(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_retain_val(val: TsVal) {
+    if val.is_ptr() {
+        crate::alloc::ts_retain(val.as_ptr());
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_release_val(val: TsVal) {
+    if val.is_ptr() {
+        let ptr = val.as_ptr();
+        let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
+        let header = unsafe { ptr.sub(header_size) as *mut crate::alloc::ArcHeader };
+        let tag = unsafe { (*header).tag };
+        
+        let destructor = match tag {
+            0 => Some(ts_obj_destructor as unsafe extern "C" fn(*mut u8)),
+            1 => Some(ts_arr_destructor as unsafe extern "C" fn(*mut u8)),
+            _ => None,
+        };
+        
+        crate::alloc::ts_release(ptr, destructor);
+    }
+}
+
+/// Destructor for TsObject.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_destructor(ptr: *mut u8) {
+    let obj_ptr = ptr as *mut TsObject;
+    unsafe {
+        for (_, val) in (*obj_ptr).properties.drain() {
+            ts_release_val(val);
+        }
+        std::ptr::drop_in_place(obj_ptr);
+    }
+}
+
+/// Destructor for TsArray.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_destructor(ptr: *mut u8) {
+    let arr_ptr = ptr as *mut TsArray;
+    unsafe {
+        for val in (*arr_ptr).elements.drain(..) {
+            ts_release_val(val);
+        }
+        std::ptr::drop_in_place(arr_ptr);
+    }
+}
+
+
+
+
