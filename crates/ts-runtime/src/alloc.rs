@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct ArcHeader {
     pub ref_count: AtomicU64,
     pub size: usize,
-    pub tag: u8, // 0 = Object, 1 = Array
+    pub tag: u8, // 0 = Object, 1 = Array, 2 = String
 }
 
 /// Allocate `size` bytes on the TS heap with an ARC header and a type tag.

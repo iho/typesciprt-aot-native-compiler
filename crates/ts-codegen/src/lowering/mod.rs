@@ -17,22 +17,23 @@
 
 use anyhow::{bail, Result};
 use melior::dialect::{arith, cf, func, llvm};
-use melior::dialect::llvm::{AllocaOptions, LoadStoreOptions};
-use melior::ir::attribute::{
-    DenseI32ArrayAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute,
-    TypeAttribute,
-};
-use melior::ir::r#type::{FunctionType, IntegerType};
 use melior::ir::{
+    attribute::{
+        DenseI32ArrayAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute,
+        TypeAttribute,
+    },
+    r#type::{FunctionType, IntegerType},
     Attribute, Block, BlockLike, BlockRef, Identifier, Location, Module, Region,
-    RegionLike, Value, ValueLike,
+    RegionLike, Type, Value, ValueLike,
 };
 use melior::ir::operation::OperationBuilder;
 use melior::Context;
 use oxc_ast::ast::{
-    AssignmentTarget, BinaryExpression, BindingPattern, CallExpression, Expression,
-    ForStatement, ForStatementInit, Function, IfStatement, LogicalExpression, Program,
-    Statement, UnaryExpression, VariableDeclaration, WhileStatement,
+    AssignmentTarget, BinaryExpression, BindingPattern, CallExpression, Class, ClassBody,
+    ClassElement, Expression, ForStatement, ForStatementInit, Function, IfStatement,
+    LogicalExpression, MethodDefinition, MethodDefinitionKind, NewExpression, Program,
+    PropertyDefinition, Statement, ThisExpression, UnaryExpression, VariableDeclaration,
+    WhileStatement,
 };
 use std::collections::HashMap;
 
@@ -42,15 +43,23 @@ mod statements;
 mod expressions;
 mod literals;
 mod operators;
+mod classes;
 
 // ── Function signature table ──────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct FuncSig<'c> {
     /// MLIR types of positional parameters (all i32 for now).
+    #[allow(dead_code)]
     param_types: Vec<melior::ir::Type<'c>>,
     /// Return type (i32, or None for void).
     return_type: Option<melior::ir::Type<'c>>,
+}
+ 
+#[derive(Clone)]
+struct ClassSig {
+    constructor_name: String,
+    methods: HashMap<String, String>,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -64,22 +73,33 @@ pub fn lower_program<'c>(
     let loc = Location::unknown(ctx);
     let module = Module::new(loc);
 
+    let i32_type = IntegerType::new(ctx, 32).into();
     let mut lowerer = Lowerer {
         ctx,
         module: &module,
         loc,
         funcs: HashMap::new(),
+        classes: HashMap::new(),
         string_count: 0,
+        var_class_types: HashMap::new(),
+        fn_return_type: i32_type,
     };
 
-    // Pass 1 – collect function signatures so calls can be emitted before
-    //          the declaration is processed (hoisting).
+    // Pass 1 – collect function signatures and class definitions.
     lowerer.collect_function_signatures(program);
+    lowerer.collect_class_definitions(program);
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
     lowerer.emit_runtime_declarations();
 
-    // Pass 2 – lower every top-level function declaration.
+    // Pass 2a – lower class declarations (constructors + methods).
+    for stmt in &program.body {
+        if let Statement::ClassDeclaration(class) = stmt {
+            lowerer.lower_class_declaration(class)?;
+        }
+    }
+
+    // Pass 2b – lower every top-level function declaration.
     for stmt in &program.body {
         if let Statement::FunctionDeclaration(func) = stmt {
             lowerer.lower_function_declaration(func)?;
@@ -95,11 +115,18 @@ pub fn lower_program<'c>(
 // ── Internal lowerer ──────────────────────────────────────────────────────────
 
 struct Lowerer<'c, 'm> {
-    ctx:         &'c Context,
-    module:      &'m Module<'c>,
-    loc:         Location<'c>,
-    funcs:       HashMap<String, FuncSig<'c>>,
-    string_count: usize,
+    ctx:            &'c Context,
+    module:         &'m Module<'c>,
+    loc:            Location<'c>,
+    funcs:          HashMap<String, FuncSig<'c>>,
+    classes:        HashMap<String, ClassSig>,
+    string_count:   usize,
+    /// Maps variable name → class name for `new Foo()` assignments.
+    /// Used for method-call dispatch without full type inference.
+    var_class_types: HashMap<String, String>,
+    /// Return type of the function currently being lowered.
+    /// `i32` for regular functions/main; `i64` for class methods.
+    fn_return_type: melior::ir::Type<'c>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
@@ -172,7 +199,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let extended = block.append_operation(arith::extui(val, self.i64_type(), self.loc)).result(0)?.into();
             let mask = block.append_operation(arith::constant(
                 self.ctx,
-                IntegerAttribute::new(self.i64_type(), 0x7FF8_0006_0000_0000u64 as i64).into(),
+                IntegerAttribute::new(self.i64_type(), 0x7FFE_0000_0000_0000u64 as i64).into(),
                 self.loc,
             )).result(0)?.into();
             Ok(block.append_operation(arith::ori(extended, mask, self.loc)).result(0)?.into())
@@ -199,8 +226,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     pub(super) fn terminate_with_return<'b>(&self, block: BlockRef<'c, 'b>, val: Value<'c, 'b>) -> Result<()> {
         if block.terminator().is_none() {
-            let wide = self.ensure_i32(val, block)?;
-            block.append_operation(func::r#return(&[wide], self.loc));
+            let coerced = if self.fn_return_type == self.i64_type() {
+                self.ensure_i64(val, block)?
+            } else {
+                self.ensure_i32(val, block)?
+            };
+            block.append_operation(func::r#return(&[coerced], self.loc));
         }
         Ok(())
     }
@@ -220,155 +251,43 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     pub(super) fn emit_runtime_declarations(&mut self) {
         let i32_type  = self.i32_type();
-        let i64_type  = self.i64_type();
+        let i64_type = self.i64_type();
         let ptr_type  = self.llvm_ptr_type();
         let private   = &[(
             Identifier::new(self.ctx, "sym_visibility"),
             StringAttribute::new(self.ctx, "private").into(),
         )];
 
-        // __ts_console_log_i32(i32) -> ()
-        let op_i32 = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "__ts_console_log_i32"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i32_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_i32);
+        let add_func = |name: &str, params: &[Type<'c>], results: &[Type<'c>]| {
+            let op = func::func(
+                self.ctx,
+                StringAttribute::new(self.ctx, name),
+                TypeAttribute::new(FunctionType::new(self.ctx, params, results).into()),
+                Region::new(),
+                private,
+                self.loc,
+            );
+            self.module.body().append_operation(op);
+        };
 
-        // __ts_console_log_str(!llvm.ptr) -> ()
-        let op_str = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "__ts_console_log_str"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[ptr_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_str);
+        add_func("__ts_console_log_i32", &[i32_type], &[]);
+        add_func("__ts_console_log_val", &[i64_type], &[]);
+        add_func("ts_retain_val", &[i64_type], &[]);
+        add_func("ts_retain", &[ptr_type], &[]);
+        add_func("ts_release", &[ptr_type, ptr_type], &[]);
+        add_func("ts_release_val", &[i64_type], &[]);
+        
+        add_func("ts_obj_new", &[], &[i64_type]);
+        add_func("ts_obj_get", &[i64_type, ptr_type], &[i64_type]);
+        add_func("ts_obj_set", &[i64_type, ptr_type, i64_type], &[]);
+        
+        add_func("ts_arr_new", &[i32_type], &[i64_type]);
+        add_func("ts_arr_get", &[i64_type, i32_type], &[i64_type]);
+        add_func("ts_arr_set", &[i64_type, i32_type, i64_type], &[]);
+        add_func("ts_arr_len", &[i64_type], &[i64_type]);
 
-        // ts_retain_val(i64) -> ()
-        let op_retain_val = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_retain_val"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i64_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_retain_val);
-
-        // ts_retain(!llvm.ptr) -> ()
-        let op_retain = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_retain"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[ptr_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_retain);
-
-        // ts_release(!llvm.ptr, !llvm.ptr) -> ()
-        let op_release = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_release"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[ptr_type, ptr_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_release);
-
-        // ts_release_val(i64) -> ()
-        let op_release_val = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_release_val"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i64_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_release_val);
-
-        // ts_obj_new() -> i64
-        let op_obj_new = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_obj_new"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[], &[i64_type]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_obj_new);
-
-        // ts_obj_get(i64, !llvm.ptr) -> i64
-        let op_obj_get = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_obj_get"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i64_type, ptr_type], &[i64_type]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_obj_get);
-
-        // ts_obj_set(i64, !llvm.ptr, i64) -> ()
-        let op_obj_set = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_obj_set"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i64_type, ptr_type, i64_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_obj_set);
-
-        // ts_arr_new(i32) -> i64
-        let op_arr_new = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_arr_new"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i32_type], &[i64_type]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_arr_new);
-
-        // ts_arr_get(i64, i32) -> i64
-        let op_arr_get = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_arr_get"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i64_type, i32_type], &[i64_type]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_arr_get);
-
-        // ts_arr_set(i64, i32, i64) -> ()
-        let op_arr_set = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_arr_set"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i64_type, i32_type, i64_type], &[]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_arr_set);
-
-        // ts_arr_len(i64) -> i64
-        let op_arr_len = func::func(
-            self.ctx,
-            StringAttribute::new(self.ctx, "ts_arr_len"),
-            TypeAttribute::new(FunctionType::new(self.ctx, &[i64_type], &[i64_type]).into()),
-            Region::new(),
-            private,
-            self.loc,
-        );
-        self.module.body().append_operation(op_arr_len);
+        add_func("ts_string_new", &[ptr_type], &[i64_type]);
+        add_func("ts_string_concat", &[i64_type, i64_type], &[i64_type]);
     }
 
 
@@ -376,6 +295,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     pub(super) fn collect_function_signatures(&mut self, program: &Program<'_>) {
         let i32_type = self.i32_type();
+        // Polymorphic + (String concatenation)
+        // if binop.operator == BinaryOperator::Addition && lhs.r#type() == self.i64_type() && rhs.r#type() == self.i64_type() {
         for stmt in &program.body {
             if let Statement::FunctionDeclaration(func) = stmt {
                 let Some(id) = &func.id else { continue };
@@ -384,6 +305,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.funcs.insert(name, FuncSig {
                     param_types,
                     return_type: Some(i32_type),
+                });
+            }
+        }
+    }
+
+    pub(super) fn collect_class_definitions(&mut self, program: &Program<'_>) {
+        for stmt in &program.body {
+            if let Statement::ClassDeclaration(class) = stmt {
+                let Some(id) = &class.id else { continue };
+                let class_name = id.name.to_string();
+
+                let mut methods = HashMap::new();
+                for element in &class.body.body {
+                    if let ClassElement::MethodDefinition(method) = element {
+                        if let Some(name) = method.key.static_name() {
+                            let mangled = format!("__class_{}_{}", class_name, name);
+                            methods.insert(name.to_string(), mangled);
+                        }
+                    }
+                }
+
+                self.classes.insert(class_name.clone(), ClassSig {
+                    constructor_name: format!("__class_{}_constructor", class_name),
+                    methods,
                 });
             }
         }

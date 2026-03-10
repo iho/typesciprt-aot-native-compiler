@@ -8,9 +8,9 @@
 
 mod emit;
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use melior::ir::operation::OperationPrintingFlags;
 use melior::ir::operation::OperationLike;

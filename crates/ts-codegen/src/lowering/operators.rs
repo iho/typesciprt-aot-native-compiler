@@ -22,6 +22,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let rhs = rhs_opt
             .ok_or_else(|| anyhow::anyhow!("binary op: no right value"))?;
 
+        // Polymorphic + (String concatenation)
+        if binop.operator == BinaryOperator::Addition && lhs.r#type() == self.i64_type() && rhs.r#type() == self.i64_type() {
+            let res: Value<'c, 'b> = block
+                .append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_string_concat"),
+                    &[lhs, rhs],
+                    &[self.i64_type()],
+                    self.loc,
+                ))
+                .result(0)?
+                .into();
+            
+            // ARC: Release operands.
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs], &[], self.loc));
+            
+            return Ok((Some(res), block));
+        }
+
         let lhs_i32 = self.ensure_i32(lhs, block)?;
         let rhs_i32 = self.ensure_i32(rhs, block)?;
 
@@ -200,8 +220,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     pub(super) fn lower_update_expression<'b>(
         &mut self,
         update: &oxc_ast::ast::UpdateExpression<'_>,
-        mut block: BlockRef<'c, 'b>,
-        region: &'b Region<'c>,
+        block: BlockRef<'c, 'b>,
+        _region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::UpdateOperator;
@@ -211,9 +231,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             _ => bail!("update expression: only simple identifiers are supported"),
         };
         let name = id.name.to_string();
-
         // ARC: Manual identifier read.
-        let name = id.name.to_string();
         let old_val = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
         let old_i64 = self.ensure_i64(old_val, block)?;
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[old_i64], &[], self.loc));
@@ -358,7 +376,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("member assignment: object produced no value"))?;
         let obj_i64 = self.ensure_i64(obj, block)?;
         
-        let key_ptr = self.lower_string_literal(&member.property.name, block)?;
+        let key_ptr = self.get_string_ptr(&member.property.name, block)?;
         let val_i64 = self.ensure_i64(rhs, block)?;
 
         // ts_obj_set(obj, key, val)

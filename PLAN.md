@@ -40,13 +40,13 @@ Create a practical TypeScript AOT compiler that generates fast, native binaries.
 **Metrics**: ~270 lines of core lowering code
 
 **Known Issues**:
-- Only i32 supported
-- No control flow yet
-- console.log blocked by melior API limitations
+- Only i32 supported (expanded to TsVal for heap objects)
+- Control flow implemented (if/else, while, for)
+- console.log implemented for all TsVal types via C interop
 
 ---
 
-### Alpha v0.2 (In Planning)
+### Alpha v0.2 ✅ COMPLETED
 **Target**: Add comparison operators and conditional logic
 
 **Features to add**:
@@ -93,7 +93,7 @@ if (x > 0) {
 
 ---
 
-### Alpha v0.3 (In Planning)
+### Alpha v0.3 ✅ COMPLETED
 **Target**: Functions and loops
 
 **Features to add**:
@@ -142,7 +142,7 @@ sum;  // → 45
 
 ---
 
-### Beta v0.1 (In Planning)
+### Beta v0.1 ✅ COMPLETED
 **Target**: Standard library and improved I/O
 
 **Features to add**:

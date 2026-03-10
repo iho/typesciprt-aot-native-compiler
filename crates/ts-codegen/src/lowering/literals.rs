@@ -40,7 +40,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
-        let i32_type = self.i32_type();
         let i64_type = self.i64_type();
 
         let n = array.elements.len();
@@ -101,7 +100,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
-        let i32_type = self.i32_type();
         let i64_type = self.i64_type();
 
         let (arr_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
@@ -139,7 +137,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     /// Emit a `llvm.mlir.global` for the string (with null terminator) at
     /// module level, then return a `!llvm.ptr` pointing to the first byte.
-    pub(super) fn lower_string_literal<'b>(
+    pub(super) fn get_string_ptr<'b>(
         &mut self,
         s: &str,
         block: BlockRef<'c, 'b>,
@@ -165,7 +163,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             .ok_or_else(|| anyhow::anyhow!("failed to parse unit attribute"))?;
 
         // llvm.mlir.global internal constant @__ts_str_N("<bytes>") : !llvm.array<N x i8>
-        // The op always requires exactly one region (empty = attribute initializer).
         let global_op = OperationBuilder::new("llvm.mlir.global", self.loc)
             .add_attributes(&[
                 (Identifier::new(self.ctx, "sym_name"),    StringAttribute::new(self.ctx, &name).into()),
@@ -205,6 +202,28 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok(char_ptr)
     }
 
+    /// Lower a string literal to a heap-allocated TsString (TsVal).
+    pub(super) fn lower_string_literal<'b>(
+        &mut self,
+        s: &str,
+        block: BlockRef<'c, 'b>,
+    ) -> Result<Value<'c, 'b>> {
+        let char_ptr = self.get_string_ptr(s, block)?;
+        let i64_type = self.i64_type();
+
+        // %ts_str = func.call @ts_string_new(%char_ptr) : (!llvm.ptr) -> i64
+        Ok(block
+            .append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_string_new"),
+                &[char_ptr],
+                &[i64_type],
+                self.loc,
+            ))
+            .result(0)?
+            .into())
+    }
+
     // ── Object literals ───────────────────────────────────────────────────
 
     pub(super) fn lower_object_expression<'b>(
@@ -239,8 +258,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 _ => bail!("object literal: only static identifiers are supported as keys for now"),
             };
 
-            // key_ptr = lower_string_literal(...)
-            let key_ptr = self.lower_string_literal(&key_str, block)?;
+            // key_ptr = get_string_ptr(...)
+            let key_ptr = self.get_string_ptr(&key_str, block)?;
 
             let (val_opt, nb) = self.lower_expression(&p.value, block, region, scope)?;
             block = nb;

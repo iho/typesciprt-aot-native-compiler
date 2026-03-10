@@ -86,8 +86,18 @@ impl TsVal {
     }
 
     #[inline]
+    pub fn is_int32(self) -> bool {
+        self.is_nan_boxed() && (self.0 & TAG_MASK) == TAG_INT
+    }
+
+    #[inline]
     pub fn as_f64(self) -> f64 {
         f64::from_bits(self.0)
+    }
+
+    #[inline]
+    pub fn as_i32(self) -> i32 {
+        (self.0 & 0x0000_0000_FFFF_FFFF) as i32
     }
 
     #[inline]
@@ -104,7 +114,7 @@ impl TsVal {
 // ── Heap Objects ──────────────────────────────────────────────────────────────
 
 use std::collections::HashMap;
-use crate::alloc::{ts_alloc_rc, ts_release};
+use crate::alloc::ts_alloc_rc;
 
 /// A heap-allocated TypeScript object.
 pub struct TsObject {
@@ -114,6 +124,11 @@ pub struct TsObject {
 /// A heap-allocated TypeScript array.
 pub struct TsArray {
     pub elements: Vec<TsVal>,
+}
+
+/// A heap-allocated TypeScript string.
+pub struct TsString {
+    pub inner: String,
 }
 
 #[no_mangle]
@@ -132,6 +147,37 @@ pub unsafe extern "C" fn ts_obj_new() -> TsVal {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ts_obj_get(obj_val: TsVal, key_ptr: *const i8) -> TsVal {
+    let ptr = obj_val.as_ptr();
+    if !ptr.is_null() && !key_ptr.is_null() {
+        let obj = ptr as *mut TsObject;
+        let key = unsafe { std::ffi::CStr::from_ptr(key_ptr) }.to_string_lossy().into_owned();
+        if let Some(&val) = (&*obj).properties.get(&key) {
+            ts_retain_val(val);
+            return val;
+        }
+    }
+    UNDEFINED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_set(obj_val: TsVal, key_ptr: *const i8, val: TsVal) {
+    let ptr = obj_val.as_ptr();
+    if !ptr.is_null() && !key_ptr.is_null() {
+        let obj = ptr as *mut TsObject;
+        let key = unsafe { std::ffi::CStr::from_ptr(key_ptr) }.to_string_lossy().into_owned();
+        
+        // ARC: retain new value
+        ts_retain_val(val);
+        
+        let old_val = (&mut *obj).properties.insert(key, val);
+        if let Some(v) = old_val {
+            ts_release_val(v);
+        }
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ts_arr_new(capacity: i32) -> TsVal {
     let size = std::mem::size_of::<TsArray>();
     let ptr = ts_alloc_rc(size, 1) as *mut TsArray; // tag 1 = Array
@@ -146,6 +192,40 @@ pub unsafe extern "C" fn ts_arr_new(capacity: i32) -> TsVal {
         for _ in 0..capacity {
             (&mut *ptr).elements.push(UNDEFINED);
         }
+    }
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_string_new(c_str: *const i8) -> TsVal {
+    let s = unsafe { std::ffi::CStr::from_ptr(c_str) }.to_string_lossy().into_owned();
+    let size = std::mem::size_of::<TsString>();
+    let ptr = ts_alloc_rc(size, 2) as *mut TsString; // tag 2 = String
+    if ptr.is_null() {
+        return NULL;
+    }
+    unsafe {
+        std::ptr::write(ptr, TsString { inner: s });
+    }
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_string_concat(v1: TsVal, v2: TsVal) -> TsVal {
+    let p1 = v1.as_ptr() as *mut TsString;
+    let p2 = v2.as_ptr() as *mut TsString;
+    
+    let s1 = unsafe { &(*p1).inner };
+    let s2 = unsafe { &(*p2).inner };
+    
+    let new_s = format!("{}{}", s1, s2);
+    let size = std::mem::size_of::<TsString>();
+    let ptr = ts_alloc_rc(size, 2) as *mut TsString;
+    if ptr.is_null() {
+        return NULL;
+    }
+    unsafe {
+        std::ptr::write(ptr, TsString { inner: new_s });
     }
     TsVal::from_ptr(ptr as *mut u8)
 }
@@ -221,6 +301,7 @@ pub unsafe extern "C" fn ts_release_val(val: TsVal) {
         let destructor = match tag {
             0 => Some(ts_obj_destructor as unsafe extern "C" fn(*mut u8)),
             1 => Some(ts_arr_destructor as unsafe extern "C" fn(*mut u8)),
+            2 => Some(ts_string_destructor as unsafe extern "C" fn(*mut u8)),
             _ => None,
         };
         
@@ -249,6 +330,15 @@ pub unsafe extern "C" fn ts_arr_destructor(ptr: *mut u8) {
             ts_release_val(val);
         }
         std::ptr::drop_in_place(arr_ptr);
+    }
+}
+
+/// Destructor for TsString.
+#[no_mangle]
+pub unsafe extern "C" fn ts_string_destructor(ptr: *mut u8) {
+    let s_ptr = ptr as *mut TsString;
+    unsafe {
+        std::ptr::drop_in_place(s_ptr);
     }
 }
 

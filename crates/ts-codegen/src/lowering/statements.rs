@@ -85,8 +85,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         &[],
                         self.loc,
                     ));
+                    // Return the (released) value so main() can use it as exit code.
+                    // For integers ts_release_val is a no-op, so the SSA value remains valid.
+                    return Ok((Some(val_i64), nb));
                 }
-                Ok((val_opt, nb))
+                Ok((None, nb))
             }
             Statement::VariableDeclaration(vd) => {
                 self.lower_variable_declaration(vd, block, region, scope)
@@ -152,6 +155,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     bail!("continue statement outside of loop");
                 }
             }
+            Statement::ClassDeclaration(_) => {
+                Ok((None, block)) // Already lowered in the dedicated pass.
+            }
             _ => {
                 tracing::debug!("skipping unimplemented statement kind");
                 Ok((None, block))
@@ -168,22 +174,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
-        let mut result = None;
         for declarator in &var_decl.declarations {
             let name = match &declarator.id {
                 BindingPattern::BindingIdentifier(b) => b.name.to_string(),
                 _ => { tracing::debug!("skipping non-simple binding pattern"); continue; }
             };
             if let Some(init) = &declarator.init {
+                // Type inference: record class name for `let x = new Foo()`.
+                if let Expression::NewExpression(new_expr) = init {
+                    if let Expression::Identifier(id) = &new_expr.callee {
+                        self.var_class_types.insert(name.clone(), id.name.to_string());
+                    }
+                }
                 let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
                 block = nb;
                 if let Some(val) = val_opt {
                     scope.insert(name.clone(), val);
-                    result = Some(val);
                 }
             }
         }
-        Ok((result, block))
+        Ok((None, block))
     }
 
     // ── Return statement ──────────────────────────────────────────────────

@@ -51,11 +51,9 @@ undefined_var.ts: Error: undefined variable → proper error ✓
 
 ### ⏳ In Progress / Blocked
 
-#### console.log Implementation (Blocked)
-- Stub implementation recognizes console.log calls
-- **Blocker**: melior ODS bindings don't expose `llvm.mlir.global` or `llvm.address_of` operations
-- Requires raw LLVM Operation API (not exposed in melior v0.26)
-- Deferred until melior improves or alternative approach found
+#### console.log Implementation (Completed)
+- [x] Unified `__ts_console_log_val` handles integers, booleans, strings, and arrays (recursively).
+- [x] Implemented via C interop in `ts-runtime`.
 
 ### 🚀 Not Yet Implemented
 
@@ -67,32 +65,25 @@ undefined_var.ts: Error: undefined variable → proper error ✓
 #### Comparison & Boolean Operators (Priority: High)
 - [x] Comparison operators: `<`, `>`, `<=`, `>=`, `==`, `!=`
 - [x] Boolean operators: `&&`, `||`, `!`
-- [ ] Boolean type support
+- [x] Boolean type support (represented as bit-tagged TsVal)
 
 #### Loops (Priority: Medium)
 - [x] `for` loops
 - [x] `while` loops
-- [ ] Loop control: `break`, `continue`
+- [x] Loop control: `break`, `continue`
 
 #### Functions (Priority: Medium)
 - [x] Function declarations
 - [x] Function calls with arguments
 - [x] Return statements
 - [x] Local scoping for parameters
-- [x] Recursive functions (supported via MLIR stack allocation)
+- [x] Recursive functions
 
-#### Type System (Priority: Medium)
-- [ ] Type annotations parsing
-- [ ] Type checking and inference
-- [ ] Multiple numeric types (f64, i16, etc.)
-- [ ] Boolean type
-
-#### Advanced Features (Priority: Low)
-- [ ] Objects and properties
-- [ ] Arrays and indexing
-- [ ] Classes and methods
-- [ ] Async/await
-- [ ] String literals and operations
+#### Heap Types & Memory (Priority: Medium)
+- [x] **ARC Garbage Collection**: Reference counting for all heap objects
+- [x] **Strings**: Literals and concatenation (`+`)
+- [x] **Arrays**: Literals, indexing (`a[i]`), assignments, and `.length`
+- [x] **Objects**: Literals, property access (`o.x`), and assignments
 
 #### Out of Scope / Future Considerations
 - **Garbage Collection**: Planned memory management via ARC or Arena Allocators instead of a heavy GC.

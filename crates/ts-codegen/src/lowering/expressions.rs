@@ -56,7 +56,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
                 
                 let obj_i64 = self.ensure_i64(obj, block)?;
-                let key_ptr = self.lower_string_literal(&member.property.name, block)?;
+                let key_ptr = self.get_string_ptr(&member.property.name, block)?;
                 
                 let val: Value<'c, 'b> = block
                     .append_operation(func::call(
@@ -109,6 +109,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Expression::ConditionalExpression(cond) => {
                 self.lower_conditional_expression(cond, block, region, scope)
             }
+            Expression::NewExpression(new_expr) => {
+                self.lower_new_expression(new_expr, block, region, scope)
+            }
+            Expression::ThisExpression(_) => {
+                match scope.get("this") {
+                    Some(&v) => {
+                        // Follow the same ownership convention as Identifier:
+                        // reading a variable produces an owned reference.
+                        let v_i64 = self.ensure_i64(v, block)?;
+                        block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                            &[v_i64],
+                            &[],
+                            self.loc,
+                        ));
+                        Ok((Some(v), block))
+                    }
+                    None => bail!("'this' used outside of a class method"),
+                }
+            }
             Expression::ParenthesizedExpression(pe) => {
                 self.lower_expression(&pe.expression, block, region, scope)
             }
@@ -141,36 +162,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     let val = val_opt
                         .ok_or_else(|| anyhow::anyhow!("console.log: argument produced no value"))?;
                     
-                    if val.r#type() == self.llvm_ptr_type() {
-                        // String argument → __ts_console_log_str(ptr)
-                        block.append_operation(func::call(
-                            self.ctx,
-                            FlatSymbolRefAttribute::new(self.ctx, "__ts_console_log_str"),
-                            &[val],
-                            &[],
-                            self.loc,
-                        ));
-                    } else {
-                        // Numeric/bool argument → __ts_console_log_i32(n)
-                        let val_i32 = self.ensure_i32(val, block)?;
-                        block.append_operation(func::call(
-                            self.ctx,
-                            FlatSymbolRefAttribute::new(self.ctx, "__ts_console_log_i32"),
-                            &[val_i32],
-                            &[],
-                            self.loc,
-                        ));
-                    }
-                    
-                    // ARC: Release the argument expression result.
                     let val_i64 = self.ensure_i64(val, block)?;
                     block.append_operation(func::call(
                         self.ctx,
-                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        FlatSymbolRefAttribute::new(self.ctx, "__ts_console_log_val"),
                         &[val_i64],
                         &[],
                         self.loc,
                     ));
+                    
+                    // ARC: console.log doesn't take ownership permanently, but it's a sink.
+                    // Following our policy, we release the argument after the call.
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[val_i64], &[], self.loc));
                     
                     return Ok((None, block));
                 }
@@ -212,8 +215,98 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
+        // Method call: obj.method(args)  → __class_Foo_method(obj, args)
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            // Determine the object's class from var_class_types (best-effort inference).
+            let class_name_opt = if let Expression::Identifier(id) = &member.object {
+                self.var_class_types.get(id.name.as_str()).cloned()
+            } else {
+                None
+            };
+
+            if let Some(class_name) = class_name_opt {
+                let method_name = member.property.name.as_str().to_string();
+                if let Some(sig) = self.classes.get(&class_name).cloned() {
+                    if let Some(mangled) = sig.methods.get(&method_name).cloned() {
+                        // Lower `this` object.
+                        let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+                        block = nb;
+                        let obj = obj_opt
+                            .ok_or_else(|| anyhow::anyhow!("method call: object produced no value"))?;
+                        let obj_i64 = self.ensure_i64(obj, block)?;
+
+                        // Lower arguments.
+                        let mut args = vec![obj_i64];
+                        for arg in &call.arguments {
+                            let expr = arg.as_expression()
+                                .ok_or_else(|| anyhow::anyhow!("spread in method call"))?;
+                            let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                            block = nb;
+                            let v = v_opt
+                                .ok_or_else(|| anyhow::anyhow!("method arg produced no value"))?;
+                            args.push(self.ensure_i64(v, block)?);
+                        }
+
+                        let result_types = &[self.i64_type()];
+                        let op = block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, &mangled),
+                            &args,
+                            result_types,
+                            self.loc,
+                        ));
+                        return Ok((Some(op.result(0)?.into()), block));
+                    }
+                }
+            }
+        }
+
         tracing::debug!("skipping unimplemented call expression");
         Ok((None, block))
+    }
+
+    // ── new Foo(args) ─────────────────────────────────────────────────────
+
+    fn lower_new_expression<'b>(
+        &mut self,
+        new_expr: &NewExpression<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let Expression::Identifier(callee_id) = &new_expr.callee else {
+            bail!("new: only simple class names are supported as constructors");
+        };
+        let class_name = callee_id.name.to_string();
+
+        let ctor_name = format!("__class_{}_constructor", class_name);
+        let Some(sig) = self.funcs.get(&ctor_name).cloned() else {
+            bail!("new {}: unknown class (constructor not found)", class_name);
+        };
+
+        let i64_type = self.i64_type();
+        let mut args: Vec<Value<'c, 'b>> = Vec::new();
+        for arg in &new_expr.arguments {
+            let expr = arg.as_expression()
+                .ok_or_else(|| anyhow::anyhow!("spread in new expression"))?;
+            let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+            block = nb;
+            let v = v_opt.ok_or_else(|| anyhow::anyhow!("new arg produced no value"))?;
+            args.push(self.ensure_i64(v, block)?);
+        }
+
+        let result_types: Vec<melior::ir::Type<'c>> =
+            sig.return_type.iter().copied().collect();
+
+        let op = block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, &ctor_name),
+            &args,
+            &result_types,
+            self.loc,
+        ));
+
+        Ok((Some(op.result(0)?.into()), block))
     }
 
 }
