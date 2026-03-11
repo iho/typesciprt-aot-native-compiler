@@ -567,3 +567,25 @@ fn map_for_of() {
         3, // sum of values = 3
     );
 }
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn regexp_basic() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/regex.ts"),
+        &root.join("target/test-regex"),
+        2, // true+false+true = 2
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn json_builtin() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/json_builtin.ts"),
+        &root.join("target/test-json"),
+        1, // parsed.a = 1
+    );
+}

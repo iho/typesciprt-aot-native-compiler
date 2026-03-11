@@ -295,6 +295,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     Err(e) => Err(e),
                 }
             }
+            Expression::RegExpLiteral(re_lit) => {
+                // /pattern/flags → ts_regexp_new(source_ptr, flags_ptr)
+                let source = re_lit.regex.pattern.text.as_str().to_string();
+                let flags = re_lit.regex.flags.to_string();
+                let src_ptr = self.get_string_ptr(&source, block)?;
+                let flags_ptr = self.get_string_ptr(&flags, block)?;
+                let i64t = self.i64_type();
+                let re_val: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_regexp_new"),
+                    &[src_ptr, flags_ptr], &[i64t], self.loc,
+                )).result(0)?.into();
+                Ok((Some(re_val), block))
+            }
             _ => {
                 tracing::debug!("skipping unimplemented expression kind");
                 Ok((None, block))
@@ -502,7 +515,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         if let Expression::Identifier(callee_id) = &call.callee {
             let callee_name = callee_id.name.as_str();
             match callee_name {
-                "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "Number" | "String" => {
+                "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "Number" | "String"
+                | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI" => {
                     if !self.funcs.contains_key(callee_name) {
                         let i64t = self.i64_type();
                         let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
@@ -561,6 +575,34 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 let v = arg_vals.first().copied().unwrap_or(undef_i64);
                                 block.append_operation(func::call(
                                     self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_coerce_string"),
+                                    &[v], &[i64t], self.loc,
+                                )).result(0)?.into()
+                            }
+                            "encodeURIComponent" => {
+                                let v = arg_vals.first().copied().unwrap_or(undef_i64);
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_encode_uri_component"),
+                                    &[v], &[i64t], self.loc,
+                                )).result(0)?.into()
+                            }
+                            "decodeURIComponent" => {
+                                let v = arg_vals.first().copied().unwrap_or(undef_i64);
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_decode_uri_component"),
+                                    &[v], &[i64t], self.loc,
+                                )).result(0)?.into()
+                            }
+                            "encodeURI" => {
+                                let v = arg_vals.first().copied().unwrap_or(undef_i64);
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_encode_uri"),
+                                    &[v], &[i64t], self.loc,
+                                )).result(0)?.into()
+                            }
+                            "decodeURI" => {
+                                let v = arg_vals.first().copied().unwrap_or(undef_i64);
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_decode_uri"),
                                     &[v], &[i64t], self.loc,
                                 )).result(0)?.into()
                             }
@@ -710,15 +752,70 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     sig.param_types.len()
                 };
 
-                // Lower all call arguments.
+                // Lower all call arguments (handling SpreadElement by flattening the array).
                 let mut all_arg_vals: Vec<Value<'c, 'b>> = Vec::new();
+                let i32t = self.i32_type();
+                let i64t2 = self.i64_type();
                 for arg in call.arguments.iter() {
-                    let expr = arg.as_expression()
-                        .ok_or_else(|| anyhow::anyhow!("spread in function call not supported"))?;
-                    let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
-                    block = nb;
-                    let v = v_opt.ok_or_else(|| anyhow::anyhow!("argument produced no value"))?;
-                    all_arg_vals.push(self.ensure_i64(v, block)?);
+                    match arg {
+                        oxc_ast::ast::Argument::SpreadElement(spread) => {
+                            // Evaluate spread expression (should be TsArray), flatten into all_arg_vals.
+                            let (v_opt, nb) = self.lower_expression(&spread.argument, block, region, scope)?;
+                            block = nb;
+                            let arr = v_opt.ok_or_else(|| anyhow::anyhow!("spread arg produced no value"))?;
+                            let arr_i64 = self.ensure_i64(arr, block)?;
+                            // Get array length at compile time is not possible, use runtime loop approach:
+                            // We don't have a loop in codegen here, so we emit ts_arr_get for indices 0..max
+                            // and build a dynamic approach. Simplest: use ts_arr_len then push individually.
+                            // For most cases (known-arity functions), the spread array has a fixed size.
+                            // Emit a runtime-length iteration: generate up to 8 elements.
+                            let len_val: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_length"),
+                                &[arr_i64], &[i64t2], self.loc,
+                            )).result(0)?.into();
+                            let len_i32 = self.ensure_i32(len_val, block)?;
+                            // We'll unroll up to the needed number of params.
+                            // Just emit gets for 0..(n_regular - current_count) clamped at 8.
+                            let needed = n_regular.saturating_sub(all_arg_vals.len()).min(8);
+                            for idx in 0..needed {
+                                let idx_c: Value<'c, 'b> = block.append_operation(arith::constant(
+                                    self.ctx, IntegerAttribute::new(i32t, idx as i64).into(), self.loc,
+                                )).result(0)?.into();
+                                // Check idx < len
+                                let in_bounds: Value<'c, 'b> = block.append_operation(arith::cmpi(
+                                    self.ctx, arith::CmpiPredicate::Slt, idx_c, len_i32, self.loc,
+                                )).result(0)?.into();
+                                // Get element (or undefined if out of bounds)
+                                let elem: Value<'c, 'b> = block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                                    &[arr_i64, idx_c], &[i64t2], self.loc,
+                                )).result(0)?.into();
+                                let undef_c: Value<'c, 'b> = block.append_operation(arith::constant(
+                                    self.ctx, IntegerAttribute::new(i64t2, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                                )).result(0)?.into();
+                                // Select: in_bounds ? elem : undefined
+                                let selected: Value<'c, 'b> = block.append_operation(
+                                    OperationBuilder::new("arith.select", self.loc)
+                                        .add_operands(&[in_bounds, elem, undef_c])
+                                        .add_results(&[i64t2])
+                                        .build()?
+                                ).result(0)?.into();
+                                all_arg_vals.push(selected);
+                            }
+                            block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[arr_i64], &[], self.loc,
+                            ));
+                        }
+                        _ => {
+                            let expr = arg.as_expression()
+                                .ok_or_else(|| anyhow::anyhow!("argument produced no value"))?;
+                            let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                            block = nb;
+                            let v = v_opt.ok_or_else(|| anyhow::anyhow!("argument produced no value"))?;
+                            all_arg_vals.push(self.ensure_i64(v, block)?);
+                        }
+                    }
                 }
 
                 let mut args: Vec<Value<'c, 'b>> = Vec::new();
@@ -994,7 +1091,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 "replace" | "replaceAll" | "startsWith" | "endsWith" |
                 "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" |
                 // Map methods
-                "set" | "get" | "has" | "delete" | "clear" | "keys" | "values" | "entries"
+                "set" | "get" | "has" | "delete" | "clear" | "keys" | "values" | "entries" |
+                // RegExp methods
+                "test" | "exec" |
+                // String match/replace with RegExp
+                "match"
             );
             if is_builtin {
                 // Evaluate receiver
@@ -1194,8 +1295,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     "replace" => {
                         let search = arg_vals.first().copied().unwrap_or(undefined_i64);
                         let repl   = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        // Use regex variant if first arg might be RegExp (ts_str_replace_regex handles both)
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_replace"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_replace_regex"),
                             &[obj_i64, search, repl], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
@@ -1311,6 +1413,29 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_entries"),
                             &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    // ── RegExp methods ──────────────────────────────────────
+                    "test" => {
+                        let s = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_regexp_test"),
+                            &[obj_i64, s], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "exec" => {
+                        let s = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_regexp_exec"),
+                            &[obj_i64, s], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "match" => {
+                        // str.match(re): obj=string, arg0=regexp
+                        let re = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_match"),
+                            &[obj_i64, re], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     _ => None,
@@ -1566,6 +1691,34 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let class_name = callee_id.name.to_string();
 
         // Built-in constructors
+        if class_name == "RegExp" {
+            let i64t = self.i64_type();
+            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            let mut args: Vec<Value<'c, 'b>> = Vec::new();
+            for a in &new_expr.arguments {
+                if let Some(expr) = a.as_expression() {
+                    let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    if let Some(v) = v_opt { args.push(self.ensure_i64(v, block)?); }
+                }
+            }
+            let src = args.first().copied().unwrap_or(undef_i64);
+            let flags = args.get(1).copied().unwrap_or(undef_i64);
+            let re_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_regexp_from_val"),
+                &[src, flags], &[i64t], self.loc,
+            )).result(0)?.into();
+            for a in &args {
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[*a], &[], self.loc,
+                ));
+            }
+            return Ok((Some(re_val), block));
+        }
+
         if class_name == "Map" {
             let i64t = self.i64_type();
             let map_val: Value<'c, 'b> = block.append_operation(func::call(

@@ -611,6 +611,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_arr_rest",    &[i64_type, i32_type], &[i64_type]);
         add_func("ts_obj_rest",    &[i64_type, i64_type], &[i64_type]);
         add_func("ts_map_entries", &[i64_type], &[i64_type]);
+
+        add_func("ts_json_stringify",  &[i64_type], &[i64_type]);
+        add_func("ts_json_parse",      &[i64_type], &[i64_type]);
+        add_func("ts_coerce_number",   &[i64_type], &[i64_type]);
+        add_func("ts_coerce_string",   &[i64_type], &[i64_type]);
+        add_func("ts_func_spread_call",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_encode_uri_component",&[i64_type], &[i64_type]);
+        add_func("ts_decode_uri_component",&[i64_type], &[i64_type]);
+        add_func("ts_encode_uri",          &[i64_type], &[i64_type]);
+        add_func("ts_decode_uri",          &[i64_type], &[i64_type]);
+
+        add_func("ts_regexp_new",          &[ptr_type, ptr_type], &[i64_type]);
+        add_func("ts_regexp_from_val",     &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_regexp_test",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_regexp_exec",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_match",           &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_replace_regex",   &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_regexp_source",       &[i64_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.

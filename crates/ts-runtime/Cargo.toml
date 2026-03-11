@@ -17,3 +17,4 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
+regex = "1"
