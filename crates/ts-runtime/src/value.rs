@@ -1112,6 +1112,127 @@ pub unsafe extern "C" fn ts_obj_set_val_key(obj: TsVal, key: TsVal, val: TsVal) 
     ts_obj_set(obj, bytes.as_ptr() as *const i8, val);
 }
 
+/// Generic getter for `obj[key]` — works for arrays (integer index), objects (string key),
+/// Map (TsVal key), and strings (character-at index).
+#[no_mangle]
+pub unsafe extern "C" fn ts_val_get_key(obj: TsVal, key: TsVal) -> TsVal {
+    if !obj.is_ptr() {
+        return UNDEFINED;
+    }
+    let tag = heap_tag(obj);
+    // Array with integer index
+    if tag == 1 && key.is_int32() {
+        return ts_arr_get(obj, key.as_i32());
+    }
+    // Map with any key
+    if tag == 5 {
+        return ts_map_get(obj, key);
+    }
+    // String: character at integer index
+    if tag == 2 && key.is_int32() {
+        let idx = key.as_i32() as usize;
+        let ts_str = &*(obj.as_ptr() as *const TsString);
+        let chars: Vec<char> = ts_str.inner.chars().collect();
+        if idx < chars.len() {
+            let ch = chars[idx].to_string();
+            let mut bytes = ch.into_bytes();
+            bytes.push(0u8);
+            return ts_string_new(bytes.as_ptr() as *const i8);
+        }
+        return UNDEFINED;
+    }
+    // Object (or array) with string key
+    let key_string = if key.is_int32() {
+        key.as_i32().to_string()
+    } else if key.is_ptr() && heap_tag(key) == 2 {
+        let ts_str = &*(key.as_ptr() as *const TsString);
+        ts_str.inner.clone()
+    } else if !key.is_nan_boxed() {
+        key.as_f64().to_string()
+    } else {
+        return UNDEFINED;
+    };
+    let mut bytes = key_string.into_bytes();
+    bytes.push(0u8);
+    ts_obj_get(obj, bytes.as_ptr() as *const i8)
+}
+
+/// Returns a new TsArray containing elements from index `start` to the end.
+/// Used for array destructuring rest: `const [a, b, ...rest] = arr`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_rest(arr: TsVal, start: i32) -> TsVal {
+    if !arr.is_ptr() || heap_tag(arr) != 1 {
+        return ts_arr_new(0);
+    }
+    let src = &*(arr.as_ptr() as *const TsArray);
+    let len = src.elements.len() as i32;
+    let from = start.max(0) as usize;
+    let new_len = ((len - start).max(0)) as i32;
+    let result = ts_arr_new(new_len);
+    for i in 0..(new_len as usize) {
+        let val = src.elements[from + i];
+        ts_retain_val(val);
+        ts_arr_set(result, i as i32, val);
+    }
+    result
+}
+
+/// Returns a new TsObject with all enumerable own properties EXCEPT those in `keys_arr`.
+/// `keys_arr` is a TsArray of TsString values (the already-destructured keys).
+/// Used for `const { a, b, ...rest } = obj`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_rest(obj: TsVal, keys_arr: TsVal) -> TsVal {
+    if !obj.is_ptr() || heap_tag(obj) != 0 {
+        return ts_obj_new();
+    }
+    // Collect excluded key strings
+    let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if keys_arr.is_ptr() && heap_tag(keys_arr) == 1 {
+        let arr = &*(keys_arr.as_ptr() as *const TsArray);
+        for &k in &arr.elements {
+            if k.is_ptr() && heap_tag(k) == 2 {
+                let ts_str = &*(k.as_ptr() as *const TsString);
+                excluded.insert(ts_str.inner.clone());
+            } else if k.is_int32() {
+                excluded.insert(k.as_i32().to_string());
+            }
+        }
+    }
+    let result = ts_obj_new();
+    let src = &*(obj.as_ptr() as *const TsObject);
+    for (key, val) in &src.properties {
+        if excluded.contains(key) { continue; }
+        if key.starts_with("__") { continue; }
+        let mut bytes = key.as_bytes().to_vec();
+        bytes.push(0u8);
+        ts_retain_val(*val);
+        ts_obj_set(result, bytes.as_ptr() as *const i8, *val);
+    }
+    result
+}
+
+/// Returns a TsArray of 2-element TsArrays: [[k1,v1], [k2,v2], ...].
+/// Used for `for (const [k, v] of m.entries())`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_map_entries(map_val: TsVal) -> TsVal {
+    if !map_val.is_ptr() || heap_tag(map_val) != 5 {
+        return ts_arr_new(0);
+    }
+    let map = &*(map_val.as_ptr() as *const TsMap);
+    let n = map.entries.len() as i32;
+    let result = ts_arr_new(n);
+    for (i, (k, v)) in map.entries.iter().enumerate() {
+        let pair = ts_arr_new(2);
+        ts_retain_val(*k);
+        ts_arr_set(pair, 0, *k);
+        ts_retain_val(*v);
+        ts_arr_set(pair, 1, *v);
+        ts_arr_set(result, i as i32, pair);
+        ts_release_val(pair);
+    }
+    result
+}
+
 /// Returns a `TsArray` containing the own enumerable string keys of `obj`.
 /// Internal keys (prefixed with `__`) are excluded.
 #[no_mangle]
@@ -2064,6 +2185,259 @@ pub unsafe extern "C" fn ts_is_finite_val(val: TsVal) -> TsVal {
         TsVal::from_bool(val.as_f64().is_finite())
     } else {
         TsVal::from_bool(false)
+    }
+}
+
+// ── JSON ──────────────────────────────────────────────────────────────────────
+
+/// JSON.stringify: convert TsVal to a JSON string TsVal.
+#[no_mangle]
+pub unsafe extern "C" fn ts_json_stringify(val: TsVal) -> TsVal {
+    let s = ts_val_to_json_string(val, 0);
+    let mut bytes = s.into_bytes();
+    bytes.push(0u8);
+    ts_string_new(bytes.as_ptr() as *const i8)
+}
+
+unsafe fn ts_val_to_json_string(val: TsVal, depth: usize) -> String {
+    if depth > 50 { return "null".to_string(); }
+    if val == UNDEFINED { return "null".to_string(); }
+    if val == NULL { return "null".to_string(); }
+    if val == TRUE { return "true".to_string(); }
+    if val == FALSE { return "false".to_string(); }
+    if val.is_int32() {
+        return val.as_i32().to_string();
+    }
+    if val.is_number() {
+        let f = val.as_f64();
+        if f.is_infinite() || f.is_nan() { return "null".to_string(); }
+        if f == f.floor() && f.abs() < 1e15 {
+            return format!("{}", f as i64);
+        }
+        return format!("{}", f);
+    }
+    if val.is_ptr() {
+        let tag = heap_tag(val);
+        if tag == 2 {
+            // String: JSON-encode it
+            let ts_str = &*(val.as_ptr() as *const TsString);
+            let escaped = ts_str.inner
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            return format!("\"{}\"", escaped);
+        }
+        if tag == 1 {
+            // Array
+            let arr = &*(val.as_ptr() as *const TsArray);
+            let items: Vec<String> = arr.elements.iter().map(|&v| {
+                if v == UNDEFINED { "null".to_string() }
+                else { ts_val_to_json_string(v, depth + 1) }
+            }).collect();
+            return format!("[{}]", items.join(","));
+        }
+        if tag == 0 {
+            // Object
+            let obj = &*(val.as_ptr() as *const TsObject);
+            let props: Vec<String> = obj.properties.iter()
+                .filter(|(k, _)| !k.starts_with("__"))
+                .filter_map(|(k, &v)| {
+                    if v == UNDEFINED { return None; }
+                    let escaped_key = k.replace('"', "\\\"");
+                    Some(format!("\"{}\":{}", escaped_key, ts_val_to_json_string(v, depth + 1)))
+                })
+                .collect();
+            return format!("{{{}}}", props.join(","));
+        }
+    }
+    "null".to_string()
+}
+
+/// JSON.parse: parse JSON string TsVal to a TsVal.
+#[no_mangle]
+pub unsafe extern "C" fn ts_json_parse(str_val: TsVal) -> TsVal {
+    if !str_val.is_ptr() || heap_tag(str_val) != 2 {
+        return UNDEFINED;
+    }
+    let ts_str = &*(str_val.as_ptr() as *const TsString);
+    let s = ts_str.inner.trim().to_string();
+    ts_parse_json_value(&s)
+}
+
+unsafe fn ts_parse_json_value(s: &str) -> TsVal {
+    let s = s.trim();
+    if s == "null" { return NULL; }
+    if s == "true" { return TRUE; }
+    if s == "false" { return FALSE; }
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len()-1];
+        let unescaped = inner
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t");
+        let mut bytes = unescaped.into_bytes();
+        bytes.push(0u8);
+        return ts_string_new(bytes.as_ptr() as *const i8);
+    }
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = s[1..s.len()-1].trim();
+        let arr = ts_arr_new(0);
+        if inner.is_empty() { return arr; }
+        let mut i = 0i32;
+        for item_str in json_split_values(inner) {
+            let val = ts_parse_json_value(item_str.trim());
+            ts_arr_set(arr, i, val);
+            ts_release_val(val);
+            i += 1;
+        }
+        return arr;
+    }
+    if s.starts_with('{') && s.ends_with('}') {
+        let inner = s[1..s.len()-1].trim();
+        let obj = ts_obj_new();
+        if inner.is_empty() { return obj; }
+        for pair_str in json_split_values(inner) {
+            let pair = pair_str.trim();
+            if let Some(colon_pos) = json_find_colon(pair) {
+                let key_str = pair[..colon_pos].trim();
+                let val_str = pair[colon_pos+1..].trim();
+                if key_str.starts_with('"') && key_str.ends_with('"') && key_str.len() >= 2 {
+                    let key = &key_str[1..key_str.len()-1];
+                    let val = ts_parse_json_value(val_str);
+                    let mut key_bytes = key.as_bytes().to_vec();
+                    key_bytes.push(0u8);
+                    ts_obj_set(obj, key_bytes.as_ptr() as *const i8, val);
+                    ts_release_val(val);
+                }
+            }
+        }
+        return obj;
+    }
+    // Number
+    if let Ok(i) = s.parse::<i32>() {
+        return TsVal::from_i32(i);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return TsVal::from_f64(f);
+    }
+    NULL
+}
+
+fn json_split_values(s: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        if escape { escape = false; continue; }
+        if ch == '\\' && in_str { escape = true; continue; }
+        if ch == '"' { in_str = !in_str; continue; }
+        if in_str { continue; }
+        match ch {
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(&s[start..]);
+    result
+}
+
+fn json_find_colon(s: &str) -> Option<usize> {
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, ch) in s.char_indices() {
+        if escape { escape = false; continue; }
+        if ch == '\\' && in_str { escape = true; continue; }
+        if ch == '"' { in_str = !in_str; continue; }
+        if !in_str && ch == ':' { return Some(i); }
+    }
+    None
+}
+
+// ── Number() / String() coercion ─────────────────────────────────────────────
+
+/// Number(val) — converts any TsVal to a numeric TsVal.
+#[no_mangle]
+pub unsafe extern "C" fn ts_coerce_number(val: TsVal) -> TsVal {
+    if val.is_int32() { return val; }
+    if val.is_number() { return val; } // already float
+    if val == TRUE { return TsVal::from_i32(1); }
+    if val == FALSE || val == NULL { return TsVal::from_i32(0); }
+    if val == UNDEFINED { return TsVal::from_f64(f64::NAN); }
+    if val.is_ptr() && heap_tag(val) == 2 {
+        let ts_str = &*(val.as_ptr() as *const TsString);
+        let s = ts_str.inner.trim();
+        if s.is_empty() { return TsVal::from_i32(0); }
+        if let Ok(i) = s.parse::<i32>() { return TsVal::from_i32(i); }
+        if let Ok(f) = s.parse::<f64>() { return TsVal::from_f64(f); }
+    }
+    TsVal::from_f64(f64::NAN)
+}
+
+/// String(val) — converts any TsVal to a string TsVal.
+#[no_mangle]
+pub unsafe extern "C" fn ts_coerce_string(val: TsVal) -> TsVal {
+    ts_val_to_string(val)
+}
+
+// ── Spread function call ──────────────────────────────────────────────────────
+
+/// Call a TsFunction with arguments spread from a TsArray.
+#[no_mangle]
+pub unsafe extern "C" fn ts_func_spread_call(fn_val: TsVal, args_arr: TsVal) -> TsVal {
+    let len = if args_arr.is_ptr() && heap_tag(args_arr) == 1 {
+        (*(args_arr.as_ptr() as *const TsArray)).elements.len()
+    } else {
+        0
+    };
+    match len {
+        0 => dispatch_callback(fn_val, &[]),
+        1 => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let r = dispatch_callback(fn_val, &[a0]);
+            ts_release_val(a0);
+            r
+        }
+        2 => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let a1 = ts_arr_get(args_arr, 1);
+            let r = dispatch_callback(fn_val, &[a0, a1]);
+            ts_release_val(a0);
+            ts_release_val(a1);
+            r
+        }
+        3 => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let a1 = ts_arr_get(args_arr, 1);
+            let a2 = ts_arr_get(args_arr, 2);
+            let r = dispatch_callback(fn_val, &[a0, a1, a2]);
+            ts_release_val(a0);
+            ts_release_val(a1);
+            ts_release_val(a2);
+            r
+        }
+        _ => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let a1 = ts_arr_get(args_arr, 1);
+            let a2 = ts_arr_get(args_arr, 2);
+            let a3 = ts_arr_get(args_arr, 3);
+            let r = dispatch_callback(fn_val, &[a0, a1, a2, a3]);
+            ts_release_val(a0);
+            ts_release_val(a1);
+            ts_release_val(a2);
+            ts_release_val(a3);
+            r
+        }
     }
 }
 

@@ -498,11 +498,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
-        // ── Global built-in functions: parseInt, parseFloat, isNaN, isFinite ──
+        // ── Global built-in functions: parseInt, parseFloat, isNaN, isFinite, Number, String ──
         if let Expression::Identifier(callee_id) = &call.callee {
             let callee_name = callee_id.name.as_str();
             match callee_name {
-                "parseInt" | "parseFloat" | "isNaN" | "isFinite" => {
+                "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "Number" | "String" => {
                     if !self.funcs.contains_key(callee_name) {
                         let i64t = self.i64_type();
                         let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
@@ -550,6 +550,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                     &[v], &[i64t], self.loc,
                                 )).result(0)?.into()
                             }
+                            "Number" => {
+                                let v = arg_vals.first().copied().unwrap_or(undef_i64);
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_coerce_number"),
+                                    &[v], &[i64t], self.loc,
+                                )).result(0)?.into()
+                            }
+                            "String" => {
+                                let v = arg_vals.first().copied().unwrap_or(undef_i64);
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_coerce_string"),
+                                    &[v], &[i64t], self.loc,
+                                )).result(0)?.into()
+                            }
                             _ => unreachable!(),
                         };
                         for av in &arg_vals {
@@ -579,7 +593,74 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
                     &[fn_i64], &[], self.loc,
                 ));
-                // Evaluate arguments
+
+                let i64t = self.i64_type();
+
+                // Detect spread arguments (e.g., fn(...arr))
+                let has_spread = call.arguments.iter().any(|a| matches!(a, oxc_ast::ast::Argument::SpreadElement(_)));
+
+                if has_spread {
+                    // Build a combined TsArray of all arguments (regular + spread flattened).
+                    let zero_i32: Value<'c, 'b> = block.append_operation(arith::constant(
+                        self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
+                    )).result(0)?.into();
+                    let args_arr: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                        &[zero_i32], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    let mut temp_vals: Vec<Value<'c, 'b>> = Vec::new();
+                    for arg in &call.arguments {
+                        match arg {
+                            oxc_ast::ast::Argument::SpreadElement(spread) => {
+                                let (v_opt, nb) = self.lower_expression(&spread.argument, block, region, scope)?;
+                                block = nb;
+                                if let Some(v) = v_opt {
+                                    let v_i64 = self.ensure_i64(v, block)?;
+                                    block.append_operation(func::call(
+                                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push_all"),
+                                        &[args_arr, v_i64], &[], self.loc,
+                                    ));
+                                    temp_vals.push(v_i64);
+                                }
+                            }
+                            _ => {
+                                if let Some(expr) = arg.as_expression() {
+                                    let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                                    block = nb;
+                                    if let Some(v) = v_opt {
+                                        let v_i64 = self.ensure_i64(v, block)?;
+                                        block.append_operation(func::call(
+                                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                                            &[args_arr, v_i64], &[i64t], self.loc,
+                                        ));
+                                        temp_vals.push(v_i64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let result: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_spread_call"),
+                        &[fn_i64, args_arr], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    for tv in &temp_vals {
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[*tv], &[], self.loc,
+                        ));
+                    }
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[args_arr], &[], self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[fn_i64], &[], self.loc,
+                    ));
+                    return Ok((Some(result), block));
+                }
+
+                // Evaluate arguments (no spread)
                 let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
                 for arg in &call.arguments {
                     if let Some(expr) = arg.as_expression() {
@@ -590,7 +671,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         }
                     }
                 }
-                let i64t = self.i64_type();
                 let call_fn = match arg_vals.len() {
                     0 => "ts_func_call0",
                     1 => "ts_func_call1",
@@ -623,38 +703,74 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         if let Expression::Identifier(callee_id) = &call.callee {
             let name = callee_id.name.to_string();
             if let Some(sig) = self.funcs.get(&name).cloned() {
-                // Lower arguments, coercing to match declared param types.
-                let mut args: Vec<Value<'c, 'b>> = Vec::new();
-                for (i, arg) in call.arguments.iter().enumerate() {
+                // Number of regular (non-rest) params.
+                let n_regular = if sig.has_rest {
+                    sig.param_types.len().saturating_sub(1)
+                } else {
+                    sig.param_types.len()
+                };
+
+                // Lower all call arguments.
+                let mut all_arg_vals: Vec<Value<'c, 'b>> = Vec::new();
+                for arg in call.arguments.iter() {
                     let expr = arg.as_expression()
                         .ok_or_else(|| anyhow::anyhow!("spread in function call not supported"))?;
                     let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
                     block = nb;
-                    let v = v_opt
-                        .ok_or_else(|| anyhow::anyhow!("argument produced no value"))?;
-                    let expected = sig.param_types.get(i).copied().unwrap_or(self.i32_type());
-                    let coerced = if expected == self.i64_type() {
-                        self.ensure_i64(v, block)?
-                    } else {
-                        self.ensure_i32(v, block)?
-                    };
-                    args.push(coerced);
+                    let v = v_opt.ok_or_else(|| anyhow::anyhow!("argument produced no value"))?;
+                    all_arg_vals.push(self.ensure_i64(v, block)?);
                 }
-                // Pad missing arguments with `undefined` for default-param support.
-                for i in args.len()..sig.param_types.len() {
-                    let expected = sig.param_types[i];
-                    let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+
+                let mut args: Vec<Value<'c, 'b>> = Vec::new();
+                // Regular params: pass args 0..n_regular, pad with undefined if needed.
+                for i in 0..n_regular {
+                    if let Some(&v) = all_arg_vals.get(i) {
+                        args.push(v);
+                    } else {
+                        let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                            self.ctx,
+                            IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                            self.loc,
+                        )).result(0)?.into();
+                        args.push(undef);
+                    }
+                }
+                // Rest param: bundle excess args into a TsArray.
+                if sig.has_rest {
+                    let rest_args = if all_arg_vals.len() > n_regular {
+                        &all_arg_vals[n_regular..]
+                    } else {
+                        &[]
+                    };
+                    let n_rest = rest_args.len() as i32;
+                    let i32_type = self.i32_type();
+                    let n_val: Value<'c, 'b> = block.append_operation(arith::constant(
                         self.ctx,
-                        IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                        IntegerAttribute::new(i32_type, n_rest as i64).into(),
                         self.loc,
                     )).result(0)?.into();
-                    let coerced = if expected == self.i64_type() {
-                        undef
-                    } else {
-                        // i32 functions: undefined is encoded as 0 for i32 (not used with defaults)
-                        self.ensure_i32(undef, block)?
-                    };
-                    args.push(coerced);
+                    let rest_arr: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                        &[n_val],
+                        &[self.i64_type()],
+                        self.loc,
+                    )).result(0)?.into();
+                    for (idx, &rv) in rest_args.iter().enumerate() {
+                        let idx_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                            self.ctx,
+                            IntegerAttribute::new(i32_type, idx as i64).into(),
+                            self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                            &[rest_arr, idx_val, rv],
+                            &[],
+                            self.loc,
+                        ));
+                    }
+                    args.push(rest_arr);
                 }
 
                 let result_types: Vec<melior::ir::Type<'c>> =
@@ -685,7 +801,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Evaluate all arguments
                 let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
                 let mut need_args = true;
-                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" {
+                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" || ns == "JSON" {
                     for arg in &call.arguments {
                         if let Some(expr) = arg.as_expression() {
                             let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
@@ -752,6 +868,21 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             let i1_val = self.ensure_i1(flag, block)?;
                             Some(self.ensure_i64(i1_val, block)?)
                         }
+                        // ── JSON ──────────────────────────────────────────────
+                        ("JSON", "stringify") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_json_stringify"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("JSON", "parse") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_json_parse"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
                         _ => None,
                     };
 
@@ -767,7 +898,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                  "sin"|"cos"|"tan"|"min"|"max"|"pow"|"atan2"|"hypot") |
                         ("Object", "keys"|"values"|"entries"|"assign"|"create"|"fromEntries") |
                         ("Array", "isArray") |
-                        ("String", "fromCharCode")
+                        ("String", "fromCharCode") |
+                        ("JSON", "stringify"|"parse")
                     ) {
                         return Ok((result_opt, block));
                     }
@@ -862,7 +994,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 "replace" | "replaceAll" | "startsWith" | "endsWith" |
                 "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" |
                 // Map methods
-                "set" | "get" | "has" | "delete" | "clear" | "keys" | "values"
+                "set" | "get" | "has" | "delete" | "clear" | "keys" | "values" | "entries"
             );
             if is_builtin {
                 // Evaluate receiver
@@ -1172,6 +1304,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     "values" => {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_values"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "entries" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_entries"),
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
@@ -1745,6 +1883,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(name.clone(), FuncSig {
             param_types: vec![i64_type; total_mlir_params],
             return_type: Some(i64_type),
+            has_rest: false,
         });
 
         // Get a function reference via func.constant, then cast to !llvm.ptr.

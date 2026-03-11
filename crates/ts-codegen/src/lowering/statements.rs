@@ -245,13 +245,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
 
                 BindingPattern::ObjectPattern(obj_pat) => {
-                    // const { a, b } = expr  →  evaluate expr once, then ts_obj_get each key
+                    // const { a, b, ...rest } = expr  →  evaluate expr once, then ts_obj_get each key
                     let Some(init) = &declarator.init else { continue };
                     let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
                     block = nb;
                     let Some(obj_val) = val_opt else { continue };
                     let obj_i64 = self.ensure_i64(obj_val, block)?;
 
+                    let mut extracted_keys: Vec<String> = Vec::new();
                     for prop in &obj_pat.properties {
                         // Determine the property key string (only static keys for now).
                         let key_str = match prop.key.static_name() {
@@ -278,7 +279,71 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             self.loc,
                         )).result(0)?.into();
                         scope.insert(var_name, field_val);
+                        extracted_keys.push(key_str);
                     }
+
+                    // Handle rest element: `const { a, ...rest } = obj`
+                    if let Some(rest_el) = &obj_pat.rest {
+                        if let BindingPattern::BindingIdentifier(rest_id) = &rest_el.argument {
+                            let rest_name = rest_id.name.to_string();
+                            // Build a TsArray of excluded key strings.
+                            let n_keys = extracted_keys.len() as i32;
+                            let i32_type = self.i32_type();
+                            let n_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(i32_type, n_keys as i64).into(),
+                                self.loc,
+                            )).result(0)?.into();
+                            let keys_arr: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                                &[n_val],
+                                &[self.i64_type()],
+                                self.loc,
+                            )).result(0)?.into();
+                            for (idx, key_str) in extracted_keys.iter().enumerate() {
+                                let key_ptr = self.get_string_ptr(key_str, block)?;
+                                let key_val: Value<'c, 'b> = block.append_operation(func::call(
+                                    self.ctx,
+                                    FlatSymbolRefAttribute::new(self.ctx, "ts_string_new"),
+                                    &[key_ptr],
+                                    &[self.i64_type()],
+                                    self.loc,
+                                )).result(0)?.into();
+                                let idx_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                                    self.ctx,
+                                    IntegerAttribute::new(i32_type, idx as i64).into(),
+                                    self.loc,
+                                )).result(0)?.into();
+                                block.append_operation(func::call(
+                                    self.ctx,
+                                    FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                                    &[keys_arr, idx_val, key_val],
+                                    &[],
+                                    self.loc,
+                                ));
+                                block.append_operation(func::call(
+                                    self.ctx,
+                                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                    &[key_val], &[], self.loc,
+                                ));
+                            }
+                            let rest_val: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_obj_rest"),
+                                &[obj_i64, keys_arr],
+                                &[self.i64_type()],
+                                self.loc,
+                            )).result(0)?.into();
+                            block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[keys_arr], &[], self.loc,
+                            ));
+                            scope.insert(rest_name, rest_val);
+                        }
+                    }
+
                     // ARC: release the init expression value now that we have extracted all fields.
                     block.append_operation(func::call(
                         self.ctx,
@@ -288,19 +353,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
 
                 BindingPattern::ArrayPattern(arr_pat) => {
-                    // const [x, y] = expr  →  evaluate expr once, then ts_arr_get each index
+                    // const [x, y, ...rest] = expr  →  evaluate expr once, then ts_arr_get each index
                     let Some(init) = &declarator.init else { continue };
                     let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
                     block = nb;
                     let Some(arr_val) = val_opt else { continue };
                     let arr_i64 = self.ensure_i64(arr_val, block)?;
 
+                    let mut extracted_count: i64 = 0;
                     for (i, elem) in arr_pat.elements.iter().enumerate() {
-                        let Some(pat) = elem else { continue }; // skip holes
+                        let Some(pat) = elem else {
+                            extracted_count = i as i64 + 1;
+                            continue;
+                        }; // skip holes
                         let var_name = match pat {
                             BindingPattern::BindingIdentifier(id) => id.name.to_string(),
                             _ => {
                                 tracing::debug!("skipping nested array destructuring");
+                                extracted_count = i as i64 + 1;
                                 continue;
                             }
                         };
@@ -313,7 +383,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             self.loc,
                         )).result(0)?.into();
                         scope.insert(var_name, elem_val);
+                        extracted_count = i as i64 + 1;
                     }
+
+                    // Handle rest element: `const [a, b, ...rest] = arr`
+                    if let Some(rest_el) = &arr_pat.rest {
+                        if let BindingPattern::BindingIdentifier(rest_id) = &rest_el.argument {
+                            let rest_name = rest_id.name.to_string();
+                            let i32_type = self.i32_type();
+                            let start_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(i32_type, extracted_count).into(),
+                                self.loc,
+                            )).result(0)?.into();
+                            let rest_val: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_rest"),
+                                &[arr_i64, start_val],
+                                &[self.i64_type()],
+                                self.loc,
+                            )).result(0)?.into();
+                            scope.insert(rest_name, rest_val);
+                        }
+                    }
+
                     // ARC: release the init expression value.
                     block.append_operation(func::call(
                         self.ctx,
@@ -818,17 +911,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
         loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
-        // Determine the loop variable name.
-        let loop_var = match &for_of.left {
+        // Determine the loop variable binding.
+        // `loop_var` is the name used to hold the raw element in body_scope (always internal or user).
+        // `destructure_vars` holds (index, name) pairs if the LHS is an ArrayPattern.
+        let (loop_var, destructure_vars) = match &for_of.left {
             ForStatementLeft::VariableDeclaration(vd) => {
-                vd.declarations.first().and_then(|d| {
-                    if let BindingPattern::BindingIdentifier(id) = &d.id {
-                        Some(id.name.to_string())
-                    } else { None }
-                })
+                if let Some(d) = vd.declarations.first() {
+                    match &d.id {
+                        BindingPattern::BindingIdentifier(id) => {
+                            (id.name.to_string(), vec![])
+                        }
+                        BindingPattern::ArrayPattern(arr_pat) => {
+                            // Destructure: use internal name for the element, extract sub-vars below.
+                            let sub_vars: Vec<(usize, String)> = arr_pat.elements.iter().enumerate()
+                                .filter_map(|(i, elem)| {
+                                    if let Some(BindingPattern::BindingIdentifier(id)) = elem {
+                                        Some((i, id.name.to_string()))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            ("__forof_item".to_string(), sub_vars)
+                        }
+                        _ => ("__forof_item".to_string(), vec![])
+                    }
+                } else {
+                    ("__forof_item".to_string(), vec![])
+                }
             }
-            _ => None,
-        }.unwrap_or_else(|| "__forof_item".to_string());
+            _ => ("__forof_item".to_string(), vec![]),
+        };
 
         // Evaluate the iterable (must be an array).
         let (iter_opt, nb) = self.lower_expression(&for_of.right, block, region, scope)?;
@@ -905,11 +1018,42 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         body_scope.insert(loop_var.clone(), elem);
 
+        // If the LHS is an ArrayPattern, destructure the element into sub-variables.
+        if !destructure_vars.is_empty() {
+            for (i, sub_name) in &destructure_vars {
+                let sub_idx_val: Value<'c, 'b> = body_block.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(self.i32_type(), *i as i64).into(),
+                    self.loc,
+                )).result(0)?.into();
+                let sub_val: Value<'c, 'b> = body_block.append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                    &[elem, sub_idx_val],
+                    &[self.i64_type()],
+                    self.loc,
+                )).result(0)?.into();
+                body_scope.insert(sub_name.clone(), sub_val);
+            }
+        }
+
         let mut inner_loops = loops.to_vec();
         inner_loops.push((update_block, exit_block, scope_keys.clone()));
         let (_, body_end) = self.lower_statement(&for_of.body, body_block, region, &mut body_scope, &inner_loops)?;
 
-        // Release the loop variable before leaving the body.
+        // Release destructured sub-variables before leaving the body.
+        for (_, sub_name) in &destructure_vars {
+            if let Some(&sub_val) = body_scope.get(sub_name) {
+                let sub_i64 = self.ensure_i64(sub_val, body_end)?;
+                body_end.append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[sub_i64], &[], self.loc,
+                ));
+            }
+        }
+
+        // Release the loop variable (the element / pair array) before leaving the body.
         if let Some(&loop_val) = body_scope.get(&loop_var) {
             let loop_val_i64 = self.ensure_i64(loop_val, body_end)?;
             body_end.append_operation(func::call(

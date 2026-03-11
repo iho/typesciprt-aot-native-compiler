@@ -534,3 +534,36 @@ fn closures() {
         19, // makeAdder(5)(3) + makeAdder(10)(1) = 8 + 11 = 19
     );
 }
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn rest_parameters() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/rest_params.ts"),
+        &root.join("target/test-rest-params"),
+        10, // sum(1,2,3,4) = 10
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn destructuring_rest() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/destructuring_rest.ts"),
+        &root.join("target/test-destr-rest"),
+        3, // rest.a + rest.b = 1 + 2 = 3
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn map_for_of() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/map_forof.ts"),
+        &root.join("target/test-map-forof"),
+        3, // sum of values = 3
+    );
+}

@@ -158,8 +158,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     }
 
 
-    /// Lower `arr[idx]` to an i32 load.
-    /// Lower `arr[idx]` to a heap-allocated TsArray access.
+    /// Lower `obj[key]` — generic computed member read using `ts_val_get_key`.
+    /// Works for arrays (integer index), objects (string key), Maps, and strings (char-at index).
     pub(super) fn lower_computed_member_expression<'b>(
         &mut self,
         member: &oxc_ast::ast::ComputedMemberExpression<'_>,
@@ -169,32 +169,31 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let i64_type = self.i64_type();
 
-        let (arr_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+        let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
         block = nb;
-        let arr = arr_opt.ok_or_else(|| anyhow::anyhow!("array: object expression produced no value"))?;
-        let arr_i64 = self.ensure_i64(arr, block)?;
+        let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("computed member: object expression produced no value"))?;
+        let obj_i64 = self.ensure_i64(obj, block)?;
 
-        let (idx_opt, nb) = self.lower_expression(&member.expression, block, region, scope)?;
+        let (key_opt, nb) = self.lower_expression(&member.expression, block, region, scope)?;
         block = nb;
-        let idx = idx_opt.ok_or_else(|| anyhow::anyhow!("array: index expression produced no value"))?;
-        let idx_i32 = self.ensure_i32(idx, block)?;
+        let key = key_opt.ok_or_else(|| anyhow::anyhow!("computed member: key expression produced no value"))?;
+        let key_i64 = self.ensure_i64(key, block)?;
 
-        // %val = func.call @ts_arr_get(%arr_i64, %idx_i32) : (i64, i32) -> i64
+        // %val = ts_val_get_key(%obj_i64, %key_i64) : (i64, i64) -> i64
         let val: Value<'c, 'b> = block
             .append_operation(func::call(
                 self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
-                &[arr_i64, idx_i32],
+                FlatSymbolRefAttribute::new(self.ctx, "ts_val_get_key"),
+                &[obj_i64, key_i64],
                 &[i64_type],
                 self.loc,
             ))
             .result(0)?
             .into();
 
-        // ARC: Release the array and index (ts_arr_get returned an owned reference).
-        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[arr_i64], &[], self.loc));
-        let idx_i64 = self.ensure_i64(idx, block)?;
-        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[idx_i64], &[], self.loc));
+        // ARC: Release the object and key after the call.
+        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[key_i64], &[], self.loc));
 
         Ok((Some(val), block))
     }

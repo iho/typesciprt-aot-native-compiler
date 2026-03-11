@@ -226,6 +226,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(func_name, FuncSig {
             param_types: vec![i64_type; n_params],
             return_type: Some(i64_type),
+            has_rest: false,
         });
         Ok(())
     }
@@ -304,6 +305,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(func_name, FuncSig {
             param_types: vec![i64_type; all_params],
             return_type: Some(i64_type),
+            has_rest: false,
         });
         Ok(())
     }
@@ -360,6 +362,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(func_name.clone(), FuncSig {
             param_types: vec![i64_type],
             return_type: Some(i64_type),
+            has_rest: false,
         });
         Ok(())
     }
@@ -419,6 +422,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(func_name, FuncSig {
             param_types: vec![i64_type, i64_type],
             return_type: Some(i64_type),
+            has_rest: false,
         });
         Ok(())
     }
@@ -484,6 +488,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(func_name, FuncSig {
             param_types: vec![i64_type; n_params],
             return_type: Some(i64_type),
+            has_rest: false,
         });
         Ok(())
     }

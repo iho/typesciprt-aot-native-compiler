@@ -54,11 +54,13 @@ mod enums;
 
 #[derive(Clone)]
 struct FuncSig<'c> {
-    /// MLIR types of positional parameters (all i32 for now).
+    /// MLIR types of positional parameters (all i64).
     #[allow(dead_code)]
     param_types: Vec<melior::ir::Type<'c>>,
-    /// Return type (i32, or None for void).
+    /// Return type (i64, or None for void).
     return_type: Option<melior::ir::Type<'c>>,
+    /// True if the last MLIR param is a rest array (i64 TsArray).
+    has_rest: bool,
 }
  
 #[derive(Clone)]
@@ -603,6 +605,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_str_char_code_at",   &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_repeat",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_from_char_code", &[i64_type], &[i64_type]);
+
+        // v1.5: generic computed member get, destructuring rest, Map.entries
+        add_func("ts_val_get_key", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_rest",    &[i64_type, i32_type], &[i64_type]);
+        add_func("ts_obj_rest",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_map_entries", &[i64_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -626,18 +634,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 Statement::FunctionDeclaration(func) => {
                     let Some(id) = &func.id else { continue };
                     let name = id.name.to_string();
+                    let has_rest = func.params.rest.is_some();
+                    let n = func.params.items.len() + if has_rest { 1 } else { 0 };
                     self.funcs.insert(name, FuncSig {
-                        param_types: vec![i64_type; func.params.items.len()],
+                        param_types: vec![i64_type; n],
                         return_type: Some(i64_type),
+                        has_rest,
                     });
                 }
                 Statement::ExportNamedDeclaration(export) => {
                     if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
+                            let has_rest = func.params.rest.is_some();
+                            let n = func.params.items.len() + if has_rest { 1 } else { 0 };
                             self.funcs.insert(name, FuncSig {
-                                param_types: vec![i64_type; func.params.items.len()],
+                                param_types: vec![i64_type; n],
                                 return_type: Some(i64_type),
+                                has_rest,
                             });
                         }
                     }
@@ -647,9 +661,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
+                            let has_rest = func.params.rest.is_some();
+                            let n = func.params.items.len() + if has_rest { 1 } else { 0 };
                             self.funcs.insert(name, FuncSig {
-                                param_types: vec![i64_type; func.params.items.len()],
+                                param_types: vec![i64_type; n],
                                 return_type: Some(i64_type),
+                                has_rest,
                             });
                         }
                     }
@@ -769,8 +786,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // All functions return i64 (NaN-boxed TsVal) so they can return any value including heap objects.
         let return_type = i64_type;
 
+        let has_rest = func.params.rest.is_some();
         // Use i64 for all params to support NaN-boxed values (including `undefined` for defaults).
-        let n_params = func.params.items.len();
+        let n_params = func.params.items.len() + if has_rest { 1 } else { 0 };
         let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
             (0..n_params).map(|_| (i64_type, self.loc)).collect();
         let func_type = FunctionType::new(
@@ -784,6 +802,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         for (i, param) in func.params.items.iter().enumerate() {
             if let BindingPattern::BindingIdentifier(id) = &param.pattern {
                 scope.insert(id.name.to_string(), entry.argument(i)?.into());
+            }
+        }
+        // Bind the rest parameter (last MLIR param) as a TsArray in scope.
+        if let Some(rest_param) = &func.params.rest {
+            if let BindingPattern::BindingIdentifier(rest_id) = &rest_param.rest.argument {
+                let rest_arg_idx = func.params.items.len();
+                let rest_val: Value<'_, '_> = entry.argument(rest_arg_idx)?.into();
+                scope.insert(rest_id.name.to_string(), rest_val);
             }
         }
 
@@ -883,6 +909,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(name, FuncSig {
             param_types: vec![i64_type; param_specs.len()],
             return_type: Some(return_type),
+            has_rest,
         });
         Ok(())
     }

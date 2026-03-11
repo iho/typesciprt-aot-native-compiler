@@ -539,7 +539,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::AssignmentOperator;
 
-        // Only identifier targets supported for now.
+        // Handle member-target logical assignment: `this.x ??= val` / `this.#x ??= val`
+        match &assign.left {
+            AssignmentTarget::StaticMemberExpression(m) => {
+                return self.lower_logical_assignment_member(m, assign.operator, &assign.right, block, region, scope);
+            }
+            AssignmentTarget::PrivateFieldExpression(m) => {
+                return self.lower_logical_assignment_private(m, assign.operator, &assign.right, block, region, scope);
+            }
+            _ => {}
+        }
+
+        // Only identifier targets supported for the remaining path.
         let name = match &assign.left {
             AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
             _ => bail!("logical assignment (??= / ||= / &&=) to non-identifier targets not supported yet"),
@@ -885,6 +896,203 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             &[obj_i64], &[], self.loc,
         ));
         Ok((Some(rhs), block))
+    }
+
+    /// Logical assignment to a static member: `obj.prop ??= rhs` / `obj.prop ||= rhs` / `obj.prop &&= rhs`
+    fn lower_logical_assignment_member<'b>(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'_>,
+        operator: oxc_ast::ast::AssignmentOperator,
+        rhs_expr: &Expression<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        use oxc_ast::ast::AssignmentOperator;
+
+        let prop_name = member.property.name.to_string();
+
+        // Read current value of lhs
+        let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+        block = nb;
+        let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("logical assign member: object produced no value"))?;
+        let obj_i64 = self.ensure_i64(obj, block)?;
+        // Retain obj since we may use it again in the write path
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+            &[obj_i64], &[], self.loc,
+        ));
+
+        let key_ptr = self.get_string_ptr(&prop_name, block)?;
+        let lhs_i64: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+            &[obj_i64, key_ptr], &[self.i64_type()], self.loc,
+        )).result(0)?.into();
+
+        // Compute condition i1
+        let cond_i1: Value<'c, 'b> = match operator {
+            AssignmentOperator::LogicalNullish => {
+                let is_null = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_nullish"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                self.ensure_i1(is_null, block)?
+            }
+            AssignmentOperator::LogicalOr => {
+                let truthy = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                let truthy_i1 = self.ensure_i1(truthy, block)?;
+                let one_i1 = block.append_operation(
+                    arith::constant(self.ctx, IntegerAttribute::new(self.i1_type(), 1).into(), self.loc)
+                ).result(0)?.into();
+                block.append_operation(arith::xori(truthy_i1, one_i1, self.loc)).result(0)?.into()
+            }
+            AssignmentOperator::LogicalAnd => {
+                let truthy = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                self.ensure_i1(truthy, block)?
+            }
+            _ => bail!("lower_logical_assignment_member: non-logical operator"),
+        };
+
+        let merge_block = region.append_block(Block::new(&[(self.i64_type(), self.loc)]));
+        let rhs_eval_block = region.append_block(Block::new(&[]));
+
+        // cond true → evaluate rhs and assign; cond false → keep lhs
+        block.append_operation(cf::cond_br(
+            self.ctx, cond_i1,
+            &rhs_eval_block, &merge_block,
+            &[], &[lhs_i64],
+            self.loc,
+        ));
+
+        // rhs_eval_block: release lhs, evaluate rhs, assign, branch
+        rhs_eval_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[lhs_i64], &[], self.loc,
+        ));
+        let mut rhs_scope = scope.clone();
+        let (rhs_val_opt, rhs_block) = self.lower_expression(rhs_expr, rhs_eval_block, region, &mut rhs_scope)?;
+        let rhs_val = rhs_val_opt.ok_or_else(|| anyhow::anyhow!("logical assign member: rhs produced no value"))?;
+        let rhs_i64 = self.ensure_i64(rhs_val, rhs_block)?;
+        // Assign to obj.prop
+        let key_ptr2 = self.get_string_ptr(&prop_name, rhs_block)?;
+        rhs_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+            &[obj_i64, key_ptr2, rhs_i64], &[], self.loc,
+        ));
+        rhs_block.append_operation(cf::br(&merge_block, &[rhs_i64], self.loc));
+
+        let result: Value<'c, 'b> = merge_block.argument(0)?.into();
+        // Release the object retain we took at the start
+        merge_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[obj_i64], &[], self.loc,
+        ));
+
+        Ok((Some(result), merge_block))
+    }
+
+    /// Logical assignment to a private field: `this.#field ??= rhs` etc.
+    fn lower_logical_assignment_private<'b>(
+        &mut self,
+        member: &oxc_ast::ast::PrivateFieldExpression<'_>,
+        operator: oxc_ast::ast::AssignmentOperator,
+        rhs_expr: &Expression<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        use oxc_ast::ast::AssignmentOperator;
+
+        let field_key = format!("__priv_{}", member.field.name.as_str());
+
+        // Read current value of lhs
+        let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+        block = nb;
+        let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("logical assign private: object produced no value"))?;
+        let obj_i64 = self.ensure_i64(obj, block)?;
+        // Retain obj since we may use it again in the write path
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+            &[obj_i64], &[], self.loc,
+        ));
+
+        let key_ptr = self.get_string_ptr(&field_key, block)?;
+        let lhs_i64: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+            &[obj_i64, key_ptr], &[self.i64_type()], self.loc,
+        )).result(0)?.into();
+
+        // Compute condition i1
+        let cond_i1: Value<'c, 'b> = match operator {
+            AssignmentOperator::LogicalNullish => {
+                let is_null = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_nullish"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                self.ensure_i1(is_null, block)?
+            }
+            AssignmentOperator::LogicalOr => {
+                let truthy = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                let truthy_i1 = self.ensure_i1(truthy, block)?;
+                let one_i1 = block.append_operation(
+                    arith::constant(self.ctx, IntegerAttribute::new(self.i1_type(), 1).into(), self.loc)
+                ).result(0)?.into();
+                block.append_operation(arith::xori(truthy_i1, one_i1, self.loc)).result(0)?.into()
+            }
+            AssignmentOperator::LogicalAnd => {
+                let truthy = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                self.ensure_i1(truthy, block)?
+            }
+            _ => bail!("lower_logical_assignment_private: non-logical operator"),
+        };
+
+        let merge_block = region.append_block(Block::new(&[(self.i64_type(), self.loc)]));
+        let rhs_eval_block = region.append_block(Block::new(&[]));
+
+        // cond true → evaluate rhs and assign; cond false → keep lhs
+        block.append_operation(cf::cond_br(
+            self.ctx, cond_i1,
+            &rhs_eval_block, &merge_block,
+            &[], &[lhs_i64],
+            self.loc,
+        ));
+
+        // rhs_eval_block: release lhs, evaluate rhs, assign, branch
+        rhs_eval_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[lhs_i64], &[], self.loc,
+        ));
+        let mut rhs_scope = scope.clone();
+        let (rhs_val_opt, rhs_block) = self.lower_expression(rhs_expr, rhs_eval_block, region, &mut rhs_scope)?;
+        let rhs_val = rhs_val_opt.ok_or_else(|| anyhow::anyhow!("logical assign private: rhs produced no value"))?;
+        let rhs_i64 = self.ensure_i64(rhs_val, rhs_block)?;
+        let key_ptr2 = self.get_string_ptr(&field_key, rhs_block)?;
+        rhs_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+            &[obj_i64, key_ptr2, rhs_i64], &[], self.loc,
+        ));
+        rhs_block.append_operation(cf::br(&merge_block, &[rhs_i64], self.loc));
+
+        let result: Value<'c, 'b> = merge_block.argument(0)?.into();
+        // Release the object retain we took at the start
+        merge_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[obj_i64], &[], self.loc,
+        ));
+
+        Ok((Some(result), merge_block))
     }
 }
 
