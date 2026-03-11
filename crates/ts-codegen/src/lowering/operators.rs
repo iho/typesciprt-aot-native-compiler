@@ -48,35 +48,72 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             return Ok((Some(res), block));
         }
 
-        // Equality / inequality on TsVal (i64) must use runtime dispatch to handle
-        // string content comparison (two equal strings have different heap addresses).
-        let is_eq_op = matches!(binop.operator,
-            BinaryOperator::Equality | BinaryOperator::StrictEquality |
-            BinaryOperator::Inequality | BinaryOperator::StrictInequality);
-        if is_eq_op && (lhs.r#type() == self.i64_type() || rhs.r#type() == self.i64_type()) {
+        // When either operand is i64 (heap or float), use runtime dispatch for all ops
+        // (equality, arithmetic, comparison) to correctly handle floats and strings.
+        if lhs.r#type() == self.i64_type() || rhs.r#type() == self.i64_type() {
             let lhs_i64 = self.ensure_i64(lhs, block)?;
             let rhs_i64 = self.ensure_i64(rhs, block)?;
-            let eq_i32: Value<'c, 'b> = block.append_operation(func::call(
-                self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "ts_val_strict_eq"),
-                &[lhs_i64, rhs_i64],
-                &[self.i32_type()],
-                self.loc,
-            )).result(0)?.into();
-            let zero_i32: Value<'c, 'b> = block.append_operation(arith::constant(
-                self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
-            )).result(0)?.into();
-            let pred = if matches!(binop.operator,
-                BinaryOperator::Inequality | BinaryOperator::StrictInequality)
-            { arith::CmpiPredicate::Eq } else { arith::CmpiPredicate::Ne };
-            // Ne → eq_i32 != 0 → true; Eq → eq_i32 == 0 → false when using Eq pred for !=
-            // Simpler: for == use Ne(eq,0), for != use Eq(eq,0)
-            let res = block.append_operation(arith::cmpi(
-                self.ctx, pred, eq_i32, zero_i32, self.loc,
-            )).result(0)?.into();
+
+            let is_eq_op = matches!(binop.operator,
+                BinaryOperator::Equality | BinaryOperator::StrictEquality |
+                BinaryOperator::Inequality | BinaryOperator::StrictInequality);
+
+            let is_cmp_op = matches!(binop.operator,
+                BinaryOperator::LessThan | BinaryOperator::GreaterThan |
+                BinaryOperator::LessEqualThan | BinaryOperator::GreaterEqualThan);
+
+            let is_arith_op = matches!(binop.operator,
+                BinaryOperator::Subtraction | BinaryOperator::Multiplication |
+                BinaryOperator::Division | BinaryOperator::Remainder);
+
+            let result_opt: Option<Value<'c, 'b>> = if is_eq_op {
+                let eq_i32: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_strict_eq"),
+                    &[lhs_i64, rhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                let zero: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
+                )).result(0)?.into();
+                let pred = if matches!(binop.operator,
+                    BinaryOperator::Inequality | BinaryOperator::StrictInequality)
+                { arith::CmpiPredicate::Eq } else { arith::CmpiPredicate::Ne };
+                Some(block.append_operation(arith::cmpi(self.ctx, pred, eq_i32, zero, self.loc)).result(0)?.into())
+            } else if is_cmp_op {
+                let fn_name = match binop.operator {
+                    BinaryOperator::LessThan         => "ts_lt",
+                    BinaryOperator::GreaterThan      => "ts_gt",
+                    BinaryOperator::LessEqualThan    => "ts_le",
+                    BinaryOperator::GreaterEqualThan => "ts_ge",
+                    _ => unreachable!(),
+                };
+                let cmp_i32: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, fn_name),
+                    &[lhs_i64, rhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                Some(self.ensure_i1(cmp_i32, block)?)
+            } else if is_arith_op {
+                let fn_name = match binop.operator {
+                    BinaryOperator::Subtraction    => "ts_sub",
+                    BinaryOperator::Multiplication => "ts_mul",
+                    BinaryOperator::Division       => "ts_div",
+                    BinaryOperator::Remainder      => "ts_mod",
+                    _ => unreachable!(),
+                };
+                Some(block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, fn_name),
+                    &[lhs_i64, rhs_i64], &[self.i64_type()], self.loc,
+                )).result(0)?.into())
+            } else {
+                None
+            };
+
             block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
             block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
-            return Ok((Some(res), block));
+
+            if result_opt.is_some() || is_eq_op || is_cmp_op || is_arith_op {
+                return Ok((result_opt, block));
+            }
+            // Fall through for other operators (bitwise etc.) using i32 path below.
         }
 
         let lhs_i32 = self.ensure_i32(lhs, block)?;
@@ -87,6 +124,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             BinaryOperator::Subtraction    => arith::subi(lhs_i32, rhs_i32, self.loc),
             BinaryOperator::Multiplication => arith::muli(lhs_i32, rhs_i32, self.loc),
             BinaryOperator::Division       => arith::divsi(lhs_i32, rhs_i32, self.loc),
+            BinaryOperator::Remainder      => arith::remsi(lhs_i32, rhs_i32, self.loc),
             BinaryOperator::LessThan         => arith::cmpi(self.ctx, arith::CmpiPredicate::Slt, lhs_i32, rhs_i32, self.loc),
             BinaryOperator::GreaterThan      => arith::cmpi(self.ctx, arith::CmpiPredicate::Sgt, lhs_i32, rhs_i32, self.loc),
             BinaryOperator::LessEqualThan    => arith::cmpi(self.ctx, arith::CmpiPredicate::Sle, lhs_i32, rhs_i32, self.loc),
@@ -203,6 +241,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::LogicalOperator;
 
+        // ?? (nullish coalescing) needs different merge type (i64 instead of i1).
+        if logical.operator == LogicalOperator::Coalesce {
+            return self.lower_nullish_coalescing(logical, block, region, scope);
+        }
+
         let (lhs_opt, nb) = self.lower_expression(&logical.left, block, region, scope)?;
         block = nb;
         let lhs = lhs_opt
@@ -240,7 +283,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let rhs_block = nb;
         let rhs = rhs_opt.ok_or_else(|| anyhow::anyhow!("logical op: no right value"))?;
         let r = self.ensure_i1(rhs, rhs_block)?;
-        
+
         let mut rhs_end_args = vec![r];
         for k in &scope_keys {
             rhs_end_args.push(*rhs_scope.get(k).unwrap_or(&orig_scope[k]));
@@ -253,6 +296,82 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         Ok((Some(res_i1), merge_block))
+    }
+
+    // ── Nullish coalescing (??) ────────────────────────────────────────────
+
+    fn lower_nullish_coalescing<'b>(
+        &mut self,
+        logical: &LogicalExpression<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        // Evaluate lhs.
+        let (lhs_opt, nb) = self.lower_expression(&logical.left, block, region, scope)?;
+        block = nb;
+        let lhs = lhs_opt.ok_or_else(|| anyhow::anyhow!("??: no left value"))?;
+        let lhs_i64 = self.ensure_i64(lhs, block)?;
+
+        // Check if lhs is null or undefined.
+        let is_null: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_is_nullish"),
+            &[lhs_i64],
+            &[self.i32_type()],
+            self.loc,
+        )).result(0)?.into();
+        let is_null_i1 = self.ensure_i1(is_null, block)?;
+
+        let orig_scope = scope.clone();
+        let scope_keys: Vec<String> = orig_scope.keys().cloned().collect();
+
+        // merge_block: receives (i64 result, ...scope_vals)
+        let mut merge_arg_types = vec![(self.i64_type(), self.loc)];
+        for k in &scope_keys {
+            merge_arg_types.push((orig_scope[k].r#type(), self.loc));
+        }
+        let merge_block = region.append_block(Block::new(&merge_arg_types));
+        let rhs_block   = region.append_block(Block::new(&[]));
+
+        let orig_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| orig_scope[k]).collect();
+
+        // When lhs IS nullish → rhs_block (release lhs there, evaluate rhs)
+        // When lhs is NOT nullish → merge_block with lhs_i64
+        let mut not_null_args = vec![lhs_i64];
+        not_null_args.extend(orig_vals.iter().copied());
+        block.append_operation(cf::cond_br(
+            self.ctx, is_null_i1,
+            &rhs_block, &merge_block,
+            &[],            // rhs_block args (none)
+            &not_null_args, // merge_block args: [lhs_i64, ...scope_vals]
+            self.loc,
+        ));
+
+        // rhs_block: lhs was nullish, release it and return rhs instead.
+        rhs_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[lhs_i64], &[], self.loc,
+        ));
+        let mut rhs_scope = orig_scope.clone();
+        let (rhs_opt, nb) = self.lower_expression(&logical.right, rhs_block, region, &mut rhs_scope)?;
+        let rhs_block = nb;
+        let rhs = rhs_opt.ok_or_else(|| anyhow::anyhow!("??: no right value"))?;
+        let rhs_i64 = self.ensure_i64(rhs, rhs_block)?;
+
+        let mut rhs_args = vec![rhs_i64];
+        for k in &scope_keys {
+            rhs_args.push(*rhs_scope.get(k).unwrap_or(&orig_scope[k]));
+        }
+        rhs_block.append_operation(cf::br(&merge_block, &rhs_args, self.loc));
+
+        // Update scope from merge_block arguments.
+        let result: Value<'c, 'b> = merge_block.argument(0)?.into();
+        for (i, k) in scope_keys.iter().enumerate() {
+            scope.insert(k.clone(), merge_block.argument(i + 1)?.into());
+        }
+
+        Ok((Some(result), merge_block))
     }
 
     // ── Conditional expression (? :) ──────────────────────────────────────
@@ -409,6 +528,120 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     }
 
 
+    // ── Logical assignment operators (??=, ||=, &&=) ─────────────────────
+
+    fn lower_logical_assignment<'b>(
+        &mut self,
+        assign: &oxc_ast::ast::AssignmentExpression<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        use oxc_ast::ast::AssignmentOperator;
+
+        // Only identifier targets supported for now.
+        let name = match &assign.left {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
+            _ => bail!("logical assignment (??= / ||= / &&=) to non-identifier targets not supported yet"),
+        };
+
+        // Read LHS — manual identifier retain (equivalent to Identifier lowering).
+        let lhs_val = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
+        let lhs_i64 = self.ensure_i64(lhs_val, block)?;
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+            &[lhs_i64], &[], self.loc,
+        ));
+
+        // Compute condition i1: when true → evaluate RHS and assign; when false → keep LHS.
+        let cond_i1: Value<'c, 'b> = match assign.operator {
+            AssignmentOperator::LogicalNullish => {
+                // ??= : assign when LHS is null/undefined
+                let is_null = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_nullish"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                self.ensure_i1(is_null, block)?
+            }
+            AssignmentOperator::LogicalOr => {
+                // ||= : assign when LHS is falsy
+                let truthy = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                let truthy_i1 = self.ensure_i1(truthy, block)?;
+                // falsy = !truthy
+                let one_i1 = block.append_operation(
+                    arith::constant(self.ctx, IntegerAttribute::new(self.i1_type(), 1).into(), self.loc)
+                ).result(0)?.into();
+                block.append_operation(arith::xori(truthy_i1, one_i1, self.loc)).result(0)?.into()
+            }
+            AssignmentOperator::LogicalAnd => {
+                // &&= : assign when LHS is truthy
+                let truthy = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                    &[lhs_i64], &[self.i32_type()], self.loc,
+                )).result(0)?.into();
+                self.ensure_i1(truthy, block)?
+            }
+            _ => bail!("lower_logical_assignment called with non-logical operator"),
+        };
+
+        // Build merge block: (result: i64, ...other scope vars).
+        let orig_scope = scope.clone();
+        // All scope keys EXCEPT `name` — those pass through unchanged.
+        let other_keys: Vec<String> = orig_scope.keys()
+            .filter(|k| *k != &name)
+            .cloned()
+            .collect();
+
+        let mut merge_arg_types = vec![(self.i64_type(), self.loc)];
+        for k in &other_keys {
+            merge_arg_types.push((orig_scope[k].r#type(), self.loc));
+        }
+        let merge_block = region.append_block(Block::new(&merge_arg_types));
+        let rhs_eval_block = region.append_block(Block::new(&[]));
+
+        let other_vals: Vec<Value<'c, 'b>> = other_keys.iter().map(|k| orig_scope[k]).collect();
+
+        // cond true  → rhs_eval_block (evaluate & assign)
+        // cond false → merge_block with current lhs_i64
+        let mut keep_args = vec![lhs_i64];
+        keep_args.extend(other_vals.iter().copied());
+        block.append_operation(cf::cond_br(
+            self.ctx, cond_i1,
+            &rhs_eval_block, &merge_block,
+            &[],         // rhs_eval_block args
+            &keep_args,  // merge_block args: [lhs_i64, ...other_vals]
+            self.loc,
+        ));
+
+        // rhs_eval_block: release old LHS, evaluate RHS, branch to merge.
+        rhs_eval_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[lhs_i64], &[], self.loc,
+        ));
+        let mut rhs_scope = orig_scope.clone();
+        let (rhs_val_opt, rhs_block) = self.lower_expression(&assign.right, rhs_eval_block, region, &mut rhs_scope)?;
+        let rhs_val = rhs_val_opt.ok_or_else(|| anyhow::anyhow!("logical assign: rhs produced no value"))?;
+        let rhs_i64 = self.ensure_i64(rhs_val, rhs_block)?;
+
+        let mut rhs_args = vec![rhs_i64];
+        for k in &other_keys {
+            rhs_args.push(*rhs_scope.get(k).unwrap_or(&orig_scope[k]));
+        }
+        rhs_block.append_operation(cf::br(&merge_block, &rhs_args, self.loc));
+
+        // After merge: result is arg 0, other scope vars from args 1..
+        let result: Value<'c, 'b> = merge_block.argument(0)?.into();
+        scope.insert(name, result);
+        for (i, k) in other_keys.iter().enumerate() {
+            scope.insert(k.clone(), merge_block.argument(i + 1)?.into());
+        }
+
+        Ok((Some(result), merge_block))
+    }
+
     // ── Assignment expressions ────────────────────────────────────────────
 
     pub(super) fn lower_assignment_expression<'b>(
@@ -419,6 +652,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::AssignmentOperator;
+
+        // Logical assignment operators use short-circuit evaluation and need special handling.
+        match assign.operator {
+            AssignmentOperator::LogicalNullish
+            | AssignmentOperator::LogicalOr
+            | AssignmentOperator::LogicalAnd => {
+                return self.lower_logical_assignment(assign, block, region, scope);
+            }
+            _ => {}
+        }
 
         let (rhs_opt, nb) = self.lower_expression(&assign.right, block, region, scope)?;
         block = nb;
@@ -591,22 +834,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let (idx_opt, nb) = self.lower_expression(&member.expression, block, region, scope)?;
         block = nb;
         let idx = idx_opt.ok_or_else(|| anyhow::anyhow!("computed assignment: index produced no value"))?;
-        let idx_i32 = self.ensure_i32(idx, block)?;
-
+        let idx_i64 = self.ensure_i64(idx, block)?;
         let val_i64 = self.ensure_i64(rhs, block)?;
 
-        // ts_arr_set(obj, idx, val)
+        // Use ts_obj_set_val_key for dynamic key access (works for both string and integer keys).
+        // This handles `obj[strKey] = val` (Hono's `this[method] = fn`) correctly.
         block.append_operation(func::call(
             self.ctx,
-            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
-            &[obj_i64, idx_i32, val_i64],
+            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set_val_key"),
+            &[obj_i64, idx_i64, val_i64],
             &[],
             self.loc,
         ));
 
-        // ARC: release obj and idx after ts_arr_set.
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
-        let idx_i64 = self.ensure_i64(idx, block)?;
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[idx_i64], &[], self.loc));
 
         Ok((Some(rhs), block))

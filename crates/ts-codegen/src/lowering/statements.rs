@@ -161,6 +161,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Statement::TryStatement(try_stmt) => {
                 self.lower_try_statement(try_stmt, block, region, scope, loops)
             }
+            Statement::ForOfStatement(for_of) => {
+                self.lower_for_of_statement(for_of, block, region, scope, loops)
+            }
+            Statement::ForInStatement(for_in) => {
+                self.lower_for_in_statement(for_in, block, region, scope, loops)
+            }
             Statement::ClassDeclaration(_) => {
                 Ok((None, block)) // Already lowered in the dedicated pass.
             }
@@ -220,21 +226,104 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         for declarator in &var_decl.declarations {
-            let name = match &declarator.id {
-                BindingPattern::BindingIdentifier(b) => b.name.to_string(),
-                _ => { tracing::debug!("skipping non-simple binding pattern"); continue; }
-            };
-            if let Some(init) = &declarator.init {
-                // Type inference: record class name for `let x = new Foo()`.
-                if let Expression::NewExpression(new_expr) = init {
-                    if let Expression::Identifier(id) = &new_expr.callee {
-                        self.var_class_types.insert(name.clone(), id.name.to_string());
+            match &declarator.id {
+                BindingPattern::BindingIdentifier(b) => {
+                    let name = b.name.to_string();
+                    if let Some(init) = &declarator.init {
+                        // Type inference: record class name for `let x = new Foo()`.
+                        if let Expression::NewExpression(new_expr) = init {
+                            if let Expression::Identifier(id) = &new_expr.callee {
+                                self.var_class_types.insert(name.clone(), id.name.to_string());
+                            }
+                        }
+                        let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
+                        block = nb;
+                        if let Some(val) = val_opt {
+                            scope.insert(name.clone(), val);
+                        }
                     }
                 }
-                let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
-                block = nb;
-                if let Some(val) = val_opt {
-                    scope.insert(name.clone(), val);
+
+                BindingPattern::ObjectPattern(obj_pat) => {
+                    // const { a, b } = expr  →  evaluate expr once, then ts_obj_get each key
+                    let Some(init) = &declarator.init else { continue };
+                    let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
+                    block = nb;
+                    let Some(obj_val) = val_opt else { continue };
+                    let obj_i64 = self.ensure_i64(obj_val, block)?;
+
+                    for prop in &obj_pat.properties {
+                        // Determine the property key string (only static keys for now).
+                        let key_str = match prop.key.static_name() {
+                            Some(n) => n.into_owned(),
+                            None => {
+                                tracing::debug!("skipping computed destructuring key");
+                                continue;
+                            }
+                        };
+                        // Determine the binding name.
+                        let var_name = match &prop.value {
+                            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                            _ => {
+                                tracing::debug!("skipping nested destructuring pattern");
+                                continue;
+                            }
+                        };
+                        let key_ptr = self.get_string_ptr(&key_str, block)?;
+                        let field_val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                            &[obj_i64, key_ptr],
+                            &[self.i64_type()],
+                            self.loc,
+                        )).result(0)?.into();
+                        scope.insert(var_name, field_val);
+                    }
+                    // ARC: release the init expression value now that we have extracted all fields.
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[obj_i64], &[], self.loc,
+                    ));
+                }
+
+                BindingPattern::ArrayPattern(arr_pat) => {
+                    // const [x, y] = expr  →  evaluate expr once, then ts_arr_get each index
+                    let Some(init) = &declarator.init else { continue };
+                    let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
+                    block = nb;
+                    let Some(arr_val) = val_opt else { continue };
+                    let arr_i64 = self.ensure_i64(arr_val, block)?;
+
+                    for (i, elem) in arr_pat.elements.iter().enumerate() {
+                        let Some(pat) = elem else { continue }; // skip holes
+                        let var_name = match pat {
+                            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                            _ => {
+                                tracing::debug!("skipping nested array destructuring");
+                                continue;
+                            }
+                        };
+                        let idx_val = self.lower_numeric_literal(i as i64, block)?;
+                        let elem_val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                            &[arr_i64, idx_val],
+                            &[self.i64_type()],
+                            self.loc,
+                        )).result(0)?.into();
+                        scope.insert(var_name, elem_val);
+                    }
+                    // ARC: release the init expression value.
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[arr_i64], &[], self.loc,
+                    ));
+                }
+
+                _ => {
+                    tracing::debug!("skipping unsupported binding pattern");
                 }
             }
         }
@@ -717,6 +806,332 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         Ok((None, merge_block))
+    }
+
+    // ── for...of ──────────────────────────────────────────────────────────
+
+    pub(super) fn lower_for_of_statement<'b>(
+        &mut self,
+        for_of: &ForOfStatement<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        // Determine the loop variable name.
+        let loop_var = match &for_of.left {
+            ForStatementLeft::VariableDeclaration(vd) => {
+                vd.declarations.first().and_then(|d| {
+                    if let BindingPattern::BindingIdentifier(id) = &d.id {
+                        Some(id.name.to_string())
+                    } else { None }
+                })
+            }
+            _ => None,
+        }.unwrap_or_else(|| "__forof_item".to_string());
+
+        // Evaluate the iterable (must be an array).
+        let (iter_opt, nb) = self.lower_expression(&for_of.right, block, region, scope)?;
+        block = nb;
+        let iter_val = iter_opt.ok_or_else(|| anyhow::anyhow!("for...of: iterable produced no value"))?;
+        let iter_i64 = self.ensure_i64(iter_val, block)?;
+
+        // Get array length (returns TsVal; unbox to i32).
+        let len_tsval: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_len"),
+            &[iter_i64],
+            &[self.i64_type()],
+            self.loc,
+        )).result(0)?.into();
+        let len_i32 = self.ensure_i32(len_tsval, block)?;
+
+        // Index starts at 0.
+        let zero_i32 = self.lower_numeric_literal(0, block)?;
+
+        // Store iter + len + idx as loop-carried scope entries with unique names.
+        let iter_key = "__forofiter__".to_string();
+        let len_key  = "__foroflen__".to_string();
+        let idx_key  = "__forofidx__".to_string();
+        scope.insert(iter_key.clone(), iter_i64);
+        scope.insert(len_key.clone(),  len_i32);
+        scope.insert(idx_key.clone(),  zero_i32);
+
+        // Snapshot scope for phi node typing (includes the three internal vars).
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+
+        let mut header_block = region.append_block(Block::new(&phi_types));
+        let body_block       = region.append_block(Block::new(&[]));
+        let update_block     = region.append_block(Block::new(&phi_types));
+        let exit_block       = region.append_block(Block::new(&phi_types));
+
+        // Jump into header with initial values.
+        let init_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+        block.append_operation(cf::br(&header_block, &init_vals, self.loc));
+
+        // ── Header: rebuild scope from phi args, check idx < len ─────────────
+        let mut header_scope = scope.clone();
+        for (i, k) in scope_keys.iter().enumerate() {
+            header_scope.insert(k.clone(), header_block.argument(i)?.into());
+        }
+
+        let idx_hdr = self.ensure_i32(header_scope[&idx_key], header_block)?;
+        let len_hdr = self.ensure_i32(header_scope[&len_key],  header_block)?;
+        let cond_i1: Value<'c, 'b> = header_block.append_operation(arith::cmpi(
+            self.ctx, arith::CmpiPredicate::Slt, idx_hdr, len_hdr, self.loc,
+        )).result(0)?.into();
+
+        let header_args: Vec<Value<'c, 'b>> = (0..scope_keys.len())
+            .map(|i| header_block.argument(i).map(Into::into))
+            .collect::<Result<_, _>>()?;
+        header_block.append_operation(cf::cond_br(
+            self.ctx, cond_i1, &body_block, &exit_block, &[], &header_args, self.loc,
+        ));
+
+        // ── Body: fetch element, execute body ────────────────────────────────
+        let mut body_scope = header_scope.clone();
+        let iter_body  = self.ensure_i64(body_scope[&iter_key], body_block)?;
+        let idx_body   = self.ensure_i32(body_scope[&idx_key],  body_block)?;
+
+        let elem: Value<'c, 'b> = body_block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+            &[iter_body, idx_body],
+            &[self.i64_type()],
+            self.loc,
+        )).result(0)?.into();
+
+        body_scope.insert(loop_var.clone(), elem);
+
+        let mut inner_loops = loops.to_vec();
+        inner_loops.push((update_block, exit_block, scope_keys.clone()));
+        let (_, body_end) = self.lower_statement(&for_of.body, body_block, region, &mut body_scope, &inner_loops)?;
+
+        // Release the loop variable before leaving the body.
+        if let Some(&loop_val) = body_scope.get(&loop_var) {
+            let loop_val_i64 = self.ensure_i64(loop_val, body_end)?;
+            body_end.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[loop_val_i64], &[], self.loc,
+            ));
+        }
+
+        // body_vals: coerce types to match phi_types (body may upgrade i32→i64 via ts_add).
+        let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+            .map(|(i, k)| {
+                let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
+                self.coerce_val_to_type(v, phi_types[i].0, body_end)
+            })
+            .collect::<Result<_>>()?;
+        self.terminate_with_br(body_end, &update_block, &body_vals);
+
+        // ── Update: increment index ───────────────────────────────────────────
+        let mut update_scope = header_scope.clone();
+        for (i, k) in scope_keys.iter().enumerate() {
+            update_scope.insert(k.clone(), update_block.argument(i)?.into());
+        }
+        let idx_upd = self.ensure_i32(update_scope[&idx_key], update_block)?;
+        let one_i32 = self.lower_numeric_literal(1, update_block)?;
+        let new_idx: Value<'c, 'b> = update_block.append_operation(
+            arith::addi(idx_upd, one_i32, self.loc)
+        ).result(0)?.into();
+        update_scope.insert(idx_key.clone(), new_idx);
+
+        let update_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+            .map(|(i, k)| {
+                let v = *update_scope.get(k).unwrap_or(&header_scope[k]);
+                self.coerce_val_to_type(v, phi_types[i].0, update_block)
+            })
+            .collect::<Result<_>>()?;
+        self.terminate_with_br(update_block, &header_block, &update_vals);
+
+        // ── Exit: update outer scope, release iter ────────────────────────────
+        for (i, k) in scope_keys.iter().enumerate() {
+            scope.insert(k.clone(), exit_block.argument(i)?.into());
+        }
+        let iter_exit = self.ensure_i64(scope[&iter_key], exit_block)?;
+        exit_block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[iter_exit], &[], self.loc,
+        ));
+
+        // Remove internal loop-carry vars from outer scope.
+        scope.remove(&iter_key);
+        scope.remove(&len_key);
+        scope.remove(&idx_key);
+
+        Ok((None, exit_block))
+    }
+
+    // ── for...in ──────────────────────────────────────────────────────────
+
+    pub(super) fn lower_for_in_statement<'b>(
+        &mut self,
+        for_in: &ForInStatement<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        // Evaluate the object.
+        let (obj_opt, nb) = self.lower_expression(&for_in.right, block, region, scope)?;
+        block = nb;
+        let obj_val = obj_opt.ok_or_else(|| anyhow::anyhow!("for...in: object produced no value"))?;
+        let obj_i64 = self.ensure_i64(obj_val, block)?;
+
+        // Get the array of keys via ts_obj_keys(obj).
+        let keys_arr: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_keys"),
+            &[obj_i64],
+            &[self.i64_type()],
+            self.loc,
+        )).result(0)?.into();
+
+        // Release obj (keys_arr owns the strings now).
+        block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[obj_i64], &[], self.loc,
+        ));
+
+        // Reuse the for...of infrastructure by building a synthetic ForOfStatement equivalent.
+        // Determine loop variable name.
+        let loop_var = match &for_in.left {
+            ForStatementLeft::VariableDeclaration(vd) => {
+                vd.declarations.first().and_then(|d| {
+                    if let BindingPattern::BindingIdentifier(id) = &d.id {
+                        Some(id.name.to_string())
+                    } else { None }
+                })
+            }
+            _ => None,
+        }.unwrap_or_else(|| "__forin_item__".to_string());
+
+        // Store keys_arr in scope under a temp name, then iterate over it.
+        let keys_key = "__forinarr__".to_string();
+        scope.insert(keys_key.clone(), keys_arr);
+
+        // Get length of keys array.
+        let len_tsval: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_len"),
+            &[scope[&keys_key]],
+            &[self.i64_type()],
+            self.loc,
+        )).result(0)?.into();
+        let len_i32 = self.ensure_i32(len_tsval, block)?;
+
+        let zero_i32 = self.lower_numeric_literal(0, block)?;
+
+        let len_key = "__forinlen__".to_string();
+        let idx_key = "__forinidx__".to_string();
+        scope.insert(len_key.clone(), len_i32);
+        scope.insert(idx_key.clone(), zero_i32);
+
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+
+        let mut header_block = region.append_block(Block::new(&phi_types));
+        let body_block       = region.append_block(Block::new(&[]));
+        let update_block     = region.append_block(Block::new(&phi_types));
+        let exit_block       = region.append_block(Block::new(&phi_types));
+
+        let init_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+        block.append_operation(cf::br(&header_block, &init_vals, self.loc));
+
+        let mut header_scope = scope.clone();
+        for (i, k) in scope_keys.iter().enumerate() {
+            header_scope.insert(k.clone(), header_block.argument(i)?.into());
+        }
+
+        let idx_hdr = self.ensure_i32(header_scope[&idx_key], header_block)?;
+        let len_hdr = self.ensure_i32(header_scope[&len_key], header_block)?;
+        let cond_i1: Value<'c, 'b> = header_block.append_operation(arith::cmpi(
+            self.ctx, arith::CmpiPredicate::Slt, idx_hdr, len_hdr, self.loc,
+        )).result(0)?.into();
+        let header_args: Vec<Value<'c, 'b>> = (0..scope_keys.len())
+            .map(|i| header_block.argument(i).map(Into::into))
+            .collect::<Result<_, _>>()?;
+        header_block.append_operation(cf::cond_br(
+            self.ctx, cond_i1, &body_block, &exit_block, &[], &header_args, self.loc,
+        ));
+
+        // Body: get the key string from the keys array.
+        let mut body_scope = header_scope.clone();
+        let arr_body = self.ensure_i64(body_scope[&keys_key], body_block)?;
+        let idx_body = self.ensure_i32(body_scope[&idx_key],  body_block)?;
+
+        let key_val: Value<'c, 'b> = body_block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+            &[arr_body, idx_body],
+            &[self.i64_type()],
+            self.loc,
+        )).result(0)?.into();
+        body_scope.insert(loop_var.clone(), key_val);
+
+        let mut inner_loops = loops.to_vec();
+        inner_loops.push((update_block, exit_block, scope_keys.clone()));
+        let (_, body_end) = self.lower_statement(&for_in.body, body_block, region, &mut body_scope, &inner_loops)?;
+
+        if let Some(&loop_val) = body_scope.get(&loop_var) {
+            let loop_val_i64 = self.ensure_i64(loop_val, body_end)?;
+            body_end.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[loop_val_i64], &[], self.loc,
+            ));
+        }
+
+        let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+            .map(|(i, k)| {
+                let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
+                self.coerce_val_to_type(v, phi_types[i].0, body_end)
+            })
+            .collect::<Result<_>>()?;
+        self.terminate_with_br(body_end, &update_block, &body_vals);
+
+        let mut update_scope = header_scope.clone();
+        for (i, k) in scope_keys.iter().enumerate() {
+            update_scope.insert(k.clone(), update_block.argument(i)?.into());
+        }
+        let idx_upd = self.ensure_i32(update_scope[&idx_key], update_block)?;
+        let one_i32 = self.lower_numeric_literal(1, update_block)?;
+        let new_idx: Value<'c, 'b> = update_block.append_operation(
+            arith::addi(idx_upd, one_i32, self.loc)
+        ).result(0)?.into();
+        update_scope.insert(idx_key.clone(), new_idx);
+
+        let update_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
+            .map(|(i, k)| {
+                let v = *update_scope.get(k).unwrap_or(&header_scope[k]);
+                self.coerce_val_to_type(v, phi_types[i].0, update_block)
+            })
+            .collect::<Result<_>>()?;
+        self.terminate_with_br(update_block, &header_block, &update_vals);
+
+        for (i, k) in scope_keys.iter().enumerate() {
+            scope.insert(k.clone(), exit_block.argument(i)?.into());
+        }
+        // Release the keys array.
+        let keys_exit = self.ensure_i64(scope[&keys_key], exit_block)?;
+        exit_block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[keys_exit], &[], self.loc,
+        ));
+
+        scope.remove(&keys_key);
+        scope.remove(&len_key);
+        scope.remove(&idx_key);
+
+        Ok((None, exit_block))
     }
 
 }

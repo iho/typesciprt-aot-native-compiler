@@ -296,6 +296,74 @@ fn typeof_and_instanceof() {
     );
 }
 
+// ── v0.9 – destructuring, for…of/in, optional chaining, ??, computed props ─────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn destructuring() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/destructuring.ts"),
+        &root.join("target/test-destructuring"),
+        34, // a(10)+b(20)+x(1)+z(3) = 34
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn nullish_coalescing() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/nullish_coalescing.ts"),
+        &root.join("target/test-nullish-coalescing"),
+        35, // v1(10)+v2(20)+v3(5) = 35
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn optional_chaining() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/optional_chaining.ts"),
+        &root.join("target/test-optional-chaining"),
+        12, // v3(5)+v4(7) = 12
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn computed_property_names() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/computed_props.ts"),
+        &root.join("target/test-computed-props"),
+        35, // obj.a(10)+obj.b(20)+obj.c(5) = 35
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn for_of_loop() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/for_of.ts"),
+        &root.join("target/test-for-of"),
+        15, // 1+2+3+4+5 = 15
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn for_in_loop() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/for_in.ts"),
+        &root.join("target/test-for-in"),
+        3, // 3 keys (a, b, c)
+    );
+}
+
 // ── v0.7 – class inheritance, super, static, getters/setters, private fields ──
 
 #[test]
@@ -341,5 +409,128 @@ fn try_catch_finally() {
         &root.join("examples/try_catch_finally.ts"),
         &root.join("target/test-try-catch-finally"),
         7, // throw 7 → catch(e){result=e} → finally{result+0} → 7
+    );
+}
+
+// ── v1.0 – template literals, array/string methods, spread ───────────────────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn template_literals() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/template_literals.ts"),
+        &root.join("target/test-template-literals"),
+        10, // x(7) + y(3) = 10
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn array_methods() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/array_methods.ts"),
+        &root.join("target/test-array-methods"),
+        4, // len(3) + idx(1) = 4
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn string_methods() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/string_methods.ts"),
+        &root.join("target/test-string-methods"),
+        6, // len(13) - idx(7) = 6
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn spread_operator() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/spread.ts"),
+        &root.join("target/test-spread"),
+        15, // 1+2+3+4+5 = 15
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn arrow_functions() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/arrow_functions.ts"),
+        &root.join("target/test-arrow-functions"),
+        15, // sum of [1,2,3,4,5] via reduce = 15
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn logical_assignment() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/logical_assign.ts"),
+        &root.join("target/test-logical-assign"),
+        27, // a(10)+b(5)+c(3)+d(7)+e(2)+f(0) = 27
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn default_parameters() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/default_params.ts"),
+        &root.join("target/test-default-params"),
+        22, // r1(7) + r4(15) = 22
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn array_flat() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/flat.ts"),
+        &root.join("target/test-flat"),
+        21, // 1+2+3+4+5+6 = 21
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn map_builtin() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/map_builtin.ts"),
+        &root.join("target/test-map-builtin"),
+        34, // a(10)+b(20)+sz(3)+has_a(1)+has_x(0) = 34
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn string_methods_extended() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/string_methods2.ts"),
+        &root.join("target/test-string-methods2"),
+        81, // sw(1)+ew(1)+rl(6)+cc(72)+fcl(1) = 81
+    );
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn closures() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/closures.ts"),
+        &root.join("target/test-closures"),
+        19, // makeAdder(5)(3) + makeAdder(10)(1) = 8 + 11 = 19
     );
 }

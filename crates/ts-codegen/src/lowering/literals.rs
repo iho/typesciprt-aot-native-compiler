@@ -42,10 +42,80 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let i64_type = self.i64_type();
 
+        // If the array has spread elements, use push-based construction.
+        let has_spread = array.elements.iter().any(|e| e.is_spread());
+
+        if has_spread {
+            // Allocate empty array, then push/push_all each element.
+            let zero = self.lower_numeric_literal(0, block)?;
+            let arr_val: Value<'c, 'b> = block
+                .append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                    &[zero],
+                    &[i64_type],
+                    self.loc,
+                ))
+                .result(0)?
+                .into();
+
+            for elem in &array.elements {
+                use oxc_ast::ast::ArrayExpressionElement;
+                match elem {
+                    ArrayExpressionElement::SpreadElement(spread) => {
+                        let (val_opt, nb) = self.lower_expression(&spread.argument, block, region, scope)?;
+                        block = nb;
+                        let val = val_opt
+                            .ok_or_else(|| anyhow::anyhow!("spread element produced no value"))?;
+                        let val_i64 = self.ensure_i64(val, block)?;
+                        block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push_all"),
+                            &[arr_val, val_i64],
+                            &[],
+                            self.loc,
+                        ));
+                        block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[val_i64],
+                            &[],
+                            self.loc,
+                        ));
+                    }
+                    _ => {
+                        let Some(expr) = elem.as_expression() else { continue };
+                        let (val_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        let val = val_opt
+                            .ok_or_else(|| anyhow::anyhow!("array element produced no value"))?;
+                        let val_i64 = self.ensure_i64(val, block)?;
+                        // push returns new length — discard it
+                        let _len: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                            &[arr_val, val_i64],
+                            &[i64_type],
+                            self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[val_i64],
+                            &[],
+                            self.loc,
+                        ));
+                    }
+                }
+            }
+
+            return Ok((Some(arr_val), block));
+        }
+
+        // No spread: pre-allocate by count and use ts_arr_set by index (faster).
         let n = array.elements.len();
         let n_val = self.lower_numeric_literal(n as i64, block)?;
 
-        // %arr = func.call @ts_arr_new(%n) : (i32) -> i64
         let arr_val: Value<'c, 'b> = block
             .append_operation(func::call(
                 self.ctx,
@@ -57,18 +127,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             .result(0)?
             .into();
 
-        // Store each element.
         for (i, elem) in array.elements.iter().enumerate() {
             let Some(expr) = elem.as_expression() else { continue };
             let (val_opt, nb) = self.lower_expression(expr, block, region, scope)?;
             block = nb;
             let val = val_opt
                 .ok_or_else(|| anyhow::anyhow!("array element produced no value"))?;
-            
+
             let val_i64 = self.ensure_i64(val, block)?;
             let idx_val = self.lower_numeric_literal(i as i64, block)?;
 
-            // func.call @ts_arr_set(%arr, %idx, %val_i64)
             block.append_operation(func::call(
                 self.ctx,
                 FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
@@ -76,8 +144,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 &[],
                 self.loc,
             ));
-            
-            // ARC: Release the temporary expression result (ts_arr_set retained it).
+
             block.append_operation(func::call(
                 self.ctx,
                 FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
@@ -249,31 +316,86 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         for prop in &obj.properties {
             use oxc_ast::ast::ObjectPropertyKind;
-            let ObjectPropertyKind::ObjectProperty(p) = prop else {
-                continue; // Skip spreads for now
-            };
-            
-            let key_str = match &p.key {
-                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                _ => bail!("object literal: only static identifiers are supported as keys for now"),
-            };
 
-            // key_ptr = get_string_ptr(...)
-            let key_ptr = self.get_string_ptr(&key_str, block)?;
+            // Handle spread: { ...src } → ts_obj_merge(dst, src)
+            if let ObjectPropertyKind::SpreadProperty(spread) = prop {
+                let (src_opt, nb) = self.lower_expression(&spread.argument, block, region, scope)?;
+                block = nb;
+                if let Some(src) = src_opt {
+                    let src_i64 = self.ensure_i64(src, block)?;
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_obj_merge"),
+                        &[obj_val, src_i64],
+                        &[],
+                        self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[src_i64], &[], self.loc,
+                    ));
+                }
+                continue;
+            }
+
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                continue;
+            };
 
             let (val_opt, nb) = self.lower_expression(&p.value, block, region, scope)?;
             block = nb;
             let val = val_opt.ok_or_else(|| anyhow::anyhow!("object property value produced no value"))?;
             let val_i64 = self.ensure_i64(val, block)?;
 
-            // func.call @ts_obj_set(%obj, %key_ptr, %val_i64)
-            block.append_operation(func::call(
-                self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
-                &[obj_val, key_ptr, val_i64],
-                &[],
-                self.loc,
-            ));
+            if let Some(key_str) = p.key.static_name() {
+                // Static key: { foo: val } or { "foo": val } or { 0: val }
+                let key_ptr = self.get_string_ptr(&key_str, block)?;
+                block.append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                    &[obj_val, key_ptr, val_i64],
+                    &[],
+                    self.loc,
+                ));
+            } else {
+                // Computed key: { [expr]: val }
+                // Try to extract the key as an identifier reference (most common computed case).
+                let key_val: Option<Value<'c, 'b>> = match &p.key {
+                    oxc_ast::ast::PropertyKey::Identifier(id_ref) => {
+                        // Variable reference key
+                        if let Some(&v) = scope.get(id_ref.name.as_str()) {
+                            let v_i64 = self.ensure_i64(v, block)?;
+                            block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                                &[v_i64], &[], self.loc,
+                            ));
+                            Some(v_i64)
+                        } else {
+                            tracing::warn!("computed property key: undefined variable {}", id_ref.name);
+                            None
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("skipping unsupported computed property key type");
+                        None
+                    }
+                };
+
+                if let Some(key_i64) = key_val {
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set_val_key"),
+                        &[obj_val, key_i64, val_i64],
+                        &[],
+                        self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[key_i64], &[], self.loc,
+                    ));
+                }
+            }
         }
 
         Ok((Some(obj_val), block))

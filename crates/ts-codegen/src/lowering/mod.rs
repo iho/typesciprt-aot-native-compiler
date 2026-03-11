@@ -29,14 +29,15 @@ use melior::ir::{
 use melior::ir::operation::OperationBuilder;
 use melior::Context;
 use oxc_ast::ast::{
-    AssignmentTarget, BinaryExpression, BindingPattern, CallExpression, CatchClause, Class,
-    ClassBody, ClassElement, Declaration, Expression, ExportDefaultDeclaration,
-    ExportNamedDeclaration, ForStatement, ForStatementInit, Function, IfStatement,
-    ImportDeclaration, ImportDeclarationSpecifier, LogicalExpression, MethodDefinition,
-    MethodDefinitionKind, NewExpression, PrivateFieldExpression, Program, PropertyDefinition,
-    Statement, ThisExpression, ThrowStatement, TSAsExpression, TSEnumDeclaration,
-    TSSatisfiesExpression, TSTypeAssertion, TryStatement, UnaryExpression, VariableDeclaration,
-    WhileStatement,
+    ArrowFunctionExpression, ArrayPattern, AssignmentTarget, BinaryExpression, BindingPattern,
+    BindingProperty, CallExpression, CatchClause, ChainElement, ChainExpression, Class, ClassBody,
+    ClassElement, Declaration, Expression, ExportDefaultDeclaration, ExportNamedDeclaration,
+    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, ForStatementLeft, Function,
+    IfStatement, ImportDeclaration, ImportDeclarationSpecifier,
+    LogicalExpression, MethodDefinition, MethodDefinitionKind, NewExpression, ObjectPattern,
+    PrivateFieldExpression, Program, PropertyDefinition, Statement, TemplateLiteral,
+    ThisExpression, ThrowStatement, TSAsExpression, TSEnumDeclaration, TSSatisfiesExpression,
+    TSTypeAssertion, TryStatement, UnaryExpression, VariableDeclaration, WhileStatement,
 };
 use std::collections::HashMap;
 
@@ -99,6 +100,7 @@ pub fn lower_program<'c>(
         funcs: HashMap::new(),
         classes: HashMap::new(),
         string_count: 0,
+        arrow_count: 0,
         var_class_types: HashMap::new(),
         fn_return_type: i32_type,
         is_async: false,
@@ -254,6 +256,8 @@ struct Lowerer<'c, 'm> {
     funcs:          HashMap<String, FuncSig<'c>>,
     classes:        HashMap<String, ClassSig>,
     string_count:   usize,
+    /// Counter for generating unique arrow-function names.
+    arrow_count:    usize,
     /// Maps variable name → class name for `new Foo()` assignments.
     /// Used for method-call dispatch without full type inference.
     var_class_types: HashMap<String, String>,
@@ -310,6 +314,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         if val.r#type() == self.i1_type() {
             return Ok(val);
         }
+        // For NaN-boxed i64 values, use ts_is_truthy so that NaN-boxed false/null/undefined
+        // are treated as falsy. Direct != 0 comparison is wrong because FALSE is non-zero.
+        let cmp_val = if val.r#type() == self.i64_type() {
+            block.append_operation(func::call(
+                self.ctx,
+                melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                &[val],
+                &[self.i32_type()],
+                self.loc,
+            )).result(0)?.into()
+        } else {
+            val
+        };
         let zero = block
             .append_operation(arith::constant(
                 self.ctx,
@@ -322,7 +339,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             .append_operation(arith::cmpi(
                 self.ctx,
                 arith::CmpiPredicate::Ne,
-                val,
+                cmp_val,
                 zero,
                 self.loc,
             ))
@@ -459,6 +476,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_string_new", &[ptr_type], &[i64_type]);
         add_func("ts_string_concat", &[i64_type, i64_type], &[i64_type]);
         add_func("ts_add", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_sub", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_mul", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_div", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_mod", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_lt",  &[i64_type, i64_type], &[i32_type]);
+        add_func("ts_le",  &[i64_type, i64_type], &[i32_type]);
+        add_func("ts_gt",  &[i64_type, i64_type], &[i32_type]);
+        add_func("ts_ge",  &[i64_type, i64_type], &[i32_type]);
 
         add_func("ts_promise_resolve", &[i64_type], &[i64_type]);
         add_func("ts_promise_await",   &[i64_type], &[i64_type]);
@@ -478,6 +503,106 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         add_func("ts_typeof",          &[i64_type], &[i64_type]);
         add_func("ts_val_strict_eq",   &[i64_type, i64_type], &[i32_type]);
+        add_func("ts_is_nullish",      &[i64_type], &[i32_type]);
+        add_func("ts_is_truthy",       &[i64_type], &[i32_type]);
+        add_func("ts_is_undefined",    &[i64_type], &[i32_type]);
+        add_func("ts_obj_set_val_key", &[i64_type, i64_type, i64_type], &[]);
+        add_func("ts_obj_keys",        &[i64_type], &[i64_type]);
+
+        // v1.0: template literals, array/string methods, spread
+        add_func("ts_val_to_string",   &[i64_type], &[i64_type]);
+        add_func("ts_val_length",      &[i64_type], &[i64_type]);
+        add_func("ts_arr_push",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_pop",         &[i64_type], &[i64_type]);
+        add_func("ts_arr_push_all",    &[i64_type, i64_type], &[]);
+        add_func("ts_arr_join",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_index_of",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_val_index_of",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_val_includes",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_index_of",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_includes",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_slice",       &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_to_upper",    &[i64_type], &[i64_type]);
+        add_func("ts_str_to_lower",    &[i64_type], &[i64_type]);
+        add_func("ts_str_trim",        &[i64_type], &[i64_type]);
+        add_func("ts_str_split",       &[i64_type, i64_type], &[i64_type]);
+
+        // v1.1: Math, Object statics, Array.isArray, parseInt/parseFloat, console.log multi-arg
+        add_func("ts_math_abs",   &[i64_type], &[i64_type]);
+        add_func("ts_math_floor", &[i64_type], &[i64_type]);
+        add_func("ts_math_ceil",  &[i64_type], &[i64_type]);
+        add_func("ts_math_round", &[i64_type], &[i64_type]);
+        add_func("ts_math_sqrt",  &[i64_type], &[i64_type]);
+        add_func("ts_math_trunc", &[i64_type], &[i64_type]);
+        add_func("ts_math_log",   &[i64_type], &[i64_type]);
+        add_func("ts_math_log2",  &[i64_type], &[i64_type]);
+        add_func("ts_math_log10", &[i64_type], &[i64_type]);
+        add_func("ts_math_sin",   &[i64_type], &[i64_type]);
+        add_func("ts_math_cos",   &[i64_type], &[i64_type]);
+        add_func("ts_math_tan",   &[i64_type], &[i64_type]);
+        add_func("ts_math_min",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_math_max",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_math_pow",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_math_atan2", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_math_hypot", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_obj_values",  &[i64_type], &[i64_type]);
+        add_func("ts_obj_entries", &[i64_type], &[i64_type]);
+        add_func("ts_obj_merge",          &[i64_type, i64_type], &[]);
+        add_func("ts_obj_assign",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_obj_create",         &[i64_type], &[i64_type]);
+        add_func("ts_obj_from_entries",   &[i64_type], &[i64_type]);
+        add_func("ts_is_array",    &[i64_type], &[i32_type]);
+        add_func("ts_parse_int",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_parse_float", &[i64_type], &[i64_type]);
+        add_func("ts_is_nan_val",  &[i64_type], &[i64_type]);
+        add_func("ts_is_finite_val", &[i64_type], &[i64_type]);
+        add_func("__ts_console_log_val_inline", &[i64_type], &[]);
+        add_func("__ts_console_log_space",      &[], &[]);
+        add_func("__ts_console_log_newline",    &[], &[]);
+
+        // v1.2: first-class functions / arrow functions / array HOFs
+        add_func("ts_func_new",        &[ptr_type, i32_type], &[i64_type]);
+        add_func("ts_closure_new",     &[ptr_type, i32_type, i64_type], &[i64_type]);
+        add_func("ts_func_call0",      &[i64_type], &[i64_type]);
+        add_func("ts_func_call1",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_func_call2",      &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_func_call3",      &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_func_call4",      &[i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_map",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_filter",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_for_each",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_reduce",      &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_find",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_find_index",  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_some",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_every",       &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_sort",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_flat_map",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_flat",        &[i64_type, i32_type], &[i64_type]);
+
+        // v1.4: Map built-in
+        add_func("ts_map_new",      &[], &[i64_type]);
+        add_func("ts_map_set",      &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_map_get",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_map_has",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_map_delete",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_map_clear",    &[i64_type], &[]);
+        add_func("ts_map_size",     &[i64_type], &[i64_type]);
+        add_func("ts_map_keys",     &[i64_type], &[i64_type]);
+        add_func("ts_map_values",   &[i64_type], &[i64_type]);
+        add_func("ts_map_for_each", &[i64_type, i64_type], &[i64_type]);
+
+        // v1.3: additional string methods
+        add_func("ts_str_replace",        &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_replace_all",    &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_starts_with",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_ends_with",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_pad_start",      &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_pad_end",        &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_char_at",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_char_code_at",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_repeat",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_from_char_code", &[i64_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -495,27 +620,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     // ── Function signature collection (hoisting pass) ─────────────────────
 
     pub(super) fn collect_function_signatures(&mut self, program: &Program<'_>) {
-        let i32_type = self.i32_type();
         let i64_type = self.i64_type();
         for stmt in &program.body {
             match stmt {
                 Statement::FunctionDeclaration(func) => {
                     let Some(id) = &func.id else { continue };
                     let name = id.name.to_string();
-                    let return_type = if func.r#async { i64_type } else { i32_type };
                     self.funcs.insert(name, FuncSig {
-                        param_types: vec![i32_type; func.params.items.len()],
-                        return_type: Some(return_type),
+                        param_types: vec![i64_type; func.params.items.len()],
+                        return_type: Some(i64_type),
                     });
                 }
                 Statement::ExportNamedDeclaration(export) => {
                     if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
-                            let return_type = if func.r#async { i64_type } else { i32_type };
                             self.funcs.insert(name, FuncSig {
-                                param_types: vec![i32_type; func.params.items.len()],
-                                return_type: Some(return_type),
+                                param_types: vec![i64_type; func.params.items.len()],
+                                return_type: Some(i64_type),
                             });
                         }
                     }
@@ -525,10 +647,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
-                            let return_type = if func.r#async { i64_type } else { i32_type };
                             self.funcs.insert(name, FuncSig {
-                                param_types: vec![i32_type; func.params.items.len()],
-                                return_type: Some(return_type),
+                                param_types: vec![i64_type; func.params.items.len()],
+                                return_type: Some(i64_type),
                             });
                         }
                     }
@@ -575,8 +696,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             for element in &class.body.body {
                 let ClassElement::MethodDefinition(method) = element else { continue };
                 if method.kind == MethodDefinitionKind::Constructor { continue; }
-                let Some(name) = method.key.static_name() else { continue };
-                let name = name.to_string();
+
+                // Resolve method name: public (StaticIdentifier) or private (#name)
+                let name_opt: Option<String> = match &method.key {
+                    oxc_ast::ast::PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                    oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => {
+                        Some(format!("__priv_{}", id.name.as_str()))
+                    }
+                    _ => method.key.static_name().map(|n| n.to_string()),
+                };
+                let Some(name) = name_opt else { continue };
 
                 match (method.kind, method.r#static) {
                     (MethodDefinitionKind::Get, false) => {
@@ -637,13 +766,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let name = id.name.to_string();
         let i32_type = self.i32_type();
         let i64_type = self.i64_type();
-        // Async functions return a Promise<T> (i64); regular functions return i32.
-        let return_type = if func.r#async { i64_type } else { i32_type };
+        // All functions return i64 (NaN-boxed TsVal) so they can return any value including heap objects.
+        let return_type = i64_type;
 
+        // Use i64 for all params to support NaN-boxed values (including `undefined` for defaults).
+        let n_params = func.params.items.len();
         let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
-            func.params.items.iter().map(|_| (i32_type, self.loc)).collect();
+            (0..n_params).map(|_| (i64_type, self.loc)).collect();
         let func_type = FunctionType::new(
-            self.ctx, &vec![i32_type; param_specs.len()], &[return_type],
+            self.ctx, &vec![i64_type; n_params], &[return_type],
         );
 
         let region = Region::new();
@@ -657,6 +788,43 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         let mut current_block = entry;
+
+        // Emit default parameter checks: if param === undefined, use initializer.
+        for (i, param) in func.params.items.iter().enumerate() {
+            let Some(init_expr) = &param.initializer else { continue };
+            let BindingPattern::BindingIdentifier(id) = &param.pattern else { continue };
+            let param_name = id.name.to_string();
+
+            let param_val: Value<'_, '_> = entry.argument(i)?.into();
+            let param_i64 = self.ensure_i64(param_val, current_block)?;
+
+            let is_undef: Value<'_, '_> = current_block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                &[param_i64], &[i32_type], self.loc,
+            )).result(0)?.into();
+            let is_undef_i1 = self.ensure_i1(is_undef, current_block)?;
+
+            let merge_block = region.append_block(Block::new(&[(i64_type, self.loc)]));
+            let default_block = region.append_block(Block::new(&[]));
+
+            current_block.append_operation(cf::cond_br(
+                self.ctx, is_undef_i1,
+                &default_block, &merge_block,
+                &[], &[param_i64],
+                self.loc,
+            ));
+
+            let mut default_scope = scope.clone();
+            let (init_val_opt, post_init_block) =
+                self.lower_expression(init_expr, default_block, &region, &mut default_scope)?;
+            let init_val = init_val_opt.ok_or_else(|| anyhow::anyhow!("default param '{}': initializer produced no value", param_name))?;
+            let init_i64 = self.ensure_i64(init_val, post_init_block)?;
+            post_init_block.append_operation(cf::br(&merge_block, &[init_i64], self.loc));
+
+            let final_param: Value<'_, '_> = merge_block.argument(0)?.into();
+            scope.insert(param_name, final_param);
+            current_block = merge_block;
+        }
         let mut result_value: Value<'_, '_> = entry
             .append_operation(arith::constant(
                 self.ctx,
@@ -713,7 +881,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.module.body().append_operation(op);
 
         self.funcs.insert(name, FuncSig {
-            param_types: vec![i32_type; param_specs.len()],
+            param_types: vec![i64_type; param_specs.len()],
             return_type: Some(return_type),
         });
         Ok(())

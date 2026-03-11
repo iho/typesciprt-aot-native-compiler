@@ -1,6 +1,6 @@
 # TypeScript AOT Native Compiler
 
-A TypeScript-to-native compiler that generates high-performance binaries via MLIR and LLVM. Write TypeScript, compile to native code.
+A TypeScript-to-native compiler that compiles TypeScript directly to native binaries via MLIR and LLVM, with no VM or JIT. Values are represented using NaN-boxing (`TsVal = i64`) and memory is managed with Automatic Reference Counting (ARC).
 
 ## Quick Start
 
@@ -16,41 +16,194 @@ A TypeScript-to-native compiler that generates high-performance binaries via MLI
 cargo build -p tscc
 
 # Compile a TypeScript program
-./target/debug/tscc examples/arithmetic.ts
+./target/debug/tscc examples/closures.ts -o my_program
 
 # Run the generated binary
-./examples/arithmetic
-echo $?  # Shows: 5 (result of 2 + 3)
+./my_program
+echo $?  # Exit code is the value of the last expression
 ```
 
 ## Language Features
 
-### Arithmetic
+### Primitives & Variables
 ```typescript
-2 + 3;          // Addition
-10 - 4;         // Subtraction
-5 * 6;          // Multiplication
-20 / 4;         // Integer division
+let x = 42;
+const y = 3.14;
+const flag = true;
+const name = "hello";
+const nothing = null;
 ```
 
-### Variables
+### Arithmetic & Operators
 ```typescript
-let x = 10;
-const y = 20;
-var z = x + y;
-z;              // Returns 30
+2 + 3;          // integer add (also string concat if either is string)
+10 - 4 * 2;     // precedence respected
+20 / 4;         // division
+7 % 3;          // modulo
+2 ** 8;         // exponentiation
 ```
 
-### Complex Expressions
+### Comparisons & Logic
 ```typescript
-let a = 2;
-let b = 3;
-let c = a + b;
-c * 2;          // Returns 10 (via exit code)
+a === b;  a !== b;  a < b;  a <= b;  a > b;  a >= b;
+a && b;   a || b;   !a;
+a ?? b;           // nullish coalescing
+a &&= b;  a ||= b;  a ??= b;  // logical assignment
 ```
 
-### Return Values
-The last expression in the program is returned as the exit code (0-255).
+### Control Flow
+```typescript
+if (cond) { ... } else { ... }
+while (cond) { ... }
+for (let i = 0; i < 10; i++) { ... }
+for (const v of arr) { ... }
+for (const k in obj) { ... }
+cond ? a : b;     // ternary
+break; continue;  // loop control
+```
+
+### Functions
+```typescript
+function add(a: number, b: number) {
+  return a + b;
+}
+
+// Default parameters
+function greet(name: string = "world") {
+  return name;
+}
+
+// Async/await
+async function fetchData() {
+  const result = await somePromise;
+  return result;
+}
+```
+
+### Arrow Functions & Closures
+```typescript
+const double = (x: number) => x * 2;
+
+// Closures capture outer variables
+function makeAdder(x: number) {
+  return (y: number) => x + y;
+}
+const add5 = makeAdder(5);
+add5(3); // 8
+```
+
+### Arrays
+```typescript
+const arr = [1, 2, 3];
+arr.push(4);
+arr.pop();
+arr.length;
+arr.indexOf(2);
+arr.includes(3);
+arr.join(",");
+arr.map(x => x * 2);
+arr.filter(x => x > 1);
+arr.reduce((acc, x) => acc + x, 0);
+arr.forEach(x => console.log(x));
+arr.find(x => x > 2);
+arr.some(x => x > 2);
+arr.every(x => x > 0);
+arr.flat(2);
+arr.flatMap(x => [x, x * 2]);
+[...arr, 4, 5];  // spread
+```
+
+### Objects
+```typescript
+const obj = { x: 1, y: 2 };
+obj.x;
+obj["y"];
+const { x, y } = obj;           // destructuring
+const { a = 10, ...rest } = obj; // with defaults and rest (partial)
+Object.assign(target, source);
+Object.create(proto);
+Object.fromEntries(entries);
+```
+
+### Destructuring
+```typescript
+const [a, b, c] = [1, 2, 3];    // array destructuring
+const { x, y } = point;          // object destructuring
+```
+
+### Template Literals
+```typescript
+const msg = `Hello, ${name}! You are ${age} years old.`;
+```
+
+### Optional Chaining & Nullish
+```typescript
+const val = obj?.prop?.nested;
+const safe = maybeNull ?? "default";
+```
+
+### String Methods
+```typescript
+str.indexOf("x");    str.includes("x");
+str.slice(1, 5);     str.toUpperCase();  str.toLowerCase();
+str.trim();          str.split(",");
+str.replace("a","b"); str.replaceAll("a","b");
+str.startsWith("x"); str.endsWith("x");
+str.padStart(5,"0"); str.padEnd(5,"_");
+str.charAt(0);       str.charCodeAt(0);  str.repeat(3);
+String.fromCharCode(65);
+```
+
+### Map
+```typescript
+const m = new Map();
+m.set("key", 42);
+m.get("key");       // 42
+m.has("key");       // true
+m.delete("key");
+m.size;
+m.keys();
+m.values();
+```
+
+### Classes
+```typescript
+class Animal {
+  #name: string;       // private field
+
+  constructor(name: string) {
+    this.#name = name;
+  }
+
+  #validate() { ... } // private method
+
+  speak() {
+    return this.#name;
+  }
+}
+
+class Dog extends Animal {
+  constructor(name: string) {
+    super(name);
+  }
+}
+```
+
+### Error Handling
+```typescript
+try {
+  throw new Error("oops");
+} catch (e) {
+  console.log("caught");
+} finally {
+  console.log("cleanup");
+}
+```
+
+### console.log
+```typescript
+console.log("hello", 42, true);
+```
 
 ## Project Structure
 
@@ -58,315 +211,76 @@ The last expression in the program is returned as the exit code (0-255).
 .
 ├── crates/
 │   ├── tscc/              # Compiler driver & CLI
-│   │   ├── main.rs        # CLI and pipeline orchestration
-│   │   └── emit.rs        # MLIR→LLVM→Binary translation
-│   ├── ts-frontend/       # Parser
-│   │   └── lib.rs         # OXC parser wrapper
-│   ├── ts-codegen/        # Code generation
-│   │   ├── lib.rs         # Main module
-│   │   ├── lowering.rs    # AST → MLIR lowering
-│   │   ├── passes.rs      # MLIR pass pipeline
-│   │   └── context.rs     # MLIR context setup
-│   └── ts-runtime/        # Runtime (future)
-├── examples/              # Example programs
-├── .cargo/config.toml     # LLVM configuration
-├── Cargo.toml             # Workspace manifest
-├── STATUS.md              # Current development status
-└── README.md              # This file
+│   ├── ts-frontend/       # OXC parser wrapper
+│   ├── ts-codegen/        # AST → MLIR lowering
+│   │   └── lowering/      # Lowering modules (expressions, statements, classes, …)
+│   └── ts-runtime/        # Runtime library (ARC, NaN-boxing, builtins)
+│       ├── value.rs        # TsVal, all runtime functions
+│       ├── alloc.rs        # ARC allocator
+│       └── console.rs      # console.log implementation
+├── examples/              # Example TypeScript programs
+└── README.md
 ```
 
 ## Compilation Pipeline
 
 ```
 TypeScript Source
-       ↓
-┌──────────────────────┐
-│  Parse (OXC)        │  → OXC AST
-└──────────────────────┘
-       ↓
-┌──────────────────────┐
-│  Lower to MLIR      │  → arith/func dialects
-└──────────────────────┘
-       ↓
-┌──────────────────────┐
-│  Optimize           │  → canonicalize, lowering passes
-└──────────────────────┘
-       ↓
-┌──────────────────────┐
-│  MLIR → LLVM IR     │  → mlir-translate
-└──────────────────────┘
-       ↓
-┌──────────────────────┐
-│  LLVM → Object Code │  → llc
-└──────────────────────┘
-       ↓
-┌──────────────────────┐
-│  Link to Binary     │  → clang/ld
-└──────────────────────┘
-       ↓
-   Native Binary
+       ↓  OXC parser
+    OXC AST
+       ↓  ts-codegen (lowering/)
+  MLIR (func/arith/cf/llvm dialects)
+       ↓  mlir-opt + mlir-translate
+    LLVM IR
+       ↓  llc
+   Object file
+       ↓  clang (links ts-runtime)
+  Native Binary
 ```
 
-## CLI Usage
+## CLI
 
 ```bash
 tscc [OPTIONS] <input.ts>
 
 OPTIONS:
-  -o, --output <PATH>     Output file path (default: replaces .ts)
-  --emit-mlir            Print MLIR and exit
-  --emit-llvm            Print LLVM IR and exit
-  -O <LEVEL>             Optimization level: 0-3 (default: 2)
-  -v, --verbose          Enable debug logging
-  -h, --help             Show help message
+  -o, --output <PATH>   Output file path (default: strips .ts extension)
+  --emit-mlir           Print MLIR and exit
+  --emit-llvm           Print LLVM IR and exit
+  -O <LEVEL>            Optimization level: 0-3 (default: 2)
+  -v, --verbose         Enable debug logging
+  -h, --help            Show help
 ```
 
-### Examples
+## Value Representation
+
+All TypeScript values are represented as `i64` using **NaN-boxing**:
+
+| Type      | Encoding                                  |
+|-----------|-------------------------------------------|
+| Integer   | `0x7FFE_0000_0000_0000 \| value`          |
+| Pointer   | `0x7FFC_0000_0000_0000 \| ptr (48-bit)`   |
+| Boolean   | `0x7FF8_0002_0000_0000 \| (0 or 1)`       |
+| null      | `0x7FF9_0000_0000_0000`                   |
+| undefined | `0x7FF8_0000_0000_0000`                   |
+
+Heap objects (Object, Array, String, Function, Map) are ref-counted via ARC. Every value read from scope produces an owned reference; temporaries are released after use.
+
+## Testing
 
 ```bash
-# Compile to native binary
-tscc examples/arithmetic.ts -o my_program
-
-# View generated MLIR
-tscc examples/arithmetic.ts --emit-mlir
-
-# View generated LLVM IR
-tscc examples/arithmetic.ts --emit-llvm
-
-# Maximum optimization
-tscc examples/arithmetic.ts -O3
-
-# Verbose logging
-tscc examples/arithmetic.ts -v
+# Run all tests (requires LLVM)
+cargo test -p tscc -- --include-ignored --test-threads=1
 ```
-
-## Examples
-
-### Basic Arithmetic
-```typescript
-// examples/arithmetic.ts
-2 + 3;
-```
-
-```bash
-$ ./target/debug/tscc examples/arithmetic.ts
-✓  compiled to examples/arithmetic
-$ ./examples/arithmetic
-$ echo $?
-5
-```
-
-### Variable Operations
-```typescript
-// examples/variables.ts
-let x = 10;
-let y = 5;
-x + y;
-```
-
-```bash
-$ ./target/debug/tscc examples/variables.ts
-✓  compiled to examples/variables
-$ ./examples/variables; echo $?
-15
-```
-
-### Complex Calculations
-```typescript
-// examples/var_arithmetic.ts
-let a = 2;
-let b = 3;
-let c = a + b;
-c * 2;
-```
-
-```bash
-$ ./target/debug/tscc examples/var_arithmetic.ts
-✓  compiled to examples/var_arithmetic
-$ ./examples/var_arithmetic; echo $?
-10
-```
-
-## Type Support
-
-Currently implemented:
-- **i32**: 32-bit signed integers (primary type)
-
-Planned:
-- **boolean**: true/false values
-- **f64**: 64-bit floating point
-- **string**: String literals and operations
-- **Array<T>**: Typed arrays
-- **Object**: Object literals and properties
-
-## Debugging
-
-### Enable tracing
-```bash
-./target/debug/tscc examples/arithmetic.ts -v
-```
-
-Shows:
-- Parsing progress
-- Variable declarations and references
-- Operation lowering steps
-- Pass execution
-
-### Inspect intermediate representations
-
-```bash
-# View MLIR IR
-./target/debug/tscc examples/arithmetic.ts --emit-mlir
-
-# View LLVM IR
-./target/debug/tscc examples/arithmetic.ts --emit-llvm
-
-# Compiler will also save intermediate files:
-# - examples/arithmetic.mlir (MLIR text format)
-# - examples/arithmetic.ll    (LLVM IR text format)
-# - examples/arithmetic.o     (Object file)
-```
-
-## Architecture
-
-### ts-frontend
-The parser layer wraps OXC (the fastest Rust TypeScript/JavaScript parser).
-- Parses TypeScript → OXC AST
-- Handles syntax errors and recovery
-- No type checking (deferred to codegen)
-
-### ts-codegen
-The code generation layer lowers OXC AST to MLIR.
-- **lowering.rs**: AST → MLIR dialect operations
-  - NumericLiteral → arith.constant
-  - BinaryExpression → arith.addi/subi/muli/divsi
-  - VariableDeclaration → scope management
-  - Identifier → scope lookup
-- **passes.rs**: MLIR transformation pipeline
-- **context.rs**: MLIR context and dialect registration
-
-### tscc
-The compiler driver orchestrates the pipeline.
-- CLI argument parsing (clap)
-- Pipeline orchestration
-- MLIR → LLVM translation (mlir-translate)
-- LLVM compilation (llc)
-- Binary linking (clang)
-
-## Performance
-
-### Compilation Time
-- Simple programs (10-20 LOC): ~2 seconds
-- Includes LLVM optimization passes
-
-### Generated Code
-- Optimization levels: -O0 to -O3 (passed to llc)
-- MLIR canonicalization and lowering passes
-- Full LLVM backend optimization
-
-### Binary Size
-- Minimal program (~arithmetic.ts): ~20KB
-- No runtime overhead
-- Direct native code execution
-
-## Limitations
-
-### Current
-- Only i32 integers supported
-- Single return value (exit code)
-- No dynamic memory allocation
-- No standard library
-- Function scope only (no global state)
-
-### By Design
-- Ahead-of-time compilation only (no JIT)
-- No garbage collection required
-- Direct native execution (no VM)
-- Rust safety guarantees in codegen
 
 ## Building from Source
 
 ```bash
-# Clone repository
 git clone <repo-url>
 cd typesciprt-aot-native-compiler
-
-# Build all crates
 cargo build -p tscc
-
-# Run tests
-cargo test
-
-# Build release binary
-cargo build --release -p tscc
-
-# Binary location
-./target/release/tscc
+./target/debug/tscc examples/closures.ts -o out && ./out
 ```
-
-## Configuration
-
-### LLVM Path
-Edit `.cargo/config.toml` to use different LLVM installation:
-
-```toml
-[build]
-rustflags = [
-  "-L/path/to/llvm/lib",
-  "-L/path/to/llvm/lib64",
-]
-
-[env]
-MLIR_SYS_210_PREFIX = "/path/to/llvm"
-LLVM_SYS_210_PREFIX = "/path/to/llvm"
-```
-
-### Optimization Levels
-- `-O0`: No optimization (fastest compilation)
-- `-O1`: Light optimization
-- `-O2`: Standard optimization (default)
-- `-O3`: Aggressive optimization
-
-## Contributing
-
-### Code Style
-- Follow Rust conventions (checked by rustfmt)
-- No unsafe code unless necessary
-- Comprehensive error messages
-- Debug logging for development
-
-### Testing
-Add test cases to `examples/` directory:
-```typescript
-// examples/test_feature.ts
-// Expected exit code: <value>
-```
-
-Run manual tests:
-```bash
-./target/debug/tscc examples/test_feature.ts
-./examples/test_feature; echo "Exit code: $?"
-```
-
-## Roadmap
-
-See [PLAN.md](PLAN.md) for detailed development roadmap.
-
-**Short term** (v0.2):
-- Comparison operators
-- If/else statements
-- Boolean type
-
-**Medium term** (v0.3):
-- Function declarations
-- For/while loops
-- Proper scoping
-
-**Long term** (v1.0):
-- String support
-- Array type
-- Standard library
-- console.log alternative
 
 ## License
 

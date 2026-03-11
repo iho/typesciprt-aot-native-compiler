@@ -1,5 +1,5 @@
-function isEven(n) {
-    let is_even = (n / 2) * 2 == n ? 1 : 0;
+function isEven(n: number) {
+    let is_even = n % 2 === 0 ? 1 : 0;
     return is_even;
 }
 

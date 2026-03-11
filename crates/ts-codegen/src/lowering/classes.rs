@@ -170,6 +170,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 let Some(init_expr) = &prop.value else { continue };
                 let key_str = match &prop.key {
                     oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                    oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => {
+                        format!("__priv_{}", id.name.as_str())
+                    }
                     _ => continue,
                 };
                 let (val_opt, nb) =
@@ -230,7 +233,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     // ── Instance methods ──────────────────────────────────────────────────
 
     fn lower_class_method(&mut self, class_name: &str, method: &MethodDefinition<'_>) -> Result<()> {
-        let Some(name) = method.key.static_name() else { return Ok(()) };
+        // Resolve method name: public or private (#name → __priv_name)
+        let name = match &method.key {
+            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+            oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => {
+                format!("__priv_{}", id.name.as_str())
+            }
+            _ => match method.key.static_name() {
+                Some(n) => n.to_string(),
+                None => return Ok(()),
+            },
+        };
         let func_name = format!("__class_{}_{}", class_name, name);
         let i64_type  = self.i64_type();
 
