@@ -1,9 +1,0 @@
-{
-    "chat.tools.terminal.autoApprove": {
-        "cargo build": true,
-        "cargo doc": true,
-        "./target/debug/tscc": true,
-        "./examples/arithmetic": true,
-        "./examples/complex": true
-    }
-}

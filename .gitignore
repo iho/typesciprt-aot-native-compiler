@@ -8,3 +8,5 @@ target
 *.dll
 *.exe
 .cargo/config.toml
+.vscode/
+.claude/
