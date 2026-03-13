@@ -16,10 +16,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     }
 
     pub(super) fn lower_boolean_literal<'b>(&self, value: bool, block: BlockRef<'c, 'b>) -> Result<Value<'c, 'b>> {
+        // NAN_MASK | TAG_BOOL | (0 or 1)
+        // NAN_MASK = 0x7FF8_0000_0000_0000, TAG_BOOL = 0x0002_0000_0000_0000
+        // TRUE  = 0x7FFA_0000_0000_0001
+        // FALSE = 0x7FFA_0000_0000_0000
+        let bits: u64 = if value { 0x7FFA_0000_0000_0001 } else { 0x7FFA_0000_0000_0000 };
         Ok(block
             .append_operation(arith::constant(
                 self.ctx,
-                IntegerAttribute::new(self.i1_type(), if value { 1 } else { 0 }).into(),
+                IntegerAttribute::new(self.i64_type(), bits as i64).into(),
                 self.loc,
             ))
             .result(0)?

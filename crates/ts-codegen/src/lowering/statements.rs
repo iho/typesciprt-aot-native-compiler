@@ -559,7 +559,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         };
 
         // ARC: Release all variables in the current scope before returning.
-        for (_, v) in scope.iter() {
+        // "__env" is the env array passed in from the caller and is not owned by this closure.
+        for (name, v) in scope.iter() {
+            if name == "__env" { continue; }
             let v_i64 = self.ensure_i64(*v, block)?;
             block.append_operation(func::call(
                 self.ctx,

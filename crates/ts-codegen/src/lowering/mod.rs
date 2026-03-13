@@ -201,6 +201,7 @@ pub fn lower_program<'c>(
         module_global_names: std::collections::HashSet::new(),
         builtin_wrappers_emitted: std::collections::HashSet::new(),
         lowered_classes: std::collections::HashSet::new(),
+        closure_env_indices: HashMap::new(),
     };
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
@@ -343,6 +344,9 @@ struct Lowerer<'c, 'm> {
     builtin_wrappers_emitted: std::collections::HashSet<String>,
     /// Tracks which classes have already been lowered (to prevent re-emission from duplicate imports).
     lowered_classes: std::collections::HashSet<String>,
+    /// When inside a closure body with captures, maps captured variable name → env array index.
+    /// Used to write back mutations to captured variables into the env array.
+    closure_env_indices: HashMap<String, usize>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
@@ -794,6 +798,28 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_promise_all",         &[i64_type], &[i64_type]);
         add_func("ts_val_has_key",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_coerce_bool",         &[i64_type], &[i64_type]);
+
+        // HTTP server
+        add_func("ts_serve",               &[i32_type, i64_type], &[i64_type]);
+
+        // Closure introspection (for recursive inner functions)
+        add_func("ts_closure_get_env",     &[i64_type], &[i64_type]);
+
+        // URL / URLSearchParams
+        add_func("ts_url_new",                    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_urlsearchparams_new",        &[i64_type], &[i64_type]);
+        add_func("ts_urlsearchparams_to_string",  &[i64_type], &[i64_type]);
+        add_func("ts_urlsearchparams_append",     &[i64_type, i64_type, i64_type], &[]);
+        add_func("ts_urlsearchparams_get_all",    &[i64_type, i64_type], &[i64_type]);
+
+        // Request/Response body methods
+        add_func("ts_val_text",                   &[i64_type], &[i64_type]);
+        add_func("ts_val_json",                   &[i64_type], &[i64_type]);
+
+        // addEventListener / serve(port) with registered listener
+        add_func("ts_add_event_listener",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_remove_event_listener",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_serve_worker",               &[i32_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -1111,15 +1137,104 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.fn_return_type = return_type;
         self.is_async = func.r#async;
         if let Some(body) = &func.body {
+            // Pre-seed ALL local bindings (vars + inner function names) as undefined.
+            let undef_placeholder: Value<'_, '_> = current_block.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                self.loc,
+            )).result(0)?.into();
             for stmt in &body.statements {
-                let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
-                current_block = next;
-                if let Some(v) = val { result_value = v; }
+                if let Statement::FunctionDeclaration(inner_fn) = stmt {
+                    if let Some(fn_id) = &inner_fn.id {
+                        let fn_name = fn_id.name.to_string();
+                        if !scope.contains_key(&fn_name) {
+                            scope.insert(fn_name, undef_placeholder);
+                        }
+                    }
+                }
+            }
+
+            // Process all statements in source order. FunctionDeclarations are handled inline.
+            for stmt in &body.statements {
+                if let Statement::FunctionDeclaration(inner_fn) = stmt {
+                    let Some(fn_id) = &inner_fn.id else { continue };
+                    let fn_name = fn_id.name.to_string();
+                    let inner_params: Vec<&oxc_ast::ast::FormalParameter<'_>> =
+                        inner_fn.params.items.iter().collect();
+                    let inner_body = inner_fn.body.as_deref();
+                    let inner_rest = inner_fn.params.rest.as_ref()
+                        .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument {
+                            Some(id.name.as_str())
+                        } else { None });
+                    let saved_async = self.is_async;
+                    self.is_async = inner_fn.r#async;
+                    let (fn_val, nb) = self.lower_arrow_like(
+                        &inner_params,
+                        inner_rest,
+                        inner_body,
+                        None,
+                        current_block,
+                        &region,
+                        &mut scope,
+                    )?;
+                    self.is_async = saved_async;
+                    current_block = nb;
+
+                    // Fix up self-reference: if fn_name appears in its own free vars (recursion),
+                    // the env slot was set to undefined. Patch it with the actual closure value.
+                    {
+                        use crate::lowering::expressions::collect_free_vars_stmts;
+                        let mut inner_outer_keys: std::collections::HashSet<String> =
+                            scope.keys().cloned().collect();
+                        let mut inner_param_set: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        for p in &inner_fn.params.items {
+                            if let BindingPattern::BindingIdentifier(id) = &p.pattern {
+                                inner_param_set.insert(id.name.to_string());
+                            }
+                        }
+                        inner_outer_keys.insert(fn_name.clone());
+                        let mut inner_free_vars: Vec<String> = Vec::new();
+                        if let Some(inner_body_ref) = inner_fn.body.as_deref() {
+                            collect_free_vars_stmts(
+                                &inner_body_ref.statements,
+                                &inner_param_set,
+                                &inner_outer_keys,
+                                &mut inner_free_vars,
+                            );
+                            let mut seen = std::collections::HashSet::new();
+                            inner_free_vars.retain(|v| seen.insert(v.clone()));
+                        }
+                        if let Some(self_idx) = inner_free_vars.iter().position(|v| v == &fn_name) {
+                            let env_arr = current_block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_closure_get_env"),
+                                &[fn_val], &[i64_type], self.loc,
+                            )).result(0)?.into();
+                            let self_idx_val = current_block.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(i32_type, self_idx as i64).into(),
+                                self.loc,
+                            )).result(0)?.into();
+                            current_block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                                &[env_arr, self_idx_val, fn_val], &[], self.loc,
+                            ));
+                            current_block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[env_arr], &[], self.loc,
+                            ));
+                        }
+                    }
+
+                    scope.insert(fn_name, fn_val);
+                } else {
+                    let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
+                    current_block = next;
+                    if let Some(v) = val { result_value = v; }
+                }
             }
         }
-        self.is_async = false;
-        self.fn_return_type = i32_type;
-
         // ARC: release scope variables before final return.
         for (_, v) in &scope {
             let v_i64 = self.ensure_i64(*v, current_block)?;
@@ -1144,6 +1259,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         } else {
             self.terminate_with_return(current_block, result_value)?;
         }
+
+        self.is_async = false;
+        self.fn_return_type = i32_type;
 
         let op = func::func(
             self.ctx,

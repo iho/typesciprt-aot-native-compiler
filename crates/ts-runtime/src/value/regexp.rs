@@ -1,0 +1,159 @@
+//! TsRegExp: heap-allocated regular expressions.
+
+use super::{TsVal, TsRegExp, NULL, FALSE, TRUE, heap_tag};
+use super::uri::{str_val_to_rust, rust_str_to_val};
+use super::array::{ts_arr_new, ts_arr_set};
+use super::string_val::ts_str_replace;
+
+use regex::Regex;
+
+pub unsafe extern "C" fn ts_regexp_destructor(ptr: *mut u8) {
+    std::ptr::drop_in_place(ptr as *mut TsRegExp);
+}
+
+/// Convert JS regex flags to Rust regex crate flags prefix.
+fn js_flags_to_regex_prefix(source: &str, flags: &str) -> String {
+    let mut prefix = String::new();
+    if flags.contains('i') { prefix.push_str("(?i)"); }
+    if flags.contains('s') { prefix.push_str("(?s)"); }
+    if flags.contains('m') { prefix.push_str("(?m)"); }
+    // Convert JS regex syntax → Rust regex syntax (best-effort)
+    format!("{}{}", prefix, source)
+}
+
+/// Create a new RegExp from source (C string) and flags (C string).
+#[no_mangle]
+pub unsafe extern "C" fn ts_regexp_new(source_ptr: *const i8, flags_ptr: *const i8) -> TsVal {
+    let source = std::ffi::CStr::from_ptr(source_ptr).to_string_lossy().into_owned();
+    let flags = if flags_ptr.is_null() { String::new() }
+                else { std::ffi::CStr::from_ptr(flags_ptr).to_string_lossy().into_owned() };
+    let size = std::mem::size_of::<TsRegExp>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 6) as *mut TsRegExp;
+    if ptr.is_null() { return super::UNDEFINED; }
+    std::ptr::write(ptr, TsRegExp { source, flags });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// Create a RegExp from a TsString source and optional TsString flags.
+#[no_mangle]
+pub unsafe extern "C" fn ts_regexp_from_val(source_val: TsVal, flags_val: TsVal) -> TsVal {
+    use super::TsString;
+    let source = if source_val.is_ptr() && heap_tag(source_val) == 2 {
+        let ts_str = &*(source_val.as_ptr() as *const TsString);
+        ts_str.inner.clone()
+    } else {
+        return super::UNDEFINED;
+    };
+    let flags = if flags_val.is_ptr() && heap_tag(flags_val) == 2 {
+        let ts_str = &*(flags_val.as_ptr() as *const TsString);
+        ts_str.inner.clone()
+    } else {
+        String::new()
+    };
+    let size = std::mem::size_of::<TsRegExp>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 6) as *mut TsRegExp;
+    if ptr.is_null() { return super::UNDEFINED; }
+    std::ptr::write(ptr, TsRegExp { source, flags });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// re.test(str) → boolean TsVal
+#[no_mangle]
+pub unsafe extern "C" fn ts_regexp_test(re_val: TsVal, str_val: TsVal) -> TsVal {
+    if !re_val.is_ptr() || heap_tag(re_val) != 6 { return FALSE; }
+    let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
+    let s = if let Some(s) = str_val_to_rust(str_val) { s } else { return FALSE; };
+    let pattern = js_flags_to_regex_prefix(&re_obj.source, &re_obj.flags);
+    match Regex::new(&pattern) {
+        Ok(re) => if re.is_match(&s) { TRUE } else { FALSE },
+        Err(_) => FALSE,
+    }
+}
+
+/// re.exec(str) → TsArray of matches or null
+#[no_mangle]
+pub unsafe extern "C" fn ts_regexp_exec(re_val: TsVal, str_val: TsVal) -> TsVal {
+    if !re_val.is_ptr() || heap_tag(re_val) != 6 { return NULL; }
+    let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
+    let s = if let Some(s) = str_val_to_rust(str_val) { s } else { return NULL; };
+    let pattern = js_flags_to_regex_prefix(&re_obj.source, &re_obj.flags);
+    match Regex::new(&pattern) {
+        Ok(re) => {
+            match re.captures(&s) {
+                Some(caps) => {
+                    let n = caps.len() as i32;
+                    let arr = ts_arr_new(n);
+                    for i in 0..n as usize {
+                        let val = if let Some(m) = caps.get(i) {
+                            rust_str_to_val(m.as_str().to_string())
+                        } else { NULL };
+                        ts_arr_set(arr, i as i32, val);
+                    }
+                    arr
+                }
+                None => NULL,
+            }
+        }
+        Err(_) => NULL,
+    }
+}
+
+/// str.match(re) → TsArray or null (non-global: same as exec; global: all matches)
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_match(str_val: TsVal, re_val: TsVal) -> TsVal {
+    if !re_val.is_ptr() || heap_tag(re_val) != 6 { return NULL; }
+    let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
+    let s = if let Some(s) = str_val_to_rust(str_val) { s } else { return NULL; };
+    let pattern = js_flags_to_regex_prefix(&re_obj.source, &re_obj.flags);
+    match Regex::new(&pattern) {
+        Ok(re) => {
+            if re_obj.flags.contains('g') {
+                // Global: return all full matches as array
+                let matches: Vec<&str> = re.find_iter(&s).map(|m| m.as_str()).collect();
+                let n = matches.len() as i32;
+                let arr = ts_arr_new(n);
+                for (i, m) in matches.iter().enumerate() {
+                    let val = rust_str_to_val(m.to_string());
+                    ts_arr_set(arr, i as i32, val);
+                }
+                arr
+            } else {
+                ts_regexp_exec(re_val, str_val)
+            }
+        }
+        Err(_) => NULL,
+    }
+}
+
+/// str.replace(re_or_str, replacement_str) — already handles string→string;
+/// this handles regex → string replacement.
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_replace_regex(str_val: TsVal, re_val: TsVal, rep_val: TsVal) -> TsVal {
+    if !re_val.is_ptr() || heap_tag(re_val) != 6 {
+        // Fall back to string replace
+        return ts_str_replace(str_val, re_val, rep_val);
+    }
+    let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
+    let s = if let Some(s) = str_val_to_rust(str_val) { s } else { return str_val; };
+    let rep = if let Some(r) = str_val_to_rust(rep_val) { r } else { String::new() };
+    let pattern = js_flags_to_regex_prefix(&re_obj.source, &re_obj.flags);
+    match Regex::new(&pattern) {
+        Ok(re) => {
+            let result = if re_obj.flags.contains('g') {
+                re.replace_all(&s, rep.as_str()).into_owned()
+            } else {
+                re.replace(&s, rep.as_str()).into_owned()
+            };
+            rust_str_to_val(result)
+        }
+        Err(_) => str_val,
+    }
+}
+
+/// Get .source property of RegExp.
+#[no_mangle]
+pub unsafe extern "C" fn ts_regexp_source(re_val: TsVal) -> TsVal {
+    if !re_val.is_ptr() || heap_tag(re_val) != 6 { return super::UNDEFINED; }
+    let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
+    rust_str_to_val(re_obj.source.clone())
+}

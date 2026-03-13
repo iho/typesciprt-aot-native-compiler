@@ -871,9 +871,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     ));
                 }
                 
-                scope.insert(name, new_val);
-                
-                // ARC: Return an OWNED reference. 
+                scope.insert(name.clone(), new_val);
+
+                // If this variable is a captured env var, write the mutation back to the env array.
+                if let Some(&env_idx) = self.closure_env_indices.get(&name) {
+                    if let Some(&env_arr) = scope.get("__env") {
+                        let new_i64_wb = self.ensure_i64(new_val, block)?;
+                        let env_i64 = self.ensure_i64(env_arr, block)?;
+                        let idx_val = block.append_operation(arith::constant(
+                            self.ctx,
+                            IntegerAttribute::new(self.i32_type(), env_idx as i64).into(),
+                            self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                            &[env_i64, idx_val, new_i64_wb], &[], self.loc,
+                        ));
+                    }
+                }
+
+                // ARC: Return an OWNED reference.
                 let new_i64 = self.ensure_i64(new_val, block)?;
                 block.append_operation(func::call(
                     self.ctx,

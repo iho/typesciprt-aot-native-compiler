@@ -1,0 +1,3 @@
+[submodule "hono"]
+	path = hono
+	url = git@github.com:honojs/hono.git

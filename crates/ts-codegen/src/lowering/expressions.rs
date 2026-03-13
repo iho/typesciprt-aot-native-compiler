@@ -274,6 +274,42 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             )).result(0)?.into();
                             return Ok((Some(fn_val), block));
                         }
+                        // Check if this is a top-level function referenced as a first-class value.
+                        if self.funcs.contains_key(&name) {
+                            let i64t = self.i64_type();
+                            let i32t = self.i32_type();
+                            let sig = self.funcs[&name].clone();
+                            let arity = sig.param_types.len() as i64;
+                            let ptr_type = melior::dialect::llvm::r#type::pointer(self.ctx, 0);
+                            let func_type_val = melior::ir::r#type::FunctionType::new(
+                                self.ctx,
+                                &sig.param_types,
+                                &[i64t],
+                            ).into();
+                            let fn_ref: Value<'c, 'b> = block.append_operation(
+                                melior::ir::operation::OperationBuilder::new("func.constant", self.loc)
+                                    .add_attributes(&[(
+                                        melior::ir::Identifier::new(self.ctx, "value"),
+                                        FlatSymbolRefAttribute::new(self.ctx, &name).into(),
+                                    )])
+                                    .add_results(&[func_type_val])
+                                    .build()?,
+                            ).result(0)?.into();
+                            let fn_ptr: Value<'c, 'b> = block.append_operation(
+                                melior::ir::operation::OperationBuilder::new("builtin.unrealized_conversion_cast", self.loc)
+                                    .add_operands(&[fn_ref])
+                                    .add_results(&[ptr_type])
+                                    .build()?,
+                            ).result(0)?.into();
+                            let arity_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx, IntegerAttribute::new(i32t, arity).into(), self.loc,
+                            )).result(0)?.into();
+                            let fn_val: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_new"),
+                                &[fn_ptr, arity_val], &[i64t], self.loc,
+                            )).result(0)?.into();
+                            return Ok((Some(fn_val), block));
+                        }
                         eprintln!("[debug] undefined var '{}', scope keys: {:?}", name, scope.keys().collect::<Vec<_>>());
                         bail!("undefined variable: {}", name)
                     }
@@ -530,6 +566,110 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         &[], &[], self.loc,
                     ));
                 }
+                return Ok((None, block));
+            }
+        }
+
+        // Built-in: addEventListener(event, handler) — registers a global fetch handler
+        if let Expression::Identifier(callee_id) = &call.callee {
+            if callee_id.name == "addEventListener" {
+                let i64t = self.i64_type();
+                let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                let event = if let Some(arg) = call.arguments.first() {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                let handler = if let Some(arg) = call.arguments.get(1) {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_add_event_listener"),
+                    &[event, handler], &[i64t], self.loc,
+                ));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[event], &[], self.loc));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[handler], &[], self.loc));
+                return Ok((None, block));
+            }
+            if callee_id.name == "removeEventListener" {
+                let i64t = self.i64_type();
+                let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                let event = if let Some(arg) = call.arguments.first() {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                let handler = if let Some(arg) = call.arguments.get(1) {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_remove_event_listener"),
+                    &[event, handler], &[i64t], self.loc,
+                ));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[event], &[], self.loc));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[handler], &[], self.loc));
+                return Ok((None, block));
+            }
+        }
+
+        // Built-in: serve(port) with registered listener → ts_serve_worker(port: i32)
+        if let Expression::Identifier(callee_id) = &call.callee {
+            if callee_id.name == "serve" && call.arguments.len() == 1 {
+                let port_expr = call.arguments[0].as_expression()
+                    .ok_or_else(|| anyhow::anyhow!("serve: spread not supported"))?;
+                let (port_opt, nb) = self.lower_expression(port_expr, block, region, scope)?;
+                block = nb;
+                let port_val = port_opt.ok_or_else(|| anyhow::anyhow!("serve: port produced no value"))?;
+                let port_i32 = self.ensure_i32(port_val, block)?;
+                block.append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_serve_worker"),
+                    &[port_i32],
+                    &[self.i64_type()],
+                    self.loc,
+                ));
+                return Ok((None, block));
+            }
+        }
+
+        // Built-in: serve(port, fetchFn) → ts_serve(port: i32, fetch_fn: i64) — blocks forever
+        if let Expression::Identifier(callee_id) = &call.callee {
+            if callee_id.name == "serve" && call.arguments.len() == 2 {
+                let port_expr = call.arguments[0].as_expression()
+                    .ok_or_else(|| anyhow::anyhow!("serve: spread not supported"))?;
+                let fn_expr = call.arguments[1].as_expression()
+                    .ok_or_else(|| anyhow::anyhow!("serve: spread not supported"))?;
+                let (port_opt, nb) = self.lower_expression(port_expr, block, region, scope)?;
+                block = nb;
+                let port_val = port_opt.ok_or_else(|| anyhow::anyhow!("serve: port produced no value"))?;
+                let port_i32 = self.ensure_i32(port_val, block)?;
+                let (fn_opt, nb) = self.lower_expression(fn_expr, block, region, scope)?;
+                block = nb;
+                let fetch_fn = fn_opt.ok_or_else(|| anyhow::anyhow!("serve: handler produced no value"))?;
+                let fetch_i64 = self.ensure_i64(fetch_fn, block)?;
+                block.append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_serve"),
+                    &[port_i32, fetch_i64],
+                    &[self.i64_type()],
+                    self.loc,
+                ));
                 return Ok((None, block));
             }
         }
@@ -1132,7 +1272,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // RegExp methods
                 "test" | "exec" |
                 // String match/replace with RegExp
-                "match"
+                "match" |
+                // Request/Response body
+                "text" | "json" |
+                // URLSearchParams
+                "toString" | "getAll"
             );
             if is_builtin {
                 // Evaluate receiver
@@ -1495,6 +1639,33 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_response_clone"),
                             &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    // ── Request/Response body methods ─────────────────────────
+                    "text" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_text"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "json" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_json"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    // ── URLSearchParams methods ───────────────────────────────
+                    "toString" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_urlsearchparams_to_string"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "getAll" => {
+                        let name = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_urlsearchparams_get_all"),
+                            &[obj_i64, name], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     _ => None,
@@ -2104,6 +2275,56 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             return Ok((Some(map_val), block));
         }
 
+        // Built-in URL constructor: new URL(href, base?) → TsObject with url properties
+        if class_name == "URL" {
+            let i64t = self.i64_type();
+            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            let href = if let Some(arg) = new_expr.arguments.first() {
+                if let Some(expr) = arg.as_expression() {
+                    let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                } else { undef_i64 }
+            } else { undef_i64 };
+            let base = if let Some(arg) = new_expr.arguments.get(1) {
+                if let Some(expr) = arg.as_expression() {
+                    let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                } else { undef_i64 }
+            } else { undef_i64 };
+            let url_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_url_new"),
+                &[href, base], &[i64t], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[href], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[base], &[], self.loc));
+            return Ok((Some(url_val), block));
+        }
+
+        // Built-in URLSearchParams constructor: new URLSearchParams(init?) → tag=9
+        if class_name == "URLSearchParams" {
+            let i64t = self.i64_type();
+            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            let init = if let Some(arg) = new_expr.arguments.first() {
+                if let Some(expr) = arg.as_expression() {
+                    let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                } else { undef_i64 }
+            } else { undef_i64 };
+            let sp_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_urlsearchparams_new"),
+                &[init], &[i64t], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[init], &[], self.loc));
+            return Ok((Some(sp_val), block));
+        }
+
         let ctor_name = format!("__class_{}_constructor", class_name);
         let Some(sig) = self.funcs.get(&ctor_name).cloned() else {
             bail!("new {}: unknown class (constructor not found)", class_name);
@@ -2234,7 +2455,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok((Some(fn_val), nb))
     }
 
-    fn lower_arrow_like<'b>(
+    pub fn lower_arrow_like<'b>(
         &mut self,
         params: &[&oxc_ast::ast::FormalParameter<'_>],
         rest_param_name: Option<&str>,
@@ -2278,6 +2499,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             "console", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
             "fetch", "URL", "URLSearchParams", "Headers", "Request", "Response",
             "Symbol", "Map", "Set", "WeakMap", "WeakRef", "Reflect", "Proxy",
+            "serve", "sleep", "select", "addEventListener", "removeEventListener",
+            "queueMicrotask", "structuredClone", "crypto", "performance",
         ] {
             outer_keys.insert(builtin.to_string());
         }
@@ -2312,6 +2535,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // If closure, bind captured variables by extracting from env array (arg 0).
         if has_captures {
             let env_arg: Value<'_, '_> = arrow_entry.argument(0)?.into();
+            // Store env under a reserved key so assignments can write back mutations.
+            arrow_scope.insert("__env".to_string(), env_arg);
             for (idx, var_name) in free_vars.iter().enumerate() {
                 let idx_val: Value<'_, '_> = arrow_entry.append_operation(arith::constant(
                     self.ctx,
@@ -2371,6 +2596,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let saved_return_type = self.fn_return_type;
         let saved_is_async = self.is_async;
+        let saved_env_indices = std::mem::replace(
+            &mut self.closure_env_indices,
+            if has_captures {
+                free_vars.iter().cloned().enumerate().map(|(i, v)| (v, i)).collect()
+            } else {
+                HashMap::new()
+            },
+        );
         self.fn_return_type = i64_type;
         self.is_async = false;
 
@@ -2421,9 +2654,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let body_opt = block_body.or(expr_body);
         if let Some(body) = body_opt {
-            // Pre-declare body locals as `undefined` in arrow_scope so that inner hoisted
-            // functions can capture them (JS hoisting: function decls are hoisted before
-            // `let` bindings execute, but closures need to see all lexical vars).
+            // Pre-seed ALL local bindings (vars + inner function names) as `undefined` so
+            // they appear in scope for phi-node tracking and free-var analysis.
             let undef_placeholder: Value<'_, '_> = current_block.append_operation(arith::constant(
                 self.ctx,
                 IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
@@ -2434,11 +2666,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     for decl in &vd.declarations {
                         predeclare_binding(&decl.id, undef_placeholder, &mut arrow_scope);
                     }
+                } else if let oxc_ast::ast::Statement::FunctionDeclaration(inner_fn) = stmt {
+                    if let Some(fn_id) = &inner_fn.id {
+                        let fn_name = fn_id.name.to_string();
+                        if !arrow_scope.contains_key(&fn_name) {
+                            arrow_scope.insert(fn_name, undef_placeholder);
+                        }
+                    }
                 }
             }
 
-            // Hoist inner FunctionDeclarations (JS hoisting semantics): lower them as closures
-            // using the current arrow_scope, then bind them in scope before running other stmts.
+            // Process all statements in source order. FunctionDeclarations are handled inline
+            // (closure created at their declaration position, not truly hoisted), which is
+            // correct for the common case where inner functions are declared before they're called.
             for stmt in &body.statements {
                 if let oxc_ast::ast::Statement::FunctionDeclaration(inner_fn) = stmt {
                     let Some(fn_id) = &inner_fn.id else { continue };
@@ -2461,21 +2701,64 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     )?;
                     self.is_async = saved_async;
                     current_block = nb;
-                    arrow_scope.insert(fn_name, fn_val);
-                }
-            }
 
-            for stmt in &body.statements {
-                // FunctionDeclarations already hoisted above.
-                if matches!(stmt, oxc_ast::ast::Statement::FunctionDeclaration(_)) { continue; }
-                let (v, nb) = self.lower_statement(stmt, current_block, &arrow_region, &mut arrow_scope, &[])?;
-                current_block = nb;
-                if let Some(val) = v { result_val = Some(val); }
+                    // Fix up self-reference: if fn_name is captured by the closure (recursive),
+                    // the env slot was set to undefined (pre-seed). Patch it with the actual closure.
+                    {
+                        let mut inner_outer_keys: NameSet = arrow_scope.keys().cloned().collect();
+                        let mut inner_param_set: NameSet = NameSet::new();
+                        for p in &inner_fn.params.items {
+                            if let BindingPattern::BindingIdentifier(id) = &p.pattern {
+                                inner_param_set.insert(id.name.to_string());
+                            }
+                        }
+                        inner_outer_keys.insert(fn_name.clone());
+                        let mut inner_free_vars: Vec<String> = Vec::new();
+                        if let Some(inner_body_ref) = inner_fn.body.as_deref() {
+                            collect_free_vars_stmts(
+                                &inner_body_ref.statements,
+                                &inner_param_set,
+                                &inner_outer_keys,
+                                &mut inner_free_vars,
+                            );
+                            let mut seen = std::collections::HashSet::new();
+                            inner_free_vars.retain(|v| seen.insert(v.clone()));
+                        }
+                        if let Some(self_idx) = inner_free_vars.iter().position(|v| v == &fn_name) {
+                            let env_arr = current_block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_closure_get_env"),
+                                &[fn_val], &[i64_type], self.loc,
+                            )).result(0)?.into();
+                            let self_idx_val = current_block.append_operation(
+                                arith::constant(self.ctx,
+                                    IntegerAttribute::new(self.i32_type(), self_idx as i64).into(),
+                                    self.loc,
+                                )
+                            ).result(0)?.into();
+                            current_block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                                &[env_arr, self_idx_val, fn_val], &[], self.loc,
+                            ));
+                            current_block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[env_arr], &[], self.loc,
+                            ));
+                        }
+                    }
+
+                    arrow_scope.insert(fn_name, fn_val);
+                } else {
+                    let (v, nb) = self.lower_statement(stmt, current_block, &arrow_region, &mut arrow_scope, &[])?;
+                    current_block = nb;
+                    if let Some(val) = v { result_val = Some(val); }
+                }
             }
         }
 
         self.fn_return_type = saved_return_type;
         self.is_async = saved_is_async;
+        self.closure_env_indices = saved_env_indices;
 
         // Default return: UNDEFINED
         let default_undef: Value<'_, '_> = current_block.append_operation(arith::constant(
@@ -2732,7 +3015,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
 type NameSet = std::collections::HashSet<String>;
 
-fn collect_free_vars_stmts(
+pub(super) fn collect_free_vars_stmts(
     stmts: &[oxc_ast::ast::Statement<'_>],
     params: &NameSet,
     outer_keys: &NameSet,

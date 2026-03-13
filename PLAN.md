@@ -1,419 +1,196 @@
 # Development Plan & Roadmap
 
+**Last Updated**: 2026-03-13
+
+---
+
 ## Vision
-Create a practical TypeScript AOT compiler that generates fast, native binaries. Start with core language features (arithmetic, variables, control flow) and expand to support larger programs.
 
-## Architecture Decisions
-
-### Why MLIR?
-- **Abstraction levels**: Allows high-level source optimization before lowering
-- **Extensibility**: Easy to add new dialects for future features
-- **Maturity**: Battle-tested by LLVM ecosystem
-- **Performance**: Multi-level optimization passes
-- **Future-proof**: Active LLVM development ensures long-term support
-
-### Why OXC Parser?
-- **Speed**: Fastest Rust TypeScript parser (3x faster than alternatives)
-- **Compliance**: Nearly complete ECMAScript specification support
-- **Ecosystem**: Production-grade (used by web-infra)
-- **Accuracy**: Better error recovery than swc
-
-### Type Strategy
-**Phase 1** (current): Single type (i32)
-**Phase 2**: Add boolean, expand to f64
-**Phase 3**: Discriminated unions for polymorphism
-**Phase 4**: Generics and type parameters
-
-## Release Plan
-
-### Alpha v0.1 ✅ COMPLETED
-**Status**: Shipped (basic arithmetic, variables, expressions)
-
-**Features**:
-- ✅ Numeric literals (i32)
-- ✅ Arithmetic operators (+, -, *, /)
-- ✅ Variable declarations (let, const, var)
-- ✅ Binary expressions with proper precedence
-- ✅ Scope management and undefined variable detection
-
-**Testing**: 7 example programs with verified output
-**Metrics**: ~270 lines of core lowering code
-
-**Known Issues**:
-- Only i32 supported (expanded to TsVal for heap objects)
-- Control flow implemented (if/else, while, for)
-- console.log implemented for all TsVal types via C interop
+Compile TypeScript to native binaries with zero VM, zero JIT, and zero Node.js dependency. The primary target is running Hono web framework as a native HTTP server backed by Rust's hyper and tokio.
 
 ---
 
-### Alpha v0.2 ✅ COMPLETED
-**Target**: Add comparison operators and conditional logic
+## Architecture
 
-**Features to add**:
-1. **Comparison Operators** (Phase 2a: Weeks 1-2)
-   - Operators: `<`, `>`, `<=`, `>=`, `==`, `!=`
-   - Return i32 (0 = false, 1 = true)
-   - MLIR: Use arith.cmpi operation
-
-2. **Boolean Type** (Phase 2b: Weeks 2-3)
-   - Internal: Still i32 (0 = false, non-zero = true)
-   - Add parsing for true/false literals
-   - Type checking: comparisons → boolean
-
-3. **If/Else Statements** (Phase 2c: Weeks 3-4)
-   - AST: Statement::IfStatement
-   - MLIR: cf.cond_br (conditional branch)
-   - Control flow graph management
-   - Block creation for branches
-
-**Implementation order**:
-```typescript
-// Week 1: Comparison operators
-let x = 5;
-x < 10;  // → 1 (true)
-
-// Week 2: Boolean operations
-5 > 3 && 2 < 4;  // && operator
-
-// Week 3-4: If/else
-if (x > 0) {
-  10;
-} else {
-  20;
-}
+```
+TypeScript Source
+       ↓  OXC parser
+    OXC AST
+       ↓  ts-codegen (lowering/)
+  MLIR (func/arith/cf/llvm dialects)
+       ↓  mlir-opt + mlir-translate
+    LLVM IR
+       ↓  clang (links ts-runtime)
+  Native Binary
 ```
 
-**Testing Strategy**:
-- Unit tests for comparison operators
-- CFG correctness tests for branches
-- Integration tests: complex conditions
-
-**Effort Estimate**: 4 weeks
-**Risk**: MLIR block management complexity
-
----
-
-### Alpha v0.3 ✅ COMPLETED
-**Target**: Functions and loops
-
-**Features to add**:
-1. **Function Declarations** (Phase 3a: Weeks 1-3)
-   - AST: Statement::FunctionDeclaration
-   - Signature parsing (parameters, return type)
-   - MLIR: func.func operation
-   - Symbol table for function references
-
-2. **Function Calls** (Phase 3b: Weeks 2-4)
-   - AST: Expression::CallExpression → FunctionCall
-   - Parameter passing and return values
-   - Call stack management in MLIR
-   - Type matching for arguments
-
-3. **Loops** (Phase 3c: Weeks 4-6)
-   - For loops: `for (let i = 0; i < 10; i++)`
-   - While loops: `while (condition) { ... }`
-   - MLIR: cf.br (unconditional branch)
-   - Loop variable management
-
-**Implementation order**:
-```typescript
-// Week 1-3: Functions (declaration + basics)
-function add(x: number, y: number): number {
-  x + y;
-}
-add(5, 3);  // → 8
-
-// Week 4-6: Loops
-let sum = 0;
-for (let i = 0; i < 10; i = i + 1) {
-  sum = sum + i;
-}
-sum;  // → 45
-```
-
-**Testing Strategy**:
-- Function with multiple parameters
-- Recursive function calls
-- Nested loops
-- Loop variable shadowing
-
-**Effort Estimate**: 6 weeks
-**Risk**: MLIR scope/block management with multiple functions
+**Key design decisions:**
+- **NaN-boxing**: All TS values are `TsVal = i64`. Heap objects tagged by pointer. No separate type tags needed for function calls.
+- **ARC**: Every identifier read produces an owned reference via `ts_retain_val`; temporaries released via `ts_release_val`.
+- **Tokio runtime**: Async functions return a `TsPromise` (heap tag 3). The tokio rt-multi-thread executor backs all async I/O.
+- **hyper 1.x**: HTTP server via `ts_serve(port, fetchFn)` — blocks in the tokio event loop.
+- **MLIR phi nodes**: All scope variables normalized to `i64` before merge blocks (if/while/for/try/logical ops).
 
 ---
 
-### Beta v0.1 ✅ COMPLETED
-**Target**: Standard library and improved I/O
+## Completed Milestones
 
-**Features to add**:
-1. **Alternative console.log** (Phase 4a: Weeks 1-2)
-   - Approach 1: Write integer to stdout via syscall
-   - Approach 2: Link against C standard library
-   - Approach 3: Use llvm.call to C functions
+### ✅ Milestone 1 — Core Language (Shipped)
+Arithmetic, variables, control flow, functions, strings, arrays, objects, closures.
 
-2. **String Type** (Phase 4b: Weeks 2-4)
-   - String literals: `"hello world"`
-   - String concatenation: `"hello" + "world"`
-   - MLIR: llvm.mlir.global for static strings
+### ✅ Milestone 2 — Advanced Language (Shipped)
+Rest params, destructuring, spread, optional chaining, nullish coalescing, logical assignment, for-of, for-in, template literals, typeof, instanceof, in, delete.
 
-3. **Array Type** (Phase 4c: Weeks 4-6)
-   - Array literals: `[1, 2, 3]`
-   - Array indexing: `arr[0]`
-   - Array length: `arr.length`
-   - MLIR: llvm.alloca for heap arrays
+### ✅ Milestone 3 — Classes & Error Handling (Shipped)
+Classes with inheritance, private fields/methods, super calls, static methods, try/catch/finally/throw, classes extending Error types, TypeScript overload signatures.
 
-**Testing Strategy**:
-- output.ts with various data types
-- Array bounds checking
-- String memory safety
+### ✅ Milestone 4 — Built-in APIs (Shipped)
+Array/String/Object/Math/Map full method support, RegExp, JSON.stringify/parse, encodeURI/decodeURI, Number/String/Boolean coercion, Promise.resolve/reject/all.
 
-**Effort Estimate**: 6 weeks
-**Risk**: Memory layout and allocation
+### ✅ Milestone 5 — Async HTTP Server (Shipped)
+async/await with tokio, HTTP server via hyper (`serve(port, fn)`), Request/Response/Headers construction, module-level globals.
 
----
+### ✅ Milestone 6 — Hono context.ts (Shipped)
+All features needed to compile `hono/src/context.ts`:
+- Private class fields and methods
+- Logical assignment to member targets (`this.x ??= val`)
+- TypeScript method overloads (bodyless signatures skipped)
+- Classes extending Error (`HTTPException extends Error`)
+- Promise namespace calls (`Promise.resolve`, `Promise.reject`, `Promise.all`)
+- Boolean/Error/Number/String coercions
+- All built-in methods from Array/String/Map/Object/Math
 
-### Beta v1.0 (In Planning)
-**Target**: Production features and optimization
+### ✅ Milestone 7 — Nested Functions & Mutable Capture (Current)
+Inner function declarations within function bodies:
+- Closures created at declaration position (sequential order preserves variable initialization)
+- Self-referential recursive inner functions via `ts_closure_get_env` + `ts_arr_set` env patching
+- Mutable captured variables: assignments inside closures write back to shared env array via `ts_arr_set`
+- `__env` stored in scope but excluded from ARC release (env is caller-owned, not closure-owned)
+- `hono/src/compose.ts` compiles successfully (async dispatch with recursion)
 
-**Features to add**:
-1. **Objects & Properties**
-   - Object literals: `{ x: 1, y: 2 }`
-   - Property access: `obj.x`
-   - Type annotations for object shapes
-
-2. **Classes** (Subset)
-   - Class declarations
-   - Constructor methods
-   - Instance properties and methods
-   - Inheritance (single)
-
-3. **Advanced Control Flow**
-   - Switch statements
-   - Try/catch error handling
-   - Break/continue in nested loops
-
-4. **Optimization Passes**
-   - Dead code elimination
-   - Constant folding
-   - Inlining small functions
-   - Loop unrolling
+**Test suite**: 49 tests, all pass.
 
 ---
 
-## Technical Roadmap by Component
+## Current Status
 
-### ts-frontend (Parser)
-**Current**: OXC parser wrapper
-**Next**: Type annotation expansion
-**Future**: Semantic analysis phase
+### Compiles
+- `hono/src/context.ts` ✅
+- `hono/src/compose.ts` ✅
+- `hono/src/http-exception.ts` ✅
 
-**Planned changes**:
-- Expand supported syntax (currently skips many constructs)
-- Error recovery improvements
-- Position tracking for diagnostics
+### Blocked on `new URL(...)`
+- `hono/src/hono-base.ts` — line 366: `const url = new URL(request.url)`
+- `hono/src/hono.ts` — transitively imports hono-base.ts
 
-### ts-codegen (Code Generation)
-**Current**: Arithmetic + variables
-**Next**: Control flow + functions
-**Future**: Optimization passes
+---
 
-**Architecture**:
+## Next Milestone: Full Hono HTTP Server
+
+### Phase A — URL / URLSearchParams (Unblocks hono-base.ts)
+
+**Priority 1: `new URL(href)` constructor**
+
+Add `url = "2"` to `ts-runtime/Cargo.toml`. Implement `ts_url_new(href: TsVal) -> TsVal` which:
+- Parses the URL with Rust's `url::Url::parse()`
+- Creates a `TsObject` (tag 0) with string properties: `href`, `protocol`, `host`, `hostname`, `port`, `pathname`, `search`, `hash`, `origin`
+- Creates a URLSearchParams from the search string and stores as `searchParams` property
+- Declares the constructor in codegen `lower_new_expression` for class name `"URL"`
+
+**Priority 2: `new URLSearchParams(init?)` constructor**
+
+Implement as a new heap type (tag 9, same layout as TsMap). Extend `ts_map_*` guards to accept tag 9 so `get`, `set`, `has`, `delete`, `entries`, `keys`, `values`, `forEach` all work via existing codegen dispatch. Add `ts_urlsearchparams_new(init: TsVal)`, `ts_urlsearchparams_to_string`, `ts_urlsearchparams_append`, `ts_urlsearchparams_get_all`.
+
+### Phase B — Headers Full API
+
+`ts_map_get/set/has/delete/keys/values/entries/for_each` already accept tag 7 (Headers) at the Rust level. Wire codegen dispatch for method names `"get"`, `"set"`, `"has"`, `"delete"`, `"forEach"`, `"entries"`, `"keys"`, `"values"` on Headers objects. These route to the existing `ts_map_*` functions.
+
+### Phase C — Request/Response Body Methods
+
 ```rust
-// Current structure:
-lower_program()
-  └→ lower_main_function()
-     └→ lower_statement()        // Only ExpressionStatement, VariableDeclaration
-        └→ lower_expression()
-
-// Future structure:
-lower_program()
-  ├→ build_symbol_table()        // Function signatures
-  └→ lower_statement()
-     ├→ lower_if_statement()
-     ├→ lower_for_statement()
-     ├→ lower_function_decl()
-     ├→ lower_variable_declaration()
-     └→ lower_expression()
+// value.rs
+pub unsafe extern "C" fn ts_request_text(req: TsVal) -> TsVal   // -> Promise<string>
+pub unsafe extern "C" fn ts_request_json(req: TsVal) -> TsVal   // -> Promise<any>
+pub unsafe extern "C" fn ts_response_text(resp: TsVal) -> TsVal // -> Promise<string>
+pub unsafe extern "C" fn ts_response_json(resp: TsVal) -> TsVal // -> Promise<any>
 ```
 
-**Scope Management Evolution**:
-- Current: Single HashMap for main function scope
-- v0.2: Branch-aware scope for if/else
-- v0.3: Function-level scope table
-- v0.4: Closure support with captured variables
+Wire `"text"` and `"json"` method names in codegen `is_builtin` dispatch. Route by receiver heap tag (0 = Request, 8 = Response).
 
-### tscc (Compiler Driver)
-**Current**: Basic CLI
-**Next**: Error diagnostics
-**Future**: Incremental compilation
+### Phase D — addEventListener (Real Implementation)
 
-**Planned features**:
-- Source location tracking in errors
-- Pretty-printed error messages with source context
-- Build cache for faster recompilation
-- Parallel compilation of multiple files
+Replace the current no-op with a real global fetch handler registration:
+```rust
+static FETCH_LISTENER: AtomicU64 = AtomicU64::new(UNDEFINED_BITS);
 
-### ts-runtime (Runtime Library)
-**Current**: Empty (reserved)
-**v1.0**:
-- Standard library functions
-- Runtime type information
-- Exception handling
+pub unsafe extern "C" fn ts_add_event_listener(event: TsVal, handler: TsVal) -> TsVal
+pub unsafe extern "C" fn ts_serve_worker(port: i32) -> TsVal  // uses FETCH_LISTENER
+```
+
+Wire `addEventListener` and `serve(port)` (1-arg form) in codegen to call these.
+
+### Phase E — Async Class Methods
+
+In `lower_class_declaration`, when a method has `value.r#async == true`, emit it with async semantics (wrap return in `ts_promise_resolve`, handle `await` expressions). Currently the `is_async` flag is only set for top-level function declarations.
 
 ---
 
-## Blocked Work
+## Future Work (Post Hono)
 
-### console.log Implementation
-**Status**: Blocked on melior API limitations
-**Issue**: melior v0.26 doesn't expose LLVM global variables or address_of operations
+### Floating-Point Arithmetic
+Currently all arithmetic is i32 (truncated). NaN-boxing supports f64 (TAG_FLOAT), but the arithmetic lowering uses `arith.addi`, `arith.subi`, etc. Switching to `ts_add(a, b)` runtime dispatch (which uses f64) would fix all number operations.
 
-**Blocking factors**:
-- ODS bindings only expose public operations
-- Raw LLVM Operation API not accessible
-- Would require melior upgrade or custom bindings
+### Proper Mutable Shared Closures
+Multiple closures capturing the same variable should share a mutable cell. Currently each closure snapshots the value at creation time. Fix: allocate a `TsCell` (single-element TsArray) for each shared-mutable variable and pass the cell reference (not the value) to all closures that capture it.
 
-**Workarounds explored**:
-1. ✗ Use melior ODS (operations not exposed)
-2. ✗ Generate raw LLVM dialect (no way to create globals)
-3. Potential: Link against C's printf (requires calling convention setup)
-4. Potential: Syscall-based output (platform-specific)
+### True Hoisting for Forward-Referenced Inner Functions
+Currently inner `function` declarations are processed at their source position. To handle the pattern `return dispatch(0); function dispatch(i) {...}`, true hoisting would require processing function declarations before other statements — which requires mutable cells for variables captured by those functions.
 
-**Resolution plan**:
-- Monitor melior releases for improved LLVM operation coverage
-- Consider contributing to melior if needed
-- Implement phase 4a (Beta v0.1) using C interop
+### switch / case
+```typescript
+switch (expr) {
+  case 1: ...; break;
+  default: ...;
+}
+```
+
+### do...while
+```typescript
+do { ... } while (condition);
+```
+
+### WeakMap / WeakSet
+Used by some Hono middleware and many JS patterns.
+
+### Symbol.iterator / Custom Iterators
+Needed for for-of over user-defined iterables.
+
+### Full fetch() API
+Implement `fetch(url, options?)` using tokio + hyper client.
+
+### Tagged Template Literals
+`` html`<div>${content}</div>` ``
 
 ---
 
 ## Design Principles
 
-### 1. Correctness First
-- Type safety in codegen (Rust prevents many bugs)
-- Comprehensive error messages
-- Extensive testing before release
-
-### 2. Simple Before Complex
-- Start with single types (i32) before generalizing
-- Linear control flow before loops/recursion
-- Basic functions before closures
-
-### 3. Out of Scope / Future Considerations
-- **Garbage Collection (GC)**: Not required. Current implementation uses stack allocation (`llvm.alloca`). Future dynamic memory management for objects/arrays will likely rely on Automatic Reference Counting (ARC) or Arena Allocators rather than a heavy tracing GC.
-- **HTTP / Networking Libraries**: Out of scope for the native standard library. The focus is on implementing core language features (control flow, arrays, strings) rather than supporting web backends.
-
-### 3. Incremental Compilation
-- Each version adds self-contained features
-- Backward compatibility within major versions
-- Clear migration path for breaking changes
-
-### 4. Performance Awareness
-- MLIR optimizations at each level
-- Avoid unnecessary allocations in codegen
-- Profile before over-optimizing
+1. **Correctness over shortcuts** — Implement features correctly for long-term use, not as no-ops
+2. **Hono as the integration test** — Compiling a real production framework is the acceptance criterion
+3. **ARC discipline** — Every heap allocation follows retain/release; no GC
+4. **Sequential compilation** — No parallelism in the codegen pass; use `--test-threads=1`
+5. **MLIR phi correctness** — All scope variables normalized to `i64` before any merge block
 
 ---
 
-## Testing Strategy
+## Testing
 
-### Unit Tests
-- Individual lowering functions
-- Expression evaluation
-- Type checking (when added)
+```bash
+# Full test suite (49 tests)
+cargo test -p tscc -- --include-ignored --test-threads=1
 
-### Integration Tests
-- Complete programs with expected output
-- Error handling and diagnostics
-- Compilation time benchmarks
+# Compile a specific file
+cargo run -p tscc -- path/to/file.ts -o /tmp/out && /tmp/out
+```
 
-### Suites
-- **correctness_suite/**: Verified computation results
-- **error_suite/**: Expected compilation errors
-- **optimization_suite/**: Performance benchmarks
-
----
-
-## Known Risks
-
-### High Risk
-1. **MLIR Block/Region Management**
-   - Challenge: Complex lifetime and borrowing rules
-   - Mitigation: Start simple, incrementally add features
-   - Impact: Could block v0.3 (functions) release
-
-2. **Scope/Symbol Management**
-   - Challenge: Multiple nested scopes with MLIR values
-   - Mitigation: Use value-based approach (no variable addresses)
-   - Impact: Limits heap allocation features
-
-### Medium Risk
-1. **Melior API Stability**
-   - Challenge: Breaking changes in melior between versions
-   - Mitigation: Lock specific version, plan upgrades
-   - Impact: May require codegen rewrites
-
-2. **LLVM Version Compatibility**
-   - Challenge: Features may vary between LLVM versions
-   - Mitigation: Target LLVM 21+, document requirements
-   - Impact: Compiler only works on specific LLVM versions
-
-### Low Risk
-1. **Performance**: Can always optimize later
-2. **Memory efficiency**: Not critical for v0.x
-3. **Compatibility**: Single architecture target (ARM64 macOS)
-
----
-
-## Success Metrics (v1.0)
-
-✓ **Feature Completeness**
-- [x] Variables and functions (including recursive)
-- [x] Control flow (if/else, loops)
-- [ ] Basic data types (int, bool, string, array)
-- [ ] Object-oriented features (classes, methods)
-
-✓ **Code Quality**
-- [ ] 100% test coverage for core features
-- [ ] Zero unsafe Rust code
-- [ ] Comprehensive error messages
-- [ ] <10ms compilation for typical programs
-
-✓ **Performance**
-- [ ] Generated code matches hand-written C in speed
-- [ ] Compilation time <1 second for average programs
-- [ ] Binary size <1MB for typical programs
-
-✓ **Documentation**
-- [ ] Complete README with examples
-- [ ] Architecture documentation
-- [ ] Contributing guidelines
-- [ ] API documentation
-
----
-
-## Maintenance Guidelines
-
-### Code Review Checklist
-- [ ] All tests passing
-- [ ] No unsafe Rust
-- [ ] Error messages are clear
-- [ ] MLIR operations are correct
-- [ ] No performance regressions
-
-### Release Checklist
-- [ ] Update VERSION
-- [ ] Update STATUS.md and PLAN.md
-- [ ] Run full test suite
-- [ ] Benchmark compilation time
-- [ ] Build release binary successfully
-
-### Dependency Updates
-- Lock melior to known good version
-- Test LLVM version compatibility before updating
-- Update OXC monthly (or on demand for bug fixes)
-
----
-
-**Last Updated**: 2026-03-10
-**Next Review**: After v0.2 completion
-**Maintainer**: ihor
+All tests must pass before merging any change.
