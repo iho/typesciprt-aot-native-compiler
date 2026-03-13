@@ -78,24 +78,30 @@ pub unsafe extern "C" fn ts_promise_resolve(val: TsVal) -> TsVal {
     alloc_promise(TsPromise { resolved, notify })
 }
 
-/// Await a Promise, blocking until resolved. Non-Promise values pass through.
+/// Await a Promise, consuming the argument and returning an owned result.
+///
+/// - Non-Promise values: passed through as-is (ownership transferred).
+/// - Promise values: blocks until resolved, releases the Promise, returns the resolved value
+///   (caller receives ownership of the result).
+///
+/// Callers must NOT release `val` after this call — ownership is consumed.
 #[no_mangle]
 pub unsafe extern "C" fn ts_promise_await(val: TsVal) -> TsVal {
     if !val.is_ptr() {
-        ts_retain_val(val);
+        // Scalar (undefined/null/bool/i32/f64): no heap refcount — pass through.
         return val;
     }
     let ptr = val.as_ptr();
     let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
     let header = ptr.sub(header_size) as *const crate::alloc::ArcHeader;
     if (*header).tag != TAG_PROMISE_ALLOC {
-        ts_retain_val(val);
+        // Non-Promise heap object: pass ownership through without retain/release.
         return val;
     }
     let promise = &*(ptr as *const TsPromise);
     let result = block_until_resolved(promise.resolved.clone(), promise.notify.clone());
     ts_retain_val(result);
-    ts_release_val(val); // may run ts_promise_destructor
+    ts_release_val(val); // releases the Promise
     result
 }
 

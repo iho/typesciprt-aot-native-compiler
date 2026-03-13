@@ -82,8 +82,14 @@ pub fn build_runtime() -> Result<PathBuf> {
         .and_then(|p| p.parent())
         .context("cannot determine workspace root from executable path")?;
 
+    // Allow extra features (e.g. "dhat-heap") via TSCC_RUNTIME_FEATURES env var.
+    let mut args = vec!["build", "-p", "ts-runtime"];
+    let extra_features = std::env::var("TSCC_RUNTIME_FEATURES").unwrap_or_default();
+    if !extra_features.is_empty() {
+        args.extend(["--features", extra_features.as_str()]);
+    }
     let status = Command::new("cargo")
-        .args(["build", "-p", "ts-runtime"])
+        .args(&args)
         .current_dir(workspace_root)
         .status()
         .context("spawn `cargo build -p ts-runtime`")?;

@@ -340,9 +340,8 @@ pub unsafe extern "C" fn ts_serve(port: i32, fetch_fn: TsVal) -> TsVal {
                                 // Call fetch(request).
                                 let result = dispatch_callback(fetch_fn, &[ts_req]);
                                 ts_release_val(ts_req);
-                                // Await if Promise.
+                                // Await if Promise (consumes result, returns owned resolved value).
                                 let resolved = ts_promise_await(result);
-                                ts_release_val(result);
                                 ts_response_to_hyper(resolved)
                             })
                             .await

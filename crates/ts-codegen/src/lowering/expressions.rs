@@ -164,6 +164,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     ))
                     .result(0)?
                     .into();
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[obj_i64], &[], self.loc,
+                ));
 
                 Ok((Some(val), block))
             }
@@ -2594,8 +2598,34 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             arrow_scope.insert(rn.to_string(), rest_val);
         }
 
+        // Collect param names for ARC: lower_return_statement skips these.
+        let mut arrow_param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for param in params.iter() {
+            match &param.pattern {
+                oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
+                    arrow_param_names.insert(id.name.to_string());
+                }
+                oxc_ast::ast::BindingPattern::ArrayPattern(arr_pat) => {
+                    // Destructured params: the extracted bindings are locals owned by this fn.
+                    // The raw arg (arg_i64) is still borrowed — but we destructured it, so we
+                    // need to release it. Mark nothing here; the caller never sees these names.
+                    let _ = arr_pat;
+                }
+                oxc_ast::ast::BindingPattern::ObjectPattern(obj_pat) => {
+                    // Destructured object param: extracted bindings are locals (owned via ts_obj_get).
+                    // The original arg_i64 was used to extract and is NOT in scope by name — skip.
+                    let _ = obj_pat;
+                }
+                _ => {}
+            }
+        }
+        if let Some(rn) = rest_param_name {
+            arrow_param_names.insert(rn.to_string());
+        }
+
         let saved_return_type = self.fn_return_type;
         let saved_is_async = self.is_async;
+        let saved_fn_params = std::mem::replace(&mut self.current_fn_params, arrow_param_names);
         let saved_env_indices = std::mem::replace(
             &mut self.closure_env_indices,
             if has_captures {
@@ -2758,6 +2788,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         self.fn_return_type = saved_return_type;
         self.is_async = saved_is_async;
+        self.current_fn_params = saved_fn_params;
         self.closure_env_indices = saved_env_indices;
 
         // Default return: UNDEFINED

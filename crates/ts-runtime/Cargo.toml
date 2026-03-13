@@ -15,7 +15,11 @@ edition.workspace = true
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+[features]
+dhat-heap = ["dhat"]
+
 [dependencies]
+dhat = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time", "net"] }
 regex = "1"
 url = "2"

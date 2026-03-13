@@ -202,6 +202,7 @@ pub fn lower_program<'c>(
         builtin_wrappers_emitted: std::collections::HashSet::new(),
         lowered_classes: std::collections::HashSet::new(),
         closure_env_indices: HashMap::new(),
+        current_fn_params: std::collections::HashSet::new(),
     };
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
@@ -347,6 +348,11 @@ struct Lowerer<'c, 'm> {
     /// When inside a closure body with captures, maps captured variable name → env array index.
     /// Used to write back mutations to captured variables into the env array.
     closure_env_indices: HashMap<String, usize>,
+    /// Parameter names of the function currently being lowered.
+    /// `lower_return_statement` skips these so it does not release borrowed refs —
+    /// the call site's post-call ts_release_val is the one that balances the pre-call
+    /// ts_retain_val done by lower_expression for each argument.
+    current_fn_params: std::collections::HashSet<String>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
@@ -820,6 +826,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_add_event_listener",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_remove_event_listener",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_serve_worker",               &[i32_type], &[i64_type]);
+
+        // Heap profiler init (no-op unless ts-runtime built with --features dhat-heap)
+        add_func("ts_dhat_init",                  &[], &[]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -1074,9 +1083,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let entry  = region.append_block(Block::new(&param_specs));
 
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
+        let mut param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (i, param) in func.params.items.iter().enumerate() {
             if let BindingPattern::BindingIdentifier(id) = &param.pattern {
-                scope.insert(id.name.to_string(), entry.argument(i)?.into());
+                let pname = id.name.to_string();
+                scope.insert(pname.clone(), entry.argument(i)?.into());
+                param_names.insert(pname);
             }
         }
         // Bind the rest parameter (last MLIR param) as a TsArray in scope.
@@ -1084,9 +1096,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             if let BindingPattern::BindingIdentifier(rest_id) = &rest_param.rest.argument {
                 let rest_arg_idx = func.params.items.len();
                 let rest_val: Value<'_, '_> = entry.argument(rest_arg_idx)?.into();
-                scope.insert(rest_id.name.to_string(), rest_val);
+                let rname = rest_id.name.to_string();
+                scope.insert(rname.clone(), rest_val);
+                param_names.insert(rname);
             }
         }
+        let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
 
         let mut current_block = entry;
 
@@ -1235,8 +1250,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
         }
-        // ARC: release scope variables before final return.
-        for (_, v) in &scope {
+        // ARC: release scope variables before final return (skip parameters —
+        // they are "borrowed" from the caller; the call site's post-call
+        // ts_release_val balances the pre-call ts_retain_val).
+        for (name, v) in &scope {
+            if self.current_fn_params.contains(name) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
@@ -1245,7 +1263,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ));
         }
 
+        self.current_fn_params = saved_fn_params;
+
         // Async: wrap the implicit return value in a resolved Promise.
+        // ARC: ts_promise_resolve retains val internally; release our owned ref after the call.
         if current_block.terminator().is_none() && func.r#async {
             let val_i64 = self.ensure_i64(result_value, current_block)?;
             let promise: Value<'_, '_> = current_block
@@ -1255,6 +1276,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     &[val_i64], &[i64_type], self.loc,
                 ))
                 .result(0)?.into();
+            current_block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[val_i64], &[], self.loc,
+            ));
             current_block.append_operation(func::r#return(&[promise], self.loc));
         } else {
             self.terminate_with_return(current_block, result_value)?;
@@ -1423,6 +1448,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
                 &[val_i64], &[i64_type], self.loc,
             )).result(0)?.into();
+            // ARC: release our owned reference after promise takes ownership.
+            current_block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[val_i64], &[], self.loc,
+            ));
             current_block.append_operation(func::r#return(&[promise], self.loc));
         } else {
             self.terminate_with_return(current_block, result_value)?;

@@ -22,6 +22,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             .into();
         let mut current_block = entry;
 
+        // Activate dhat heap profiler if compiled with --features dhat-heap.
+        // This is a no-op in normal builds (the function body is empty).
+        current_block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_dhat_init"),
+            &[],
+            &[],
+            self.loc,
+        ));
+
         for stmt in &program.body {
             // Function declarations are emitted separately; skip here.
             if matches!(stmt, Statement::FunctionDeclaration(_)) {
@@ -545,23 +555,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         };
 
         // For async functions, wrap the return value in a resolved Promise.
+        // ARC: ts_promise_resolve retains val internally, so we must release our
+        // owned reference to val after the call (ownership transferred to promise).
         let val = if self.is_async {
             let val_i64 = self.ensure_i64(val, block)?;
-            block.append_operation(func::call(
+            let promise: Value<'c, 'b> = block.append_operation(func::call(
                 self.ctx,
                 FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
                 &[val_i64],
                 &[self.i64_type()],
                 self.loc,
-            )).result(0)?.into()
+            )).result(0)?.into();
+            // Release the original owned reference — promise now owns it.
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[val_i64],
+                &[],
+                self.loc,
+            ));
+            promise
         } else {
             val
         };
 
-        // ARC: Release all variables in the current scope before returning.
-        // "__env" is the env array passed in from the caller and is not owned by this closure.
+        // ARC: Release local variables in the current scope before returning.
+        // Skip "__env" (env array is borrowed from the closure caller) and function
+        // parameters (they are borrowed refs; the call site's post-call ts_release_val
+        // balances the pre-call ts_retain_val done by lower_expression).
         for (name, v) in scope.iter() {
             if name == "__env" { continue; }
+            if self.current_fn_params.contains(name) { continue; }
             let v_i64 = self.ensure_i64(*v, block)?;
             block.append_operation(func::call(
                 self.ctx,
