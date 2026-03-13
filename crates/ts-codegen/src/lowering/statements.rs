@@ -63,6 +63,55 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok(())
     }
 
+    // ── Module-level const arrow hoisting ────────────────────────────────
+
+    /// Lower module-level `const name = (params) => body` declarations as top-level MLIR functions.
+    /// This is called after `collect_function_signatures` so `self.funcs` already has all sigs.
+    pub(super) fn lower_module_const_functions(&mut self, program: &Program<'_>) -> Result<()> {
+        use oxc_ast::ast::ExportNamedDeclaration;
+        for stmt in &program.body {
+            let vd_opt: Option<&oxc_ast::ast::VariableDeclaration<'_>> = match stmt {
+                Statement::VariableDeclaration(vd) => Some(vd),
+                Statement::ExportNamedDeclaration(exp) => {
+                    if let Some(Declaration::VariableDeclaration(vd)) = &exp.declaration {
+                        Some(vd)
+                    } else { None }
+                }
+                _ => None,
+            };
+            let Some(vd) = vd_opt else { continue };
+            for decl in &vd.declarations {
+                let name = match &decl.id {
+                    BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                    _ => continue,
+                };
+                // Only process if we registered a sig for this name (arrow or function expr).
+                if !self.funcs.contains_key(&name) { continue; }
+                let init = match &decl.init { Some(e) => e, None => continue };
+                let inner = Lowerer::strip_ts_casts(init);
+                match inner {
+                    Expression::ArrowFunctionExpression(arrow) => {
+                        let params: Vec<&oxc_ast::ast::FormalParameter<'_>> =
+                            arrow.params.items.iter().collect();
+                        let rest_name = arrow.params.rest.as_ref()
+                            .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument { Some(id.name.as_str()) } else { None });
+                        self.lower_named_function(&name, &params, rest_name, Some(&arrow.body), None)?;
+                    }
+                    Expression::FunctionExpression(func_expr) => {
+                        let params: Vec<&oxc_ast::ast::FormalParameter<'_>> =
+                            func_expr.params.items.iter().collect();
+                        let rest_name = func_expr.params.rest.as_ref()
+                            .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument { Some(id.name.as_str()) } else { None });
+                        let body = func_expr.body.as_deref();
+                        self.lower_named_function(&name, &params, rest_name, body, None)?;
+                    }
+                    _ => {} // alias or non-function const — skip
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ── Statement lowering ────────────────────────────────────────────────
 
     pub(super) fn lower_statement<'b>(
@@ -229,6 +278,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             match &declarator.id {
                 BindingPattern::BindingIdentifier(b) => {
                     let name = b.name.to_string();
+                    if declarator.init.is_none() {
+                        // `let x` with no initializer — initialize to undefined.
+                        let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                            self.ctx,
+                            IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                            self.loc,
+                        )).result(0)?.into();
+                        scope.insert(name.clone(), undef);
+                    }
                     if let Some(init) = &declarator.init {
                         // Type inference: record class name for `let x = new Foo()`.
                         if let Expression::NewExpression(new_expr) = init {
@@ -240,6 +298,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         block = nb;
                         if let Some(val) = val_opt {
                             scope.insert(name.clone(), val);
+                            // If this is a module-level global, also store it in the runtime global map.
+                            if self.module_global_names.contains(&name) {
+                                let val_i64 = self.ensure_i64(val, block)?;
+                                let key_ptr = self.get_string_ptr(&name, block)?;
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_set_module_global"),
+                                    &[key_ptr, val_i64], &[], self.loc,
+                                ));
+                            }
                         }
                     }
                 }
@@ -262,9 +329,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 continue;
                             }
                         };
-                        // Determine the binding name.
-                        let var_name = match &prop.value {
-                            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                        // Determine binding name and optional default initializer.
+                        let (var_name, default_init) = match &prop.value {
+                            BindingPattern::BindingIdentifier(id) => (id.name.to_string(), None),
+                            BindingPattern::AssignmentPattern(ap) => {
+                                if let BindingPattern::BindingIdentifier(id) = &ap.left {
+                                    (id.name.to_string(), Some(&ap.right))
+                                } else {
+                                    tracing::debug!("skipping nested destructuring pattern");
+                                    continue;
+                                }
+                            }
                             _ => {
                                 tracing::debug!("skipping nested destructuring pattern");
                                 continue;
@@ -278,7 +353,31 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[self.i64_type()],
                             self.loc,
                         )).result(0)?.into();
-                        scope.insert(var_name, field_val);
+                        // Handle default value: if field is undefined, use the initializer.
+                        let final_val = if let Some(default_expr) = default_init {
+                            let i64t = self.i64_type();
+                            let i32t = self.i32_type();
+                            let is_undef: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                                &[field_val], &[i32t], self.loc,
+                            )).result(0)?.into();
+                            let is_undef_i1 = self.ensure_i1(is_undef, block)?;
+                            let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
+                            let default_block = region.append_block(Block::new(&[]));
+                            block.append_operation(cf::cond_br(
+                                self.ctx, is_undef_i1, &default_block, &merge_block, &[], &[field_val], self.loc,
+                            ));
+                            let mut def_scope = scope.clone();
+                            let (def_opt, post_def) = self.lower_expression(default_expr, default_block, region, &mut def_scope)?;
+                            let def_val = def_opt.ok_or_else(|| anyhow::anyhow!("destructuring default: no value"))?;
+                            let def_i64 = self.ensure_i64(def_val, post_def)?;
+                            post_def.append_operation(cf::br(&merge_block, &[def_i64], self.loc));
+                            block = merge_block;
+                            merge_block.argument(0)?.into()
+                        } else {
+                            field_val
+                        };
+                        scope.insert(var_name, final_val);
                         extracted_keys.push(key_str);
                     }
 
@@ -494,8 +593,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let cond_i1 = self.ensure_i1(cond_val, block)?;
 
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        // Normalize all scope variable types to i64 for the merge block to avoid type mismatches.
+        let i64t = self.i64_type();
         let merge_arg_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
-            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+            scope_keys.iter().map(|_| (i64t, self.loc)).collect();
+        // Convert all current scope values to i64 before branching.
+        let init_i64_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| {
+            self.ensure_i64(scope[k], block).unwrap_or(scope[k])
+        }).collect();
+        // Update scope to use i64 versions.
+        for (k, v) in scope_keys.iter().zip(init_i64_vals.iter()) {
+            scope.insert(k.clone(), *v);
+        }
 
         let then_block  = region.append_block(Block::new(&[]));
         let else_block  = region.append_block(Block::new(&[]));
@@ -508,16 +617,25 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Then branch
         let mut then_scope = scope.clone();
         let (_, then_end) = self.lower_statement(&if_stmt.consequent, then_block, region, &mut then_scope, loops)?;
-        let then_vals: Vec<Value<'c, 'b>> =
-            scope_keys.iter().map(|k| *then_scope.get(k).unwrap_or(&scope[k])).collect();
+        // Collect values as i64; only if block is not yet terminated.
+        let then_vals: Vec<Value<'c, 'b>> = if then_end.terminator().is_none() {
+            scope_keys.iter().map(|k| {
+                let v = *then_scope.get(k).unwrap_or(&scope[k]);
+                self.ensure_i64(v, then_end).unwrap_or(v)
+            }).collect()
+        } else { scope_keys.iter().map(|k| scope[k]).collect() };
         self.terminate_with_br(then_end, &merge_block, &then_vals);
 
         // Else branch
         let mut else_scope = scope.clone();
         if let Some(alt) = &if_stmt.alternate {
             let (_, else_end) = self.lower_statement(alt, else_block, region, &mut else_scope, loops)?;
-            let else_vals: Vec<Value<'c, 'b>> =
-                scope_keys.iter().map(|k| *else_scope.get(k).unwrap_or(&scope[k])).collect();
+            let else_vals: Vec<Value<'c, 'b>> = if else_end.terminator().is_none() {
+                scope_keys.iter().map(|k| {
+                    let v = *else_scope.get(k).unwrap_or(&scope[k]);
+                    self.ensure_i64(v, else_end).unwrap_or(v)
+                }).collect()
+            } else { scope_keys.iter().map(|k| scope[k]).collect() };
             self.terminate_with_br(else_end, &merge_block, &else_vals);
         } else {
             let orig_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
@@ -543,8 +661,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        // Normalize all scope values to i64 to avoid type mismatches in phi nodes.
+        let i64t = self.i64_type();
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
-            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+            scope_keys.iter().map(|_| (i64t, self.loc)).collect();
 
         // header receives all scope vars as block arguments (loop-carried values).
         let mut header_block = region.append_block(Block::new(&phi_types));
@@ -581,8 +705,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         inner_loops.push((header_block, exit_block, scope_keys.clone()));
         let (_, body_end) =
             self.lower_statement(&while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
-        let body_vals: Vec<Value<'c, 'b>> =
-            scope_keys.iter().map(|k| *body_scope.get(k).unwrap_or(&header_scope[k])).collect();
+        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
+            scope_keys.iter().map(|k| {
+                let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
+                self.ensure_i64(v, body_end).unwrap_or(v)
+            }).collect()
+        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(body_end, &header_block, &body_vals);
 
         // After the loop, scope uses exit-block arguments.
@@ -622,8 +750,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        // Normalize all scope values to i64 for consistent phi types.
+        let i64t = self.i64_type();
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], current)?;
+            scope.insert(k.clone(), v64);
+        }
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
-            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+            scope_keys.iter().map(|_| (i64t, self.loc)).collect();
 
         let mut header_block = region.append_block(Block::new(&phi_types));
         let body_block   = region.append_block(Block::new(&[]));
@@ -670,8 +804,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.lower_statement(&for_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
 
         // Normal end of body also jumps to the update block.
-        let body_vals: Vec<Value<'c, 'b>> =
-            scope_keys.iter().map(|k| *body_scope.get(k).unwrap_or(&header_scope[k])).collect();
+        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
+            scope_keys.iter().zip(phi_types.iter()).map(|(k, (ty, _))| {
+                let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
+                self.coerce_val_to_type(v, *ty, body_end).unwrap_or(v)
+            }).collect()
+        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(body_end, &update_block, &body_vals);
 
         // Lower update expression inside the update block.
@@ -686,8 +824,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         // Finally, the update block jumps unconditionally back to the header block.
-        let update_vals: Vec<Value<'c, 'b>> =
-            scope_keys.iter().map(|k| *update_scope.get(k).unwrap_or(&header_scope[k])).collect();
+        let update_vals: Vec<Value<'c, 'b>> = if update_block.terminator().is_none() {
+            scope_keys.iter().zip(phi_types.iter()).map(|(k, (ty, _))| {
+                let v = *update_scope.get(k).unwrap_or(&header_scope[k]);
+                self.coerce_val_to_type(v, *ty, update_block).unwrap_or(v)
+            }).collect()
+        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(update_block, &header_block, &update_vals);
 
         for (i, k) in scope_keys.iter().enumerate() {
@@ -739,10 +881,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let i64_type = self.i64_type();
 
         // Snapshot the outer scope before entering the try body.
-        // These keys/types are used for all phi-node blocks.
+        // Normalize all scope values to i64 for consistent phi types.
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
-            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+            scope_keys.iter().map(|_| (i64_type, self.loc)).collect();
 
         let has_catch   = try_stmt.handler.is_some();
         let has_finally = try_stmt.finalizer.is_some();
@@ -962,18 +1108,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Index starts at 0.
         let zero_i32 = self.lower_numeric_literal(0, block)?;
 
+        // Normalize len/idx to i64 for consistent phi types.
+        let len_i64 = self.ensure_i64(len_i32, block)?;
+        let zero_i64 = self.ensure_i64(zero_i32, block)?;
+
         // Store iter + len + idx as loop-carried scope entries with unique names.
         let iter_key = "__forofiter__".to_string();
         let len_key  = "__foroflen__".to_string();
         let idx_key  = "__forofidx__".to_string();
         scope.insert(iter_key.clone(), iter_i64);
-        scope.insert(len_key.clone(),  len_i32);
-        scope.insert(idx_key.clone(),  zero_i32);
+        scope.insert(len_key.clone(),  len_i64);
+        scope.insert(idx_key.clone(),  zero_i64);
 
-        // Snapshot scope for phi node typing (includes the three internal vars).
+        // Normalize all outer scope values to i64 before creating phi nodes.
+        let i64t = self.i64_type();
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
-            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+            scope_keys.iter().map(|_| (i64t, self.loc)).collect();
 
         let mut header_block = region.append_block(Block::new(&phi_types));
         let body_block       = region.append_block(Block::new(&[]));
@@ -1063,13 +1218,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ));
         }
 
-        // body_vals: coerce types to match phi_types (body may upgrade i32→i64 via ts_add).
-        let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
-            .map(|(i, k)| {
-                let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
-                self.coerce_val_to_type(v, phi_types[i].0, body_end)
-            })
-            .collect::<Result<_>>()?;
+        // body_vals: coerce types to match phi_types.
+        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
+            scope_keys.iter().enumerate()
+                .map(|(i, k)| {
+                    let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
+                    self.coerce_val_to_type(v, phi_types[i].0, body_end)
+                })
+                .collect::<Result<_>>()?
+        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(body_end, &update_block, &body_vals);
 
         // ── Update: increment index ───────────────────────────────────────────
@@ -1079,17 +1236,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
         let idx_upd = self.ensure_i32(update_scope[&idx_key], update_block)?;
         let one_i32 = self.lower_numeric_literal(1, update_block)?;
-        let new_idx: Value<'c, 'b> = update_block.append_operation(
+        let new_idx_i32: Value<'c, 'b> = update_block.append_operation(
             arith::addi(idx_upd, one_i32, self.loc)
         ).result(0)?.into();
-        update_scope.insert(idx_key.clone(), new_idx);
+        let new_idx_i64 = self.ensure_i64(new_idx_i32, update_block)?;
+        update_scope.insert(idx_key.clone(), new_idx_i64);
 
-        let update_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
-            .map(|(i, k)| {
-                let v = *update_scope.get(k).unwrap_or(&header_scope[k]);
-                self.coerce_val_to_type(v, phi_types[i].0, update_block)
-            })
-            .collect::<Result<_>>()?;
+        let update_vals: Vec<Value<'c, 'b>> = if update_block.terminator().is_none() {
+            scope_keys.iter().enumerate()
+                .map(|(i, k)| {
+                    let v = *update_scope.get(k).unwrap_or(&header_scope[k]);
+                    self.coerce_val_to_type(v, phi_types[i].0, update_block)
+                })
+                .collect::<Result<_>>()?
+        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(update_block, &header_block, &update_vals);
 
         // ── Exit: update outer scope, release iter ────────────────────────────
@@ -1172,14 +1332,23 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let zero_i32 = self.lower_numeric_literal(0, block)?;
 
+        let len_i64 = self.ensure_i64(len_i32, block)?;
+        let zero_i64 = self.ensure_i64(zero_i32, block)?;
+
         let len_key = "__forinlen__".to_string();
         let idx_key = "__forinidx__".to_string();
-        scope.insert(len_key.clone(), len_i32);
-        scope.insert(idx_key.clone(), zero_i32);
+        scope.insert(len_key.clone(), len_i64);
+        scope.insert(idx_key.clone(), zero_i64);
 
+        // Normalize all scope values to i64 before creating phi nodes.
+        let i64t = self.i64_type();
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
-            scope_keys.iter().map(|k| (scope[k].r#type(), self.loc)).collect();
+            scope_keys.iter().map(|_| (i64t, self.loc)).collect();
 
         let mut header_block = region.append_block(Block::new(&phi_types));
         let body_block       = region.append_block(Block::new(&[]));
@@ -1233,31 +1402,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ));
         }
 
-        let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
-            .map(|(i, k)| {
-                let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
-                self.coerce_val_to_type(v, phi_types[i].0, body_end)
-            })
-            .collect::<Result<_>>()?;
+        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
+            scope_keys.iter().enumerate()
+                .map(|(i, k)| {
+                    let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
+                    self.coerce_val_to_type(v, phi_types[i].0, body_end)
+                })
+                .collect::<Result<_>>()?
+        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(body_end, &update_block, &body_vals);
 
         let mut update_scope = header_scope.clone();
         for (i, k) in scope_keys.iter().enumerate() {
             update_scope.insert(k.clone(), update_block.argument(i)?.into());
         }
-        let idx_upd = self.ensure_i32(update_scope[&idx_key], update_block)?;
+        // Increment index: extract i32, add 1, normalize back to i64.
+        let idx_upd_i32 = self.ensure_i32(update_scope[&idx_key], update_block)?;
         let one_i32 = self.lower_numeric_literal(1, update_block)?;
-        let new_idx: Value<'c, 'b> = update_block.append_operation(
-            arith::addi(idx_upd, one_i32, self.loc)
+        let new_idx_i32: Value<'c, 'b> = update_block.append_operation(
+            arith::addi(idx_upd_i32, one_i32, self.loc)
         ).result(0)?.into();
-        update_scope.insert(idx_key.clone(), new_idx);
+        let new_idx_i64 = self.ensure_i64(new_idx_i32, update_block)?;
+        update_scope.insert(idx_key.clone(), new_idx_i64);
 
-        let update_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
-            .map(|(i, k)| {
-                let v = *update_scope.get(k).unwrap_or(&header_scope[k]);
-                self.coerce_val_to_type(v, phi_types[i].0, update_block)
-            })
-            .collect::<Result<_>>()?;
+        let update_vals: Vec<Value<'c, 'b>> = if update_block.terminator().is_none() {
+            scope_keys.iter().enumerate()
+                .map(|(i, k)| {
+                    let v = *update_scope.get(k).unwrap_or(&header_scope[k]);
+                    self.coerce_val_to_type(v, phi_types[i].0, update_block)
+                })
+                .collect::<Result<_>>()?
+        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(update_block, &header_block, &update_vals);
 
         for (i, k) in scope_keys.iter().enumerate() {

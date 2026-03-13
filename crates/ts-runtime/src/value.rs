@@ -555,15 +555,48 @@ pub unsafe extern "C" fn ts_obj_new() -> TsVal {
 }
 
 #[no_mangle]
+/// Create an Error object with a `message` property. Represented as a plain TsObject.
+pub unsafe extern "C" fn ts_error_new(message: TsVal) -> TsVal {
+    let err = ts_obj_new();
+    let msg_key = b"message\0";
+    ts_obj_set(err, msg_key.as_ptr() as *const i8, message);
+    let name_c = b"Error\0";
+    let name_str = ts_string_new(name_c.as_ptr() as *const i8);
+    let name_key = b"name\0";
+    ts_obj_set(err, name_key.as_ptr() as *const i8, name_str);
+    ts_release_val(name_str);
+    err
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ts_obj_get(obj_val: TsVal, key_ptr: *const i8) -> TsVal {
     let ptr = obj_val.as_ptr();
-    if !ptr.is_null() && !key_ptr.is_null() {
-        let obj = ptr as *mut TsObject;
-        let key = unsafe { std::ffi::CStr::from_ptr(key_ptr) }.to_string_lossy().into_owned();
-        if let Some(&val) = (&*obj).properties.get(&key) {
-            ts_retain_val(val);
-            return val;
+    if ptr.is_null() || key_ptr.is_null() { return UNDEFINED; }
+    let tag = heap_tag(obj_val);
+    let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy().into_owned();
+    if tag == 7 {
+        // TsHeaders: __class__ property or nothing else via obj_get
+        if key == "__class__" {
+            return rust_str_to_val("Headers".to_string());
         }
+        return UNDEFINED;
+    }
+    if tag == 8 {
+        // TsResponse: expose body, status, headers, __class__
+        let resp = &*(ptr as *const TsResponse);
+        match key.as_str() {
+            "__class__" => return rust_str_to_val("Response".to_string()),
+            "body" => { ts_retain_val(resp.body); return resp.body; }
+            "status" => return TsVal::from_i32(resp.status as i32),
+            "headers" => { ts_retain_val(resp.headers); return resp.headers; }
+            "ok" => return TsVal::from_bool(resp.status >= 200 && resp.status < 300),
+            _ => return UNDEFINED,
+        }
+    }
+    let obj = ptr as *mut TsObject;
+    if let Some(&val) = (&*obj).properties.get(&key) {
+        ts_retain_val(val);
+        return val;
     }
     UNDEFINED
 }
@@ -583,6 +616,82 @@ pub unsafe extern "C" fn ts_obj_set(obj_val: TsVal, key_ptr: *const i8, val: TsV
             ts_release_val(v);
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_delete(obj_val: TsVal, key_ptr: *const i8) -> TsVal {
+    let ptr = obj_val.as_ptr();
+    if !ptr.is_null() && !key_ptr.is_null() {
+        let obj = ptr as *mut TsObject;
+        let key = unsafe { std::ffi::CStr::from_ptr(key_ptr) }.to_string_lossy().into_owned();
+        if let Some(old) = (&mut *obj).properties.remove(&key) {
+            ts_release_val(old);
+        }
+    }
+    TsVal::from_bool(true)
+}
+
+#[no_mangle]
+/// Convert a TsVal key to a Rust String for HashMap lookup, or None if not representable.
+unsafe fn tsval_to_key_string(key: TsVal) -> Option<String> {
+    if key.is_int32() {
+        return Some(key.as_i32().to_string());
+    }
+    if key.is_ptr() && heap_tag(key) == 2 {
+        let ts_str = &*(key.as_ptr() as *const TsString);
+        return Some(ts_str.inner.clone());
+    }
+    if !key.is_nan_boxed() {
+        return Some(key.as_f64().to_string());
+    }
+    None
+}
+
+/// `key in obj` — returns boolean TsVal
+#[no_mangle]
+pub unsafe extern "C" fn ts_val_has_key(obj: TsVal, key: TsVal) -> TsVal {
+    if !obj.is_ptr() { return TsVal::from_bool(false); }
+    let tag = heap_tag(obj);
+    let ptr = obj.as_ptr();
+    if tag == 0 {
+        // TsObject
+        let key_str = tsval_to_key_string(key);
+        let has = if let Some(k) = key_str {
+            (*(ptr as *const TsObject)).properties.contains_key(&k)
+        } else { false };
+        return TsVal::from_bool(has);
+    }
+    if tag == 1 {
+        // TsArray: check index
+        if key.is_int32() {
+            let idx = key.as_i32() as usize;
+            let arr = &*(ptr as *const TsArray);
+            return TsVal::from_bool(idx < arr.elements.len());
+        }
+        return TsVal::from_bool(false);
+    }
+    if tag == 5 {
+        // TsMap
+        let map = &*(ptr as *const TsMap);
+        let kv = key;
+        let has = map.entries.iter().any(|(k, _)| ts_val_strict_eq(*k, kv) != 0);
+        return TsVal::from_bool(has);
+    }
+    TsVal::from_bool(false)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_delete_key(obj_val: TsVal, key: TsVal) -> TsVal {
+    let ptr = obj_val.as_ptr();
+    if !ptr.is_null() {
+        let obj = ptr as *mut TsObject;
+        if let Some(key_str) = tsval_to_key_string(key) {
+            if let Some(old) = (&mut *obj).properties.remove(&key_str) {
+                ts_release_val(old);
+            }
+        }
+    }
+    TsVal::from_bool(true)
 }
 
 #[no_mangle]
@@ -856,6 +965,35 @@ pub unsafe extern "C" fn ts_promise_race(p1: TsVal, p2: TsVal) -> TsVal {
     alloc_promise(TsPromise { resolved: rr, notify: rn })
 }
 
+/// Returns a Promise that resolves to an array of all resolved values.
+#[no_mangle]
+pub unsafe extern "C" fn ts_promise_all(arr: TsVal) -> TsVal {
+    let len = if arr.is_ptr() && heap_tag(arr) == 1 {
+        (*(arr.as_ptr() as *const TsArray)).elements.len()
+    } else {
+        0
+    };
+    let mut results: Vec<TsVal> = Vec::with_capacity(len);
+    for i in 0..len {
+        let item = ts_arr_get(arr, i as i32);
+        let resolved = ts_promise_await(item);
+        results.push(resolved);
+    }
+    ts_release_val(arr);
+    let out = ts_arr_new(0);
+    for v in results {
+        ts_arr_push(out, v);
+        ts_release_val(v);
+    }
+    out
+}
+
+/// Returns a rejected Promise (wraps val as-is; in our runtime, resolve == reject).
+#[no_mangle]
+pub unsafe extern "C" fn ts_promise_reject(val: TsVal) -> TsVal {
+    ts_promise_resolve(val)
+}
+
 // ── Async spawn (spawn_blocking + function pointer) ───────────────────────────
 
 type AsyncFn0 = unsafe extern "C" fn() -> u64;
@@ -981,6 +1119,8 @@ pub unsafe extern "C" fn ts_release_val(val: TsVal) {
             4 => Some(ts_func_destructor as unsafe extern "C" fn(*mut u8)),
             5 => Some(ts_map_destructor as unsafe extern "C" fn(*mut u8)),
             6 => Some(ts_regexp_destructor as unsafe extern "C" fn(*mut u8)),
+            7 => Some(ts_headers_destructor as unsafe extern "C" fn(*mut u8)),
+            8 => Some(ts_response_destructor as unsafe extern "C" fn(*mut u8)),
             _ => None,
         };
         
@@ -1087,6 +1227,12 @@ pub unsafe extern "C" fn ts_is_truthy(val: TsVal) -> i32 {
     if ts_val_is_truthy(val) { 1 } else { 0 }
 }
 
+/// Logical NOT of a truthy i32 result (0 → 1, non-zero → 0).
+#[no_mangle]
+pub unsafe extern "C" fn ts_val_not(v: i32) -> i32 {
+    if v == 0 { 1 } else { 0 }
+}
+
 /// Returns 1 if `val` is `undefined`, 0 otherwise.
 /// Used to implement default parameter values.
 #[no_mangle]
@@ -1132,9 +1278,23 @@ pub unsafe extern "C" fn ts_val_get_key(obj: TsVal, key: TsVal) -> TsVal {
     if tag == 1 && key.is_int32() {
         return ts_arr_get(obj, key.as_i32());
     }
-    // Map with any key
-    if tag == 5 {
+    // Map or Headers with any key
+    if tag == 5 || tag == 7 {
         return ts_map_get(obj, key);
+    }
+    // Response: property access via string key
+    if tag == 8 {
+        let key_str = if key.is_ptr() && heap_tag(key) == 2 {
+            let ts_str = &*(key.as_ptr() as *const TsString);
+            ts_str.inner.clone()
+        } else if key.is_int32() {
+            key.as_i32().to_string()
+        } else {
+            return UNDEFINED;
+        };
+        let mut bytes = key_str.into_bytes();
+        bytes.push(0u8);
+        return ts_obj_get(obj, bytes.as_ptr() as *const i8);
     }
     // String: character at integer index
     if tag == 2 && key.is_int32() {
@@ -1223,7 +1383,8 @@ pub unsafe extern "C" fn ts_obj_rest(obj: TsVal, keys_arr: TsVal) -> TsVal {
 /// Used for `for (const [k, v] of m.entries())`.
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_entries(map_val: TsVal) -> TsVal {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 {
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 {
         return ts_arr_new(0);
     }
     let map = &*(map_val.as_ptr() as *const TsMap);
@@ -1964,9 +2125,11 @@ pub unsafe extern "C" fn ts_map_new() -> TsVal {
 }
 
 /// `map.set(key, val)` — insert or update a key; returns the map (owned ref).
+/// Also handles TsHeaders (tag=7) which has the same Vec layout.
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_set(map_val: TsVal, key: TsVal, val: TsVal) -> TsVal {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 {
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 {
         ts_retain_val(map_val);
         return map_val;
     }
@@ -1988,10 +2151,11 @@ pub unsafe extern "C" fn ts_map_set(map_val: TsVal, key: TsVal, val: TsVal) -> T
     map_val
 }
 
-/// `map.get(key)` — retrieve value or undefined.
+/// `map.get(key)` — retrieve value or undefined. Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_get(map_val: TsVal, key: TsVal) -> TsVal {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return UNDEFINED; }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return UNDEFINED; }
     let map = &*(map_val.as_ptr() as *const TsMap);
     for (k, v) in &map.entries {
         if map_key_eq(*k, key) {
@@ -2002,10 +2166,11 @@ pub unsafe extern "C" fn ts_map_get(map_val: TsVal, key: TsVal) -> TsVal {
     UNDEFINED
 }
 
-/// `map.has(key)` — true if key is present.
+/// `map.has(key)` — true if key is present. Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_has(map_val: TsVal, key: TsVal) -> TsVal {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return TsVal::from_bool(false); }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return TsVal::from_bool(false); }
     let map = &*(map_val.as_ptr() as *const TsMap);
     for (k, _) in &map.entries {
         if map_key_eq(*k, key) { return TsVal::from_bool(true); }
@@ -2013,10 +2178,11 @@ pub unsafe extern "C" fn ts_map_has(map_val: TsVal, key: TsVal) -> TsVal {
     TsVal::from_bool(false)
 }
 
-/// `map.delete(key)` — remove a key; returns true if it was present.
+/// `map.delete(key)` — remove a key; returns true if it was present. Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_delete(map_val: TsVal, key: TsVal) -> TsVal {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return TsVal::from_bool(false); }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return TsVal::from_bool(false); }
     let map = &mut *(map_val.as_ptr() as *mut TsMap);
     let pos = map.entries.iter().position(|(k, _)| map_key_eq(*k, key));
     if let Some(i) = pos {
@@ -2028,10 +2194,11 @@ pub unsafe extern "C" fn ts_map_delete(map_val: TsVal, key: TsVal) -> TsVal {
     TsVal::from_bool(false)
 }
 
-/// `map.clear()` — remove all entries.
+/// `map.clear()` — remove all entries. Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_clear(map_val: TsVal) {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return; }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return; }
     let map = &mut *(map_val.as_ptr() as *mut TsMap);
     for (k, v) in map.entries.drain(..) {
         ts_release_val(k);
@@ -2039,19 +2206,21 @@ pub unsafe extern "C" fn ts_map_clear(map_val: TsVal) {
     }
 }
 
-/// `map.size` — number of entries as integer TsVal.
+/// `map.size` — number of entries as integer TsVal. Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_size(map_val: TsVal) -> TsVal {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return TsVal::from_i32(0); }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return TsVal::from_i32(0); }
     let map = &*(map_val.as_ptr() as *const TsMap);
     TsVal::from_i32(map.entries.len() as i32)
 }
 
-/// `map.keys()` — returns a TsArray of all keys (owned refs).
+/// `map.keys()` — returns a TsArray of all keys (owned refs). Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_keys(map_val: TsVal) -> TsVal {
     let result = ts_arr_new(0);
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return result; }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return result; }
     let map = &*(map_val.as_ptr() as *const TsMap);
     for (k, _) in &map.entries {
         ts_arr_push(result, *k);
@@ -2059,11 +2228,12 @@ pub unsafe extern "C" fn ts_map_keys(map_val: TsVal) -> TsVal {
     result
 }
 
-/// `map.values()` — returns a TsArray of all values (owned refs).
+/// `map.values()` — returns a TsArray of all values (owned refs). Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_values(map_val: TsVal) -> TsVal {
     let result = ts_arr_new(0);
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return result; }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return result; }
     let map = &*(map_val.as_ptr() as *const TsMap);
     for (_, v) in &map.entries {
         ts_arr_push(result, *v);
@@ -2071,10 +2241,11 @@ pub unsafe extern "C" fn ts_map_values(map_val: TsVal) -> TsVal {
     result
 }
 
-/// `map.forEach(cb)` — call cb(value, key, map) for each entry.
+/// `map.forEach(cb)` — call cb(value, key, map) for each entry. Also handles TsHeaders (tag=7).
 #[no_mangle]
 pub unsafe extern "C" fn ts_map_for_each(map_val: TsVal, callback: TsVal) -> TsVal {
-    if !map_val.is_ptr() || heap_tag(map_val) != 5 { return UNDEFINED; }
+    let tag = if map_val.is_ptr() { heap_tag(map_val) } else { 255 };
+    if tag != 5 && tag != 7 { return UNDEFINED; }
     let map = &*(map_val.as_ptr() as *const TsMap);
     let len = map.entries.len();
     for i in 0..len {
@@ -2398,6 +2569,11 @@ pub unsafe extern "C" fn ts_coerce_string(val: TsVal) -> TsVal {
     ts_val_to_string(val)
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ts_coerce_bool(val: TsVal) -> TsVal {
+    TsVal::from_bool(ts_val_is_truthy(val))
+}
+
 // ── Spread function call ──────────────────────────────────────────────────────
 
 /// Call a TsFunction with arguments spread from a TsArray.
@@ -2682,4 +2858,250 @@ pub unsafe extern "C" fn ts_regexp_source(re_val: TsVal) -> TsVal {
     if !re_val.is_ptr() || heap_tag(re_val) != 6 { return UNDEFINED; }
     let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
     rust_str_to_val(re_obj.source.clone())
+}
+
+// ── Web API: Headers (tag=7) ──────────────────────────────────────────────────
+
+/// TsHeaders has the same memory layout as TsMap so all ts_map_* functions work for it.
+/// tag=7 allocated via ts_alloc_rc(size, 7).
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_destructor(ptr: *mut u8) {
+    // Same layout as TsMap
+    let map_ptr = ptr as *mut TsMap;
+    for (k, v) in (*map_ptr).entries.drain(..) {
+        ts_release_val(k);
+        ts_release_val(v);
+    }
+    std::ptr::drop_in_place(map_ptr);
+}
+
+/// `new Headers(init?)` — create a new Headers object.
+/// init can be:
+///   - UNDEFINED / NULL: empty
+///   - TsObject (tag=0): copy all non-__ properties as headers
+///   - TsHeaders (tag=7): clone all entries
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_new(init: TsVal) -> TsVal {
+    let size = std::mem::size_of::<TsMap>();
+    let ptr = ts_alloc_rc(size, 7) as *mut TsMap;
+    if ptr.is_null() { return NULL; }
+    std::ptr::write(ptr, TsMap { entries: Vec::new() });
+    let headers_val = TsVal::from_ptr(ptr as *mut u8);
+
+    if init.is_ptr() {
+        let tag = heap_tag(init);
+        if tag == 0 {
+            // TsObject: copy string properties as header key/val pairs
+            let obj = &*(init.as_ptr() as *const TsObject);
+            for (k, v) in &obj.properties {
+                if k.starts_with("__") { continue; }
+                let k_val = rust_str_to_val(k.clone());
+                ts_map_set(headers_val, k_val, *v);
+                ts_release_val(k_val);
+            }
+        } else if tag == 7 {
+            // Clone from another TsHeaders
+            let src = &*(init.as_ptr() as *const TsMap);
+            let dst = &mut *ptr;
+            for (k, v) in &src.entries {
+                ts_retain_val(*k);
+                ts_retain_val(*v);
+                dst.entries.push((*k, *v));
+            }
+        }
+    }
+    headers_val
+}
+
+/// `headers.append(name, value)` — add header value without removing existing ones.
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_append(headers_val: TsVal, name: TsVal, value: TsVal) -> TsVal {
+    if !headers_val.is_ptr() || heap_tag(headers_val) != 7 {
+        ts_retain_val(headers_val);
+        return headers_val;
+    }
+    let map = &mut *(headers_val.as_ptr() as *mut TsMap);
+    ts_retain_val(name);
+    ts_retain_val(value);
+    map.entries.push((name, value));
+    ts_retain_val(headers_val);
+    headers_val
+}
+
+/// `headers.getSetCookie()` — return TsArray of all "set-cookie" header values.
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_get_set_cookie(headers_val: TsVal) -> TsVal {
+    let result = ts_arr_new(0);
+    if !headers_val.is_ptr() || heap_tag(headers_val) != 7 { return result; }
+    let map = &*(headers_val.as_ptr() as *const TsMap);
+    let target = rust_str_to_val("set-cookie".to_string());
+    for (k, v) in &map.entries {
+        if map_key_eq(*k, target) {
+            ts_retain_val(*v);
+            ts_arr_push(result, *v);
+        }
+    }
+    ts_release_val(target);
+    result
+}
+
+// ── Web API: Response (tag=8) ─────────────────────────────────────────────────
+
+pub struct TsResponse {
+    pub status: u16,
+    pub body: TsVal,    // TsString or NULL
+    pub headers: TsVal, // TsHeaders (tag=7)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_response_destructor(ptr: *mut u8) {
+    let resp = &mut *(ptr as *mut TsResponse);
+    ts_release_val(resp.body);
+    ts_release_val(resp.headers);
+    std::ptr::drop_in_place(resp as *mut TsResponse);
+}
+
+/// `new Response(body?, init?)` — create a new Response object.
+/// body: TsString or NULL/UNDEFINED
+/// init: TsObject with optional "status" and "headers" fields,
+///       OR TsResponse to clone status/headers from.
+#[no_mangle]
+pub unsafe extern "C" fn ts_response_new(body: TsVal, init: TsVal) -> TsVal {
+    let size = std::mem::size_of::<TsResponse>();
+    let ptr = ts_alloc_rc(size, 8) as *mut TsResponse;
+    if ptr.is_null() { return NULL; }
+
+    let mut status: u16 = 200;
+    let headers_val = ts_headers_new(UNDEFINED);
+
+    // Parse init
+    if init.is_ptr() {
+        let tag = heap_tag(init);
+        if tag == 0 {
+            // { status?: number, headers?: HeadersInit }
+            let obj = &*(init.as_ptr() as *const TsObject);
+            if let Some(&s) = obj.properties.get("status") {
+                if s.is_int32() { status = s.as_i32() as u16; }
+                else if !s.is_nan_boxed() { status = s.as_f64() as u16; }
+            }
+            if let Some(&h) = obj.properties.get("headers") {
+                // Copy headers from init object headers field
+                if h.is_ptr() {
+                    let h_tag = heap_tag(h);
+                    if h_tag == 7 {
+                        // Copy all entries
+                        let src = &*(h.as_ptr() as *const TsMap);
+                        let dst = &mut *(headers_val.as_ptr() as *mut TsMap);
+                        for (k, v) in &src.entries {
+                            ts_retain_val(*k);
+                            ts_retain_val(*v);
+                            dst.entries.push((*k, *v));
+                        }
+                    } else if h_tag == 0 {
+                        // TsObject: copy string properties
+                        let h_obj = &*(h.as_ptr() as *const TsObject);
+                        for (k, v) in &h_obj.properties {
+                            if k.starts_with("__") { continue; }
+                            let k_val = rust_str_to_val(k.clone());
+                            ts_map_set(headers_val, k_val, *v);
+                            ts_release_val(k_val);
+                        }
+                    }
+                }
+            }
+        } else if tag == 8 {
+            // Clone from another Response: copy status and headers
+            let src_resp = &*(init.as_ptr() as *const TsResponse);
+            status = src_resp.status;
+            // Copy headers
+            if src_resp.headers.is_ptr() && heap_tag(src_resp.headers) == 7 {
+                let src_map = &*(src_resp.headers.as_ptr() as *const TsMap);
+                let dst_map = &mut *(headers_val.as_ptr() as *mut TsMap);
+                for (k, v) in &src_map.entries {
+                    ts_retain_val(*k);
+                    ts_retain_val(*v);
+                    dst_map.entries.push((*k, *v));
+                }
+            }
+        }
+    }
+
+    // Retain body
+    ts_retain_val(body);
+
+    std::ptr::write(ptr, TsResponse { status, body, headers: headers_val });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// `response.clone()` — clone a Response.
+#[no_mangle]
+pub unsafe extern "C" fn ts_response_clone(resp_val: TsVal) -> TsVal {
+    if !resp_val.is_ptr() || heap_tag(resp_val) != 8 { return resp_val; }
+    let resp = &*(resp_val.as_ptr() as *const TsResponse);
+    ts_retain_val(resp.body);
+    ts_response_new(resp.body, resp_val)
+}
+
+// ── Module-level global variables ─────────────────────────────────────────────
+// Used to allow module-level const/let non-function declarations to be shared
+// across module-level functions that get lowered as separate MLIR functions.
+
+static mut MODULE_GLOBALS_MAP: *mut std::collections::HashMap<String, TsVal> = std::ptr::null_mut();
+
+unsafe fn ensure_module_globals() -> &'static mut std::collections::HashMap<String, TsVal> {
+    if MODULE_GLOBALS_MAP.is_null() {
+        MODULE_GLOBALS_MAP = Box::into_raw(Box::new(std::collections::HashMap::new()));
+    }
+    &mut *MODULE_GLOBALS_MAP
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_set_module_global(name_ptr: *const i8, val: TsVal) {
+    let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+    let map = ensure_module_globals();
+    ts_retain_val(val);
+    if let Some(old) = map.insert(name, val) {
+        ts_release_val(old);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_get_module_global(name_ptr: *const i8) -> TsVal {
+    let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+    let map = ensure_module_globals();
+    if let Some(&val) = map.get(&name) {
+        ts_retain_val(val);
+        val
+    } else {
+        UNDEFINED
+    }
+}
+
+/// `new Request(url, init?)` — create a Request-like TsObject with url/method/headers/body.
+#[no_mangle]
+pub unsafe extern "C" fn ts_request_new(url: TsVal, init: TsVal) -> TsVal {
+    let obj = ts_obj_new();
+    let url_key = b"url\0";
+    let method_key = b"method\0";
+    let headers_key = b"headers\0";
+    let body_key = b"body\0";
+    ts_obj_set(obj, url_key.as_ptr() as *const i8, url);
+    // Extract method/headers/body from init if it's an object
+    if init.is_ptr() && heap_tag(init) == 0 {
+        let method = ts_obj_get(init, method_key.as_ptr() as *const i8);
+        let headers = ts_obj_get(init, headers_key.as_ptr() as *const i8);
+        let body = ts_obj_get(init, body_key.as_ptr() as *const i8);
+        ts_obj_set(obj, method_key.as_ptr() as *const i8, method);
+        ts_obj_set(obj, headers_key.as_ptr() as *const i8, headers);
+        ts_obj_set(obj, body_key.as_ptr() as *const i8, body);
+        ts_release_val(method);
+        ts_release_val(headers);
+        ts_release_val(body);
+    } else {
+        let get_str = ts_string_new(b"GET\0".as_ptr() as *const i8);
+        ts_obj_set(obj, method_key.as_ptr() as *const i8, get_str);
+        ts_release_val(get_str);
+    }
+    obj
 }

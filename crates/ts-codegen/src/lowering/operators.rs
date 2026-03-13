@@ -19,6 +19,23 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             return self.lower_instanceof(binop, block, region, scope);
         }
 
+        // `key in obj` — uses ts_val_has_key(obj, key)
+        if binop.operator == BinaryOperator::In {
+            let (key_opt, nb) = self.lower_expression(&binop.left, block, region, scope)?;
+            block = nb;
+            let key = self.ensure_i64(key_opt.ok_or_else(|| anyhow::anyhow!("in: no key"))?, block)?;
+            let (obj_opt, nb) = self.lower_expression(&binop.right, block, region, scope)?;
+            block = nb;
+            let obj = self.ensure_i64(obj_opt.ok_or_else(|| anyhow::anyhow!("in: no obj"))?, block)?;
+            let res: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_has_key"),
+                &[obj, key], &[self.i64_type()], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[key], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj], &[], self.loc));
+            return Ok((Some(res), block));
+        }
+
         let (lhs_opt, nb) = self.lower_expression(&binop.left, block, region, scope)?;
         block = nb;
         let lhs = lhs_opt
@@ -246,17 +263,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             return self.lower_nullish_coalescing(logical, block, region, scope);
         }
 
+        // JS semantics: `a && b` returns `a` if falsy, else `b`.
+        //               `a || b` returns `a` if truthy, else `b`.
+        // So we return the actual i64 value, not a boolean i1.
+        let i64_type = self.i64_type();
+
         let (lhs_opt, nb) = self.lower_expression(&logical.left, block, region, scope)?;
         block = nb;
         let lhs = lhs_opt
             .ok_or_else(|| anyhow::anyhow!("logical op: no left value"))?;
-        let l = self.ensure_i1(lhs, block)?;
+        let lhs_i64 = self.ensure_i64(lhs, block)?;
+        let l = self.ensure_i1(lhs_i64, block)?;
 
-        let orig_scope = scope.clone();
-        let scope_keys: Vec<String> = orig_scope.keys().cloned().collect();
-        let mut merge_arg_types = vec![(self.i1_type(), self.loc)];
+        // Normalize all scope vars to i64 before creating merge block.
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
         for k in &scope_keys {
-            merge_arg_types.push((orig_scope[k].r#type(), self.loc));
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
+        let orig_scope = scope.clone();
+
+        // merge_block receives: (result_i64, ...scope_vals all i64)
+        let mut merge_arg_types = vec![(i64_type, self.loc)];
+        for _ in &scope_keys {
+            merge_arg_types.push((i64_type, self.loc));
         }
 
         let merge_block = region.append_block(Block::new(&merge_arg_types));
@@ -266,12 +296,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         match logical.operator {
             LogicalOperator::And => {
-                let mut false_args = vec![l];
+                // false → skip rhs, return lhs; true → evaluate rhs
+                let mut false_args = vec![lhs_i64];
                 false_args.extend(orig_vals.iter().copied());
                 block.append_operation(cf::cond_br(self.ctx, l, &rhs_block, &merge_block, &[], &false_args, self.loc));
             }
             LogicalOperator::Or => {
-                let mut true_args = vec![l];
+                // true → return lhs; false → evaluate rhs
+                let mut true_args = vec![lhs_i64];
                 true_args.extend(orig_vals.iter().copied());
                 block.append_operation(cf::cond_br(self.ctx, l, &merge_block, &rhs_block, &true_args, &[], self.loc));
             }
@@ -282,20 +314,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let (rhs_opt, nb) = self.lower_expression(&logical.right, rhs_block, region, &mut rhs_scope)?;
         let rhs_block = nb;
         let rhs = rhs_opt.ok_or_else(|| anyhow::anyhow!("logical op: no right value"))?;
-        let r = self.ensure_i1(rhs, rhs_block)?;
+        let rhs_i64 = self.ensure_i64(rhs, rhs_block)?;
 
-        let mut rhs_end_args = vec![r];
+        let mut rhs_end_args = vec![rhs_i64];
         for k in &scope_keys {
-            rhs_end_args.push(*rhs_scope.get(k).unwrap_or(&orig_scope[k]));
+            let v = *rhs_scope.get(k).unwrap_or(&orig_scope[k]);
+            let v64 = self.ensure_i64(v, rhs_block).unwrap_or(v);
+            rhs_end_args.push(v64);
         }
         rhs_block.append_operation(cf::br(&merge_block, &rhs_end_args, self.loc));
 
-        let res_i1 = merge_block.argument(0)?.into();
+        let result_i64: Value<'c, 'b> = merge_block.argument(0)?.into();
         for (i, k) in scope_keys.iter().enumerate() {
             scope.insert(k.clone(), merge_block.argument(i + 1)?.into());
         }
 
-        Ok((Some(res_i1), merge_block))
+        Ok((Some(result_i64), merge_block))
     }
 
     // ── Nullish coalescing (??) ────────────────────────────────────────────
@@ -323,13 +357,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         )).result(0)?.into();
         let is_null_i1 = self.ensure_i1(is_null, block)?;
 
-        let orig_scope = scope.clone();
-        let scope_keys: Vec<String> = orig_scope.keys().cloned().collect();
-
-        // merge_block: receives (i64 result, ...scope_vals)
-        let mut merge_arg_types = vec![(self.i64_type(), self.loc)];
+        // Normalize all scope vars to i64 before creating merge block.
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
         for k in &scope_keys {
-            merge_arg_types.push((orig_scope[k].r#type(), self.loc));
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
+        let orig_scope = scope.clone();
+
+        // merge_block: receives (i64 result, ...scope_vals all i64)
+        let mut merge_arg_types = vec![(self.i64_type(), self.loc)];
+        for _ in &scope_keys {
+            merge_arg_types.push((self.i64_type(), self.loc));
         }
         let merge_block = region.append_block(Block::new(&merge_arg_types));
         let rhs_block   = region.append_block(Block::new(&[]));
@@ -361,7 +400,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let mut rhs_args = vec![rhs_i64];
         for k in &scope_keys {
-            rhs_args.push(*rhs_scope.get(k).unwrap_or(&orig_scope[k]));
+            let v = *rhs_scope.get(k).unwrap_or(&orig_scope[k]);
+            let v64 = self.ensure_i64(v, rhs_block).unwrap_or(v);
+            rhs_args.push(v64);
         }
         rhs_block.append_operation(cf::br(&merge_block, &rhs_args, self.loc));
 
@@ -401,11 +442,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let alt_val = alt_val_opt
             .ok_or_else(|| anyhow::anyhow!("conditional ?: no alternate value"))?;
 
-        // Ensure both branches return the same type (i32).
-        let cons_i32 = self.ensure_i32(cons_val, block)?;
-        let alt_i32 = self.ensure_i32(alt_val, block)?;
+        // Ensure both branches return i64 (to preserve heap pointers and NaN-boxed values).
+        let cons_i64 = self.ensure_i64(cons_val, block)?;
+        let alt_i64 = self.ensure_i64(alt_val, block)?;
 
-        let op = arith::select(test_i1, cons_i32, alt_i32, self.loc);
+        let op = arith::select(test_i1, cons_i64, alt_i64, self.loc);
         Ok((Some(block.append_operation(op).result(0)?.into()), block))
     }
 
@@ -419,6 +460,49 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::UnaryOperator;
+        use oxc_ast::ast::Expression;
+
+        // `delete obj[key]` / `delete obj.prop` — special case: do not evaluate operand.
+        if unary.operator == UnaryOperator::Delete {
+            let i64t = self.i64_type();
+            let result = match &unary.argument {
+                Expression::ComputedMemberExpression(member) => {
+                    let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+                    block = nb;
+                    let (key_opt, nb) = self.lower_expression(&member.expression, block, region, scope)?;
+                    block = nb;
+                    let obj_i64 = self.ensure_i64(obj_opt.ok_or_else(|| anyhow::anyhow!("delete: obj no value"))?, block)?;
+                    let key_i64 = self.ensure_i64(key_opt.ok_or_else(|| anyhow::anyhow!("delete: key no value"))?, block)?;
+                    let r = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_delete_key"),
+                        &[obj_i64, key_i64], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[key_i64], &[], self.loc));
+                    r
+                }
+                Expression::StaticMemberExpression(member) => {
+                    let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+                    block = nb;
+                    let obj_i64 = self.ensure_i64(obj_opt.ok_or_else(|| anyhow::anyhow!("delete: obj no value"))?, block)?;
+                    let prop = member.property.name.as_str();
+                    let key_ptr = self.get_string_ptr(prop, block)?;
+                    let r = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_delete"),
+                        &[obj_i64, key_ptr], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                    r
+                }
+                _ => {
+                    // For anything else, just return true (delete always succeeds in non-strict mode).
+                    block.append_operation(arith::constant(
+                        self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0001u64 as i64).into(), self.loc,
+                    )).result(0)?.into()
+                }
+            };
+            return Ok((Some(result), block));
+        }
 
         let (operand_opt, nb) = self.lower_expression(&unary.argument, block, region, scope)?;
         block = nb;
@@ -547,6 +631,65 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             AssignmentTarget::PrivateFieldExpression(m) => {
                 return self.lower_logical_assignment_private(m, assign.operator, &assign.right, block, region, scope);
             }
+            AssignmentTarget::ComputedMemberExpression(m) => {
+                // `obj[key] ??= val` / `obj[key] ||= val` / `obj[key] &&= val`
+                use oxc_ast::ast::AssignmentOperator;
+                let (obj_opt, nb) = self.lower_expression(&m.object, block, region, scope)?;
+                block = nb;
+                let obj_i64 = self.ensure_i64(obj_opt.ok_or_else(|| anyhow::anyhow!("computed ??=: no object"))?, block)?;
+                let (key_opt, nb) = self.lower_expression(&m.expression, block, region, scope)?;
+                block = nb;
+                let key_i64 = self.ensure_i64(key_opt.ok_or_else(|| anyhow::anyhow!("computed ??=: no key"))?, block)?;
+                let i64t = self.i64_type();
+                let i32t = self.i32_type();
+                // Current value: ts_val_get_key(obj, key)
+                let current: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_get_key"),
+                    &[obj_i64, key_i64], &[i64t], self.loc,
+                )).result(0)?.into();
+                // Check condition.
+                let cond_i32: Value<'c, 'b> = match assign.operator {
+                    AssignmentOperator::LogicalNullish => block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_nullish"),
+                        &[current], &[i32t], self.loc,
+                    )).result(0)?.into(),
+                    AssignmentOperator::LogicalOr => {
+                        let t = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                            &[current], &[i32t], self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_not"),
+                            &[t], &[i32t], self.loc,
+                        )).result(0)?.into()
+                    }
+                    AssignmentOperator::LogicalAnd => block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                        &[current], &[i32t], self.loc,
+                    )).result(0)?.into(),
+                    _ => unreachable!(),
+                };
+                let cond_i1 = self.ensure_i1(cond_i32, block)?;
+                let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
+                let assign_block = region.append_block(Block::new(&[]));
+                block.append_operation(cf::cond_br(
+                    self.ctx, cond_i1, &assign_block, &merge_block, &[], &[current], self.loc,
+                ));
+                // assign_block: evaluate RHS, store in obj[key].
+                let mut assign_scope = scope.clone();
+                let (rhs_opt, rhs_end) = self.lower_expression(&assign.right, assign_block, region, &mut assign_scope)?;
+                let rhs_i64 = self.ensure_i64(rhs_opt.ok_or_else(|| anyhow::anyhow!("computed ??= rhs no val"))?, rhs_end)?;
+                rhs_end.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set_val_key"),
+                    &[obj_i64, key_i64, rhs_i64], &[], self.loc,
+                ));
+                rhs_end.append_operation(cf::br(&merge_block, &[rhs_i64], self.loc));
+                block = merge_block;
+                let result: Value<'c, 'b> = merge_block.argument(0)?.into();
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[key_i64], &[], self.loc));
+                return Ok((Some(result), block));
+            }
             _ => {}
         }
 
@@ -638,8 +781,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let rhs_i64 = self.ensure_i64(rhs_val, rhs_block)?;
 
         let mut rhs_args = vec![rhs_i64];
-        for k in &other_keys {
-            rhs_args.push(*rhs_scope.get(k).unwrap_or(&orig_scope[k]));
+        for (i, k) in other_keys.iter().enumerate() {
+            let v = *rhs_scope.get(k).unwrap_or(&orig_scope[k]);
+            let ty = merge_arg_types[i + 1].0;
+            let coerced = self.coerce_val_to_type(v, ty, rhs_block).unwrap_or(v);
+            rhs_args.push(coerced);
         }
         rhs_block.append_operation(cf::br(&merge_block, &rhs_args, self.loc));
 
@@ -834,9 +980,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::AssignmentOperator;
-        if operator != AssignmentOperator::Assign {
-            bail!("compound assignment to computed member expressions is not supported yet");
-        }
         let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
         block = nb;
         let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("computed assignment: object produced no value"))?;
@@ -846,14 +989,35 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block = nb;
         let idx = idx_opt.ok_or_else(|| anyhow::anyhow!("computed assignment: index produced no value"))?;
         let idx_i64 = self.ensure_i64(idx, block)?;
-        let val_i64 = self.ensure_i64(rhs, block)?;
+
+        let new_val: Value<'c, 'b> = if operator == AssignmentOperator::Assign {
+            self.ensure_i64(rhs, block)?
+        } else {
+            // Read current value
+            let cur: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_get_key"),
+                &[obj_i64, idx_i64], &[self.i64_type()], self.loc,
+            )).result(0)?.into();
+            let lhs_i32 = self.ensure_i32(cur, block)?;
+            let rhs_i32 = self.ensure_i32(rhs, block)?;
+            let res_i32: Value<'c, 'b> = match operator {
+                AssignmentOperator::Addition       => block.append_operation(arith::addi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Subtraction    => block.append_operation(arith::subi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Multiplication => block.append_operation(arith::muli(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Division       => block.append_operation(arith::divsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Remainder      => block.append_operation(arith::remsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                _ => bail!("unsupported compound assignment operator on computed member"),
+            };
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[cur], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[self.ensure_i64(rhs, block)?], &[], self.loc));
+            self.ensure_i64(res_i32, block)?
+        };
 
         // Use ts_obj_set_val_key for dynamic key access (works for both string and integer keys).
-        // This handles `obj[strKey] = val` (Hono's `this[method] = fn`) correctly.
         block.append_operation(func::call(
             self.ctx,
             FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set_val_key"),
-            &[obj_i64, idx_i64, val_i64],
+            &[obj_i64, idx_i64, new_val],
             &[],
             self.loc,
         ));
@@ -861,7 +1025,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[idx_i64], &[], self.loc));
 
-        Ok((Some(rhs), block))
+        Ok((Some(new_val), block))
     }
 
     fn lower_private_field_assignment<'b>(

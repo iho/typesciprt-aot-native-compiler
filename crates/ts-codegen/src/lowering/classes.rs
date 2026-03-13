@@ -7,12 +7,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let Some(id) = &class.id else { return Ok(()) };
         let class_name = id.name.to_string();
 
+        // Guard against duplicate class lowering (can happen with transitive imports).
+        if self.lowered_classes.contains(&class_name) {
+            return Ok(());
+        }
+        self.lowered_classes.insert(class_name.clone());
+
         self.current_class = Some(class_name.clone());
 
         self.lower_class_constructor(&class_name, class)?;
 
         for elem in &class.body.body {
             let ClassElement::MethodDefinition(method) = elem else { continue };
+            // Skip overload signatures (TypeScript overloads have no body).
+            if method.value.body.is_none() { continue; }
             match (method.kind, method.r#static) {
                 (MethodDefinitionKind::Constructor, _) => {}
                 (MethodDefinitionKind::Get, false) => {
@@ -97,9 +105,48 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Create `this`
         // - No parent:              allocate a fresh object.
+        // - Parent is a built-in error type: call ts_error_new(message) using super() args.
         // - Parent + explicit super(): call parent ctor with those args.
         // - Parent + no super():    call parent ctor with no args.
-        let this_val: Value<'_, '_> = if let Some(ref parent_ctor) = parent_ctor_name {
+        let builtin_error_parents = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError"];
+        let parent_is_builtin_error = parent_name.as_deref()
+            .map(|n| builtin_error_parents.contains(&n))
+            .unwrap_or(false);
+
+        let this_val: Value<'_, '_> = if parent_is_builtin_error {
+            // For built-in error parents: create via ts_error_new(first_super_arg).
+            let undef_i64: Value<'_, '_> = current.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                self.loc,
+            )).result(0)?.into();
+            let msg_arg = if let Some(idx) = super_call_index {
+                let ctor_body = constructor.unwrap().value.body.as_ref().unwrap();
+                if let Statement::ExpressionStatement(es) = &ctor_body.statements[idx] {
+                    if let Expression::CallExpression(call) = &es.expression {
+                        if let Some(first_arg) = call.arguments.first() {
+                            if let Some(expr) = first_arg.as_expression() {
+                                let (v_opt, nb) = self.lower_expression(expr, current, &region, &mut scope)?;
+                                current = nb;
+                                v_opt.map(|v| self.ensure_i64(v, current)).transpose()?.unwrap_or(undef_i64)
+                            } else { undef_i64 }
+                        } else { undef_i64 }
+                    } else { undef_i64 }
+                } else { undef_i64 }
+            } else { undef_i64 };
+            let err_val: Value<'_, '_> = current.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_error_new"),
+                &[msg_arg],
+                &[i64_type],
+                self.loc,
+            )).result(0)?.into();
+            current.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[msg_arg], &[], self.loc,
+            ));
+            err_val
+        } else if let Some(ref parent_ctor) = parent_ctor_name {
             // Extract super() argument expressions (references into the AST).
             let mut call_args: Vec<Value<'_, '_>> = Vec::new();
 
