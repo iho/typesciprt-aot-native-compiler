@@ -7,7 +7,17 @@ pub unsafe extern "C" fn ts_func_new(fn_ptr: *const u8, arity: i32) -> TsVal {
     let size = std::mem::size_of::<TsFunction>();
     let ptr = crate::alloc::ts_alloc_rc(size, 4) as *mut TsFunction; // tag 4 = Function
     if ptr.is_null() { return NULL; }
-    std::ptr::write(ptr, TsFunction { fn_ptr, arity: arity as u8, env: UNDEFINED });
+    std::ptr::write(ptr, TsFunction { fn_ptr, arity: arity as u8, has_this: 0, has_rest: 0, env: UNDEFINED });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// Create a non-closure function that expects `this` as its first MLIR parameter.
+#[no_mangle]
+pub unsafe extern "C" fn ts_func_new_this(fn_ptr: *const u8, arity: i32) -> TsVal {
+    let size = std::mem::size_of::<TsFunction>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 4) as *mut TsFunction;
+    if ptr.is_null() { return NULL; }
+    std::ptr::write(ptr, TsFunction { fn_ptr, arity: arity as u8, has_this: 1, has_rest: 0, env: UNDEFINED });
     TsVal::from_ptr(ptr as *mut u8)
 }
 
@@ -18,7 +28,19 @@ pub unsafe extern "C" fn ts_closure_new(fn_ptr: *const u8, arity: i32, env: TsVa
     let ptr = crate::alloc::ts_alloc_rc(size, 4) as *mut TsFunction;
     if ptr.is_null() { return NULL; }
     ts_retain_val(env);
-    std::ptr::write(ptr, TsFunction { fn_ptr, arity: arity as u8, env });
+    std::ptr::write(ptr, TsFunction { fn_ptr, arity: arity as u8, has_this: 0, has_rest: 0, env });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// Create a closure with a rest parameter: last MLIR param is a TsArray for excess args.
+/// When called dynamically, args beyond `arity-1` are bundled into a TsArray.
+#[no_mangle]
+pub unsafe extern "C" fn ts_closure_new_rest(fn_ptr: *const u8, arity: i32, env: TsVal) -> TsVal {
+    let size = std::mem::size_of::<TsFunction>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 4) as *mut TsFunction;
+    if ptr.is_null() { return NULL; }
+    ts_retain_val(env);
+    std::ptr::write(ptr, TsFunction { fn_ptr, arity: arity as u8, has_this: 0, has_rest: 1, env });
     TsVal::from_ptr(ptr as *mut u8)
 }
 
@@ -39,25 +61,105 @@ pub unsafe extern "C" fn ts_closure_get_env(fn_val: TsVal) -> TsVal {
     func.env
 }
 
+/// Dispatch helper for when has_rest=1: args before rest_start are regular, rest_arr is the bundled rest.
+unsafe fn dispatch_callback_with_rest(
+    func: &TsFunction,
+    is_closure: bool,
+    env: TsVal,
+    args: &[TsVal],
+    rest_start: usize,
+    rest_arr: TsVal,
+) -> TsVal {
+    let a0 = args.first().copied().unwrap_or(UNDEFINED);
+    let a1 = args.get(1).copied().unwrap_or(UNDEFINED);
+    eprintln!("[DEBUG] dispatch_callback_with_rest: is_closure={}, rest_start={}, fn_ptr={:?}", is_closure, rest_start, func.fn_ptr);
+    // arity = rest_start + 1. The last param is rest_arr.
+    if is_closure {
+        match rest_start {
+            0 => {
+                eprintln!("[DEBUG] calling f(env, rest_arr)");
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                let r = f(env, rest_arr);
+                eprintln!("[DEBUG] f(env, rest_arr) returned");
+                r
+            }
+            1 => {
+                eprintln!("[DEBUG] calling f(env, a0, rest_arr) a0={:x} rest_arr={:x}", a0.0, rest_arr.0);
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                let r = f(env, a0, rest_arr);
+                eprintln!("[DEBUG] f(env, a0, rest_arr) returned");
+                r
+            }
+            _ => {
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                f(env, a0, a1, rest_arr)
+            }
+        }
+    } else {
+        match rest_start {
+            0 => {
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal) -> TsVal>(func.fn_ptr);
+                f(rest_arr)
+            }
+            1 => {
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                f(a0, rest_arr)
+            }
+            _ => {
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                f(a0, a1, rest_arr)
+            }
+        }
+    }
+}
+
+/// Bundle args from index `start` onwards into a TsArray for rest parameter dispatch.
+unsafe fn make_rest_array(args: &[TsVal], start: usize) -> TsVal {
+    use super::array::{ts_arr_new, ts_arr_set};
+    let count = if args.len() > start { args.len() - start } else { 0 };
+    let arr = ts_arr_new(count as i32);
+    for (i, &v) in args[start..].iter().enumerate() {
+        ts_arr_set(arr, i as i32, v);
+    }
+    arr
+}
+
 /// Internal: call a TsFunction value with up to 4 TsVal arguments.
 /// If the function is a closure (env ≠ UNDEFINED), passes env as the first arg.
+/// If has_rest=1, args from index arity-1 are bundled into a TsArray for the last param.
 pub(super) unsafe fn dispatch_callback(fn_val: TsVal, args: &[TsVal]) -> TsVal {
     if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
     let func = &*(fn_val.as_ptr() as *const TsFunction);
     let is_closure = !func.env.is_undefined();
     let env = func.env;
+
+    // When has_rest=1, bundle args from index (arity-1) into a TsArray for the rest param.
+    if func.has_rest != 0 {
+        let rest_start = (func.arity as usize).saturating_sub(1);
+        eprintln!("[DEBUG] dispatch_callback: has_rest=1, arity={}, rest_start={}, args.len()={}, is_closure={}", func.arity, rest_start, args.len(), is_closure);
+        let rest_arr = make_rest_array(args, rest_start);
+        eprintln!("[DEBUG] dispatch_callback: rest_arr created, calling dispatch_callback_with_rest");
+        let result = dispatch_callback_with_rest(func, is_closure, env, args, rest_start, rest_arr);
+        eprintln!("[DEBUG] dispatch_callback: dispatch_callback_with_rest returned");
+        ts_release_val(rest_arr);
+        return result;
+    }
+
     let a0 = args.first().copied().unwrap_or(UNDEFINED);
     let a1 = args.get(1).copied().unwrap_or(UNDEFINED);
     let a2 = args.get(2).copied().unwrap_or(UNDEFINED);
     let a3 = args.get(3).copied().unwrap_or(UNDEFINED);
+    eprintln!("[DEBUG] dispatch_callback: no_rest arity={} is_closure={} fn_ptr={:p}", func.arity, is_closure, func.fn_ptr);
     if is_closure {
         // fn(env, arg0, arg1, ...) — env is always first
         match func.arity {
             0 => {
+                eprintln!("[DEBUG] dispatch_callback: calling closure(env) arity=0");
                 let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal) -> TsVal>(func.fn_ptr);
                 f(env)
             }
             1 => {
+                eprintln!("[DEBUG] dispatch_callback: calling closure(env, a0) arity=1 a0={:016x}", a0.0);
                 let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal) -> TsVal>(func.fn_ptr);
                 f(env, a0)
             }
@@ -123,4 +225,120 @@ pub unsafe extern "C" fn ts_func_call3(fn_val: TsVal, a: TsVal, b: TsVal, c: TsV
 #[no_mangle]
 pub unsafe extern "C" fn ts_func_call4(fn_val: TsVal, a: TsVal, b: TsVal, c: TsVal, d: TsVal) -> TsVal {
     dispatch_callback(fn_val, &[a, b, c, d])
+}
+
+/// Call a function that has `has_this=1` with an explicit `this` value and args.
+pub(super) unsafe fn dispatch_method_callback(fn_val: TsVal, this_val: TsVal, args: &[TsVal]) -> TsVal {
+    if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
+    let func = &*(fn_val.as_ptr() as *const TsFunction);
+
+    // When has_rest=1, bundle args from index (arity-1) into a TsArray (arity includes this).
+    if func.has_rest != 0 {
+        let rest_start = (func.arity as usize).saturating_sub(1);
+        let rest_arr = make_rest_array(args, rest_start);
+        let a0 = this_val;
+        let a1 = args.first().copied().unwrap_or(UNDEFINED);
+        let a2 = args.get(1).copied().unwrap_or(UNDEFINED);
+        let result = match rest_start {
+            0 => {
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                f(a0, rest_arr)
+            }
+            1 => {
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                f(a0, a1, rest_arr)
+            }
+            _ => {
+                let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+                f(a0, a1, a2, rest_arr)
+            }
+        };
+        ts_release_val(rest_arr);
+        return result;
+    }
+
+    let a0 = this_val;
+    let a1 = args.first().copied().unwrap_or(UNDEFINED);
+    let a2 = args.get(1).copied().unwrap_or(UNDEFINED);
+    let a3 = args.get(2).copied().unwrap_or(UNDEFINED);
+    let a4 = args.get(3).copied().unwrap_or(UNDEFINED);
+    // non-closure function with this as first param
+    match func.arity {
+        0 => {
+            let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal) -> TsVal>(func.fn_ptr);
+            f(a0)
+        }
+        1 => {
+            let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal) -> TsVal>(func.fn_ptr);
+            f(a0, a1)
+        }
+        2 => {
+            let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+            f(a0, a1, a2)
+        }
+        3 => {
+            let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+            f(a0, a1, a2, a3)
+        }
+        _ => {
+            let f = std::mem::transmute::<*const u8, unsafe extern "C" fn(TsVal, TsVal, TsVal, TsVal, TsVal) -> TsVal>(func.fn_ptr);
+            f(a0, a1, a2, a3, a4)
+        }
+    }
+}
+
+/// Call a member function with the receiver as `this`. Checks `has_this` to decide dispatch path.
+#[no_mangle]
+pub unsafe extern "C" fn ts_method_call0(fn_val: TsVal, obj: TsVal) -> TsVal {
+    if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
+    let has_this = (*(fn_val.as_ptr() as *const TsFunction)).has_this;
+    if has_this != 0 {
+        dispatch_method_callback(fn_val, obj, &[])
+    } else {
+        dispatch_callback(fn_val, &[])
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_method_call1(fn_val: TsVal, obj: TsVal, a: TsVal) -> TsVal {
+    if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
+    let has_this = (*(fn_val.as_ptr() as *const TsFunction)).has_this;
+    if has_this != 0 {
+        dispatch_method_callback(fn_val, obj, &[a])
+    } else {
+        dispatch_callback(fn_val, &[a])
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_method_call2(fn_val: TsVal, obj: TsVal, a: TsVal, b: TsVal) -> TsVal {
+    if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
+    let has_this = (*(fn_val.as_ptr() as *const TsFunction)).has_this;
+    if has_this != 0 {
+        dispatch_method_callback(fn_val, obj, &[a, b])
+    } else {
+        dispatch_callback(fn_val, &[a, b])
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_method_call3(fn_val: TsVal, obj: TsVal, a: TsVal, b: TsVal, c: TsVal) -> TsVal {
+    if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
+    let has_this = (*(fn_val.as_ptr() as *const TsFunction)).has_this;
+    if has_this != 0 {
+        dispatch_method_callback(fn_val, obj, &[a, b, c])
+    } else {
+        dispatch_callback(fn_val, &[a, b, c])
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_method_call4(fn_val: TsVal, obj: TsVal, a: TsVal, b: TsVal, c: TsVal, d: TsVal) -> TsVal {
+    if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
+    let has_this = (*(fn_val.as_ptr() as *const TsFunction)).has_this;
+    if has_this != 0 {
+        dispatch_method_callback(fn_val, obj, &[a, b, c, d])
+    } else {
+        dispatch_callback(fn_val, &[a, b, c, d])
+    }
 }

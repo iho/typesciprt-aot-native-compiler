@@ -3,7 +3,7 @@
 use super::{TsVal, TsString, UNDEFINED, NULL, TRUE, FALSE, TAG_MASK, TAG_UNDEFINED, TAG_NULL, TAG_BOOL, TAG_INT, TAG_PTR, heap_tag, ts_release_val};
 use super::string_val::{ts_string_new, ts_val_to_string, ts_string_concat};
 use super::array::ts_arr_get;
-use super::func::dispatch_callback;
+use super::func::{dispatch_callback, dispatch_method_callback};
 use super::array::ts_val_is_truthy;
 
 // ── Numeric helpers ───────────────────────────────────────────────────────────
@@ -154,9 +154,10 @@ pub unsafe extern "C" fn ts_typeof(val: TsVal) -> TsVal {
             TAG_BOOL      => b"boolean\0",
             TAG_INT       => b"number\0",
             TAG_PTR       => match heap_tag(val) {
-                2 => b"string\0",
-                4 => b"function\0",
-                _ => b"object\0",
+                2  => b"string\0",
+                4  => b"function\0",
+                10 => b"symbol\0",
+                _  => b"object\0",
             },
             _ => b"undefined\0",
         }
@@ -377,6 +378,67 @@ pub unsafe extern "C" fn ts_func_spread_call(fn_val: TsVal, args_arr: TsVal) -> 
             ts_release_val(a1);
             ts_release_val(a2);
             ts_release_val(a3);
+            r
+        }
+    }
+}
+
+/// Call a method (with `this`) with arguments spread from a TsArray.
+#[no_mangle]
+pub unsafe extern "C" fn ts_method_spread_call(fn_val: TsVal, obj: TsVal, args_arr: TsVal) -> TsVal {
+    let len = if args_arr.is_ptr() && heap_tag(args_arr) == 1 {
+        use super::TsArray;
+        (*(args_arr.as_ptr() as *const TsArray)).elements.len()
+    } else {
+        0
+    };
+    match len {
+        0 => dispatch_method_callback(fn_val, obj, &[]),
+        1 => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let r = dispatch_method_callback(fn_val, obj, &[a0]);
+            ts_release_val(a0);
+            r
+        }
+        2 => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let a1 = ts_arr_get(args_arr, 1);
+            let r = dispatch_method_callback(fn_val, obj, &[a0, a1]);
+            ts_release_val(a0);
+            ts_release_val(a1);
+            r
+        }
+        3 => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let a1 = ts_arr_get(args_arr, 1);
+            let a2 = ts_arr_get(args_arr, 2);
+            let r = dispatch_method_callback(fn_val, obj, &[a0, a1, a2]);
+            ts_release_val(a0);
+            ts_release_val(a1);
+            ts_release_val(a2);
+            r
+        }
+        4 => {
+            let a0 = ts_arr_get(args_arr, 0);
+            let a1 = ts_arr_get(args_arr, 1);
+            let a2 = ts_arr_get(args_arr, 2);
+            let a3 = ts_arr_get(args_arr, 3);
+            let r = dispatch_method_callback(fn_val, obj, &[a0, a1, a2, a3]);
+            ts_release_val(a0);
+            ts_release_val(a1);
+            ts_release_val(a2);
+            ts_release_val(a3);
+            r
+        }
+        _ => {
+            let mut args_vec = Vec::with_capacity(len);
+            for i in 0..len {
+                args_vec.push(ts_arr_get(args_arr, i as i32));
+            }
+            let r = dispatch_method_callback(fn_val, obj, &args_vec);
+            for a in &args_vec {
+                ts_release_val(*a);
+            }
             r
         }
     }

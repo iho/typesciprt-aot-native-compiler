@@ -31,3 +31,4 @@ pub unsafe extern "C" fn ts_get_module_global(name_ptr: *const i8) -> TsVal {
         UNDEFINED
     }
 }
+

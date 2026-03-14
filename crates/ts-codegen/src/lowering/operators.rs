@@ -561,11 +561,84 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     pub(super) fn lower_update_expression<'b>(
         &mut self,
         update: &oxc_ast::ast::UpdateExpression<'_>,
-        block: BlockRef<'c, 'b>,
+        mut block: BlockRef<'c, 'b>,
         _region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::UpdateOperator;
+
+        // Handle member expression updates: obj.prop++ / obj.#prop++
+        match &update.argument {
+            oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                let (obj_opt, nb) = self.lower_expression(&m.object, block, _region, scope)?;
+                block = nb;
+                let obj_val = obj_opt.ok_or_else(|| anyhow::anyhow!("update member: object produced no value"))?;
+                let obj_i64 = self.ensure_i64(obj_val, block)?;
+                let key_ptr = self.get_string_ptr(m.property.name.as_str(), block)?;
+                let i64t = self.i64_type();
+                // Load old value
+                let old_i64: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                    &[obj_i64, key_ptr], &[i64t], self.loc,
+                )).result(0)?.into();
+                // Compute new value
+                let old_i32 = self.ensure_i32(old_i64, block)?;
+                let one = self.lower_numeric_literal(1, block)?;
+                let new_i32: Value<'c, 'b> = match update.operator {
+                    UpdateOperator::Increment => block.append_operation(arith::addi(old_i32, one, self.loc)).result(0)?.into(),
+                    UpdateOperator::Decrement => block.append_operation(arith::subi(old_i32, one, self.loc)).result(0)?.into(),
+                };
+                let new_i64 = self.ensure_i64(new_i32, block)?;
+                // Store new value
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                    &[obj_i64, key_ptr, new_i64], &[], self.loc,
+                ));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                if update.prefix {
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[new_i64], &[], self.loc));
+                    return Ok((Some(new_i64), block));
+                } else {
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[new_i64], &[], self.loc));
+                    return Ok((Some(old_i64), block));
+                }
+            }
+            oxc_ast::ast::SimpleAssignmentTarget::PrivateFieldExpression(m) => {
+                let (obj_opt, nb) = self.lower_expression(&m.object, block, _region, scope)?;
+                block = nb;
+                let obj_val = obj_opt.ok_or_else(|| anyhow::anyhow!("update private field: object produced no value"))?;
+                let obj_i64 = self.ensure_i64(obj_val, block)?;
+                let key_name = format!("__priv_{}", m.field.name.as_str());
+                let key_ptr = self.get_string_ptr(&key_name, block)?;
+                let i64t = self.i64_type();
+                let old_i64: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                    &[obj_i64, key_ptr], &[i64t], self.loc,
+                )).result(0)?.into();
+                let old_i32 = self.ensure_i32(old_i64, block)?;
+                let one = self.lower_numeric_literal(1, block)?;
+                let new_i32: Value<'c, 'b> = match update.operator {
+                    UpdateOperator::Increment => block.append_operation(arith::addi(old_i32, one, self.loc)).result(0)?.into(),
+                    UpdateOperator::Decrement => block.append_operation(arith::subi(old_i32, one, self.loc)).result(0)?.into(),
+                };
+                let new_i64 = self.ensure_i64(new_i32, block)?;
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                    &[obj_i64, key_ptr, new_i64], &[], self.loc,
+                ));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                if update.prefix {
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[new_i64], &[], self.loc));
+                    return Ok((Some(new_i64), block));
+                } else {
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[new_i64], &[], self.loc));
+                    return Ok((Some(old_i64), block));
+                }
+            }
+            _ => {}
+        }
 
         let id = match &update.argument {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id,
@@ -576,8 +649,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let old_val = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
         let old_i64 = self.ensure_i64(old_val, block)?;
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[old_i64], &[], self.loc));
-        
-        
+
+
         let old_val_i32 = self.ensure_i32(old_val, block)?;
         let one = self.lower_numeric_literal(1, block)?;
 
@@ -591,7 +664,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
              let v_i64 = self.ensure_i64(v, block)?;
              block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[v_i64], &[], self.loc));
         }
-        
+
         // Box new value and store in scope.
         let new_val_boxed = self.ensure_i64(new_val_i32, block)?;
         scope.insert(name.clone(), new_val_boxed);
@@ -599,11 +672,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         if update.prefix {
             // ARC: Return owned new_val.
             block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[new_val_boxed], &[], self.loc));
-            
+
             // Cleanup: release old_val (from lower_expression)
             let old_i64 = self.ensure_i64(old_val, block)?;
             block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
-            
+
             Ok((Some(new_val_boxed), block))
         } else {
             // Postfix: return owned old_val.

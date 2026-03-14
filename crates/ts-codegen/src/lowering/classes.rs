@@ -3,45 +3,125 @@ use super::*;
 impl<'c, 'm> Lowerer<'c, 'm> {
     // ── Class declarations ────────────────────────────────────────────────
 
-    pub(super) fn lower_class_declaration(&mut self, class: &Class<'_>) -> Result<()> {
-        let Some(id) = &class.id else { return Ok(()) };
-        let class_name = id.name.to_string();
-
-        // Guard against duplicate class lowering (can happen with transitive imports).
-        if self.lowered_classes.contains(&class_name) {
+    pub(super) fn lower_class_declaration_with_name(&mut self, class_name: &str, class: &Class<'_>) -> Result<()> {
+        if self.lowered_classes.contains(class_name) {
             return Ok(());
         }
-        self.lowered_classes.insert(class_name.clone());
+        self.lowered_classes.insert(class_name.to_string());
 
-        self.current_class = Some(class_name.clone());
+        // If the class is exported under an alias (e.g. `class Hono` → exported as `HonoBase`),
+        // register a scoped mapping so that `new Hono(...)` inside the class body resolves correctly.
+        // The mapping is removed after the class is fully lowered so it doesn't bleed into other files.
+        let scoped_alias: Option<String> = if let Some(id) = &class.id {
+            let original_name = id.name.to_string();
+            if original_name != class_name {
+                self.class_name_aliases.insert(original_name.clone(), class_name.to_string());
+                Some(original_name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        self.lower_class_constructor(&class_name, class)?;
+        // Register in self.classes if not already present (needed for method dispatch)
+        if !self.classes.contains_key(class_name) {
+            let parent = class.super_class.as_ref().and_then(|e| {
+                if let Expression::Identifier(id) = e { Some(id.name.to_string()) } else { None }
+            });
+            let mut methods: HashMap<String, String> = HashMap::new();
+            let mut statics: HashMap<String, String> = HashMap::new();
+            let mut getters: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut setters: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for elem in &class.body.body {
+                let ClassElement::MethodDefinition(method) = elem else { continue };
+                if method.value.body.is_none() { continue; }
+                let name_opt: Option<String> = match &method.key {
+                    oxc_ast::ast::PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                    oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => Some(format!("__priv_{}", id.name.as_str())),
+                    _ => method.key.static_name().map(|n| n.to_string()),
+                };
+                let Some(mname) = name_opt else { continue };
+                match (method.kind, method.r#static) {
+                    (MethodDefinitionKind::Get, false) => { getters.insert(mname); }
+                    (MethodDefinitionKind::Set, false) => { setters.insert(mname); }
+                    (MethodDefinitionKind::Method, true) => { statics.insert(mname.clone(), format!("__class_{}_{}", class_name, mname)); }
+                    (MethodDefinitionKind::Method, false) => { methods.insert(mname.clone(), format!("__class_{}_{}", class_name, mname)); }
+                    _ => {}
+                }
+            }
+            // Inherit from parent
+            let parent_sig = parent.as_ref().and_then(|p| self.classes.get(p)).cloned();
+            if let Some(psig) = parent_sig {
+                for (k, v) in &psig.methods { methods.entry(k.clone()).or_insert_with(|| v.clone()); }
+                for (k, v) in &psig.statics { statics.entry(k.clone()).or_insert_with(|| v.clone()); }
+                for k in &psig.getters { getters.insert(k.clone()); }
+                for k in &psig.setters { setters.insert(k.clone()); }
+            }
+            self.classes.insert(class_name.to_string(), ClassSig {
+                constructor_name: format!("__class_{}_constructor", class_name),
+                methods,
+                statics,
+                getters,
+                setters,
+                parent,
+            });
+        }
 
+        self.current_class = Some(class_name.to_string());
+
+        // Pre-register all class methods in self.funcs BEFORE lowering the constructor.
+        // This is needed so that field initializer arrow functions (e.g. `fetch = (req) => this.#dispatch(...)`)
+        // can resolve `this.#method()` as a direct function call instead of a dynamic property lookup.
+        let i64_type = self.i64_type();
         for elem in &class.body.body {
             let ClassElement::MethodDefinition(method) = elem else { continue };
-            // Skip overload signatures (TypeScript overloads have no body).
             if method.value.body.is_none() { continue; }
-            match (method.kind, method.r#static) {
-                (MethodDefinitionKind::Constructor, _) => {}
-                (MethodDefinitionKind::Get, false) => {
-                    self.lower_class_getter(&class_name, method)?;
-                }
-                (MethodDefinitionKind::Set, false) => {
-                    self.lower_class_setter(&class_name, method)?;
-                }
-                (MethodDefinitionKind::Method, true) => {
-                    self.lower_class_static_method(&class_name, method)?;
-                }
-                (MethodDefinitionKind::Method, false) => {
-                    self.lower_class_method(&class_name, method)?;
-                }
-                _ => {}
+            let mname_opt: Option<String> = match &method.key {
+                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                oxc_ast::ast::PropertyKey::PrivateIdentifier(id) => Some(format!("__priv_{}", id.name.as_str())),
+                _ => method.key.static_name().map(|n| n.to_string()),
+            };
+            let Some(mname) = mname_opt else { continue };
+            let func_name = format!("__class_{}_{}", class_name, mname);
+            let n_params = method.value.params.items.len();
+            let all_params = 1 + n_params; // +1 for `this`
+            if !self.funcs.contains_key(&func_name) {
+                self.funcs.insert(func_name, FuncSig {
+                    param_types: vec![i64_type; all_params],
+                    return_type: Some(i64_type),
+                    has_rest: method.value.params.rest.is_some(),
+                    has_this_param: false,
+                });
             }
         }
 
+        self.lower_class_constructor(class_name, class)?;
+        for elem in &class.body.body {
+            let ClassElement::MethodDefinition(method) = elem else { continue };
+            if method.value.body.is_none() { continue; }
+            match (method.kind, method.r#static) {
+                (MethodDefinitionKind::Constructor, _) => {}
+                (MethodDefinitionKind::Get, false) => { self.lower_class_getter(class_name, method)?; }
+                (MethodDefinitionKind::Set, false) => { self.lower_class_setter(class_name, method)?; }
+                (MethodDefinitionKind::Method, true) => { self.lower_class_static_method(class_name, method)?; }
+                (MethodDefinitionKind::Method, false) => { self.lower_class_method(class_name, method)?; }
+                _ => {}
+            }
+        }
         self.current_class = None;
         self.var_class_types.remove("this");
+        // Remove the scoped alias now that the class body is fully lowered.
+        if let Some(original_name) = scoped_alias {
+            self.class_name_aliases.remove(&original_name);
+        }
         Ok(())
+    }
+
+    pub(super) fn lower_class_declaration(&mut self, class: &Class<'_>) -> Result<()> {
+        let Some(id) = &class.id else { return Ok(()) };
+        let class_name = id.name.to_string();
+        self.lower_class_declaration_with_name(&class_name, class)
     }
 
     // ── Constructor ───────────────────────────────────────────────────────
@@ -65,7 +145,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let parent_ctor_name: Option<String> =
             parent_name.as_deref().map(|n| format!("__class_{}_constructor", n));
 
-        let n_params = constructor.map_or(0, |c| c.value.params.items.len());
+        // For error subclasses with no explicit constructor, add an implicit message param.
+        let builtin_error_names = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError"];
+        let implicit_error_param = constructor.is_none()
+            && parent_name.as_deref().map(|n| builtin_error_names.contains(&n)).unwrap_or(false);
+        let n_params = constructor.map_or(0, |c| c.value.params.items.len())
+            + if implicit_error_param { 1 } else { 0 };
         let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
             (0..n_params).map(|_| (i64_type, self.loc)).collect();
         let func_type = FunctionType::new(self.ctx, &vec![i64_type; n_params], &[i64_type]);
@@ -81,6 +166,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     scope.insert(id.name.to_string(), entry.argument(i)?.into());
                 }
             }
+        }
+        // For implicit error param (no explicit constructor, extends Error), bind message arg.
+        if implicit_error_param {
+            let msg: Value<'_, '_> = entry.argument(0)?.into();
+            scope.insert("__implicit_error_msg".to_string(), msg);
         }
 
         let mut current = entry;
@@ -120,7 +210,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
                 self.loc,
             )).result(0)?.into();
-            let msg_arg = if let Some(idx) = super_call_index {
+            // Use implicit error message arg if available (no explicit constructor)
+            let msg_arg = if implicit_error_param {
+                scope.get("__implicit_error_msg").copied().unwrap_or(undef_i64)
+            } else if let Some(idx) = super_call_index {
                 let ctor_body = constructor.unwrap().value.body.as_ref().unwrap();
                 if let Statement::ExpressionStatement(es) = &ctor_body.statements[idx] {
                     if let Expression::CallExpression(call) = &es.expression {
@@ -240,7 +333,66 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
+        // Store each class method as a TsFunction property on `this`.
+        // This enables dynamic method dispatch (e.g. `router.add(...)`) when the
+        // class type isn't known statically at the call site.
+        let ptr_type = melior::dialect::llvm::r#type::pointer(self.ctx, 0);
+        let i32_type = self.i32_type();
+        for elem in &class.body.body {
+            let ClassElement::MethodDefinition(method) = elem else { continue };
+            if method.value.body.is_none() { continue; }
+            // Only expose public instance methods (not static, not getters/setters, not private)
+            use oxc_ast::ast::MethodDefinitionKind;
+            if method.r#static { continue; }
+            if !matches!(method.kind, MethodDefinitionKind::Method) { continue; }
+            let oxc_ast::ast::PropertyKey::StaticIdentifier(key_id) = &method.key else { continue };
+            let method_name = key_id.name.to_string();
+            let func_name = format!("__class_{}_{}", class_name, method_name);
+            let n_params = method.value.params.items.len();
+            // arity for TsFunction does NOT include `this` (which is the first MLIR param)
+            let arity = n_params as i64;
+            let func_type_val = melior::ir::r#type::FunctionType::new(
+                self.ctx,
+                &vec![i64_type; 1 + n_params], // +1 for `this`
+                &[i64_type],
+            ).into();
+            let fn_ref: Value<'_, '_> = current.append_operation(
+                melior::ir::operation::OperationBuilder::new("func.constant", self.loc)
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(self.ctx, "value"),
+                        FlatSymbolRefAttribute::new(self.ctx, &func_name).into(),
+                    )])
+                    .add_results(&[func_type_val])
+                    .build()?,
+            ).result(0)?.into();
+            let fn_ptr_val: Value<'_, '_> = current.append_operation(
+                melior::ir::operation::OperationBuilder::new("builtin.unrealized_conversion_cast", self.loc)
+                    .add_operands(&[fn_ref])
+                    .add_results(&[ptr_type])
+                    .build()?,
+            ).result(0)?.into();
+            let arity_val: Value<'_, '_> = current.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i32_type, arity).into(), self.loc,
+            )).result(0)?.into();
+            let fn_val: Value<'_, '_> = current.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_new_this"),
+                &[fn_ptr_val, arity_val], &[i64_type], self.loc,
+            )).result(0)?.into();
+            let key_ptr = self.get_string_ptr(&method_name, current)?;
+            let this_i64 = self.ensure_i64(scope["this"], current)?;
+            current.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                &[this_i64, key_ptr, fn_val], &[], self.loc,
+            ));
+            // ts_obj_set retains fn_val; release our ref
+            current.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[fn_val], &[], self.loc,
+            ));
+        }
+
         // Lower constructor body (skip the super() call we already processed).
+        let saved_fn_return_type_cls = self.fn_return_type;
         self.fn_return_type = i64_type;
         if let Some(ctor) = constructor {
             if let Some(body) = &ctor.value.body {
@@ -252,7 +404,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
         }
-        self.fn_return_type = self.i32_type();
+        self.fn_return_type = saved_fn_return_type_cls;
 
         // Return `this`.
         if current.terminator().is_none() {
@@ -274,6 +426,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_types: vec![i64_type; n_params],
             return_type: Some(i64_type),
             has_rest: false,
+            has_this_param: false,
         });
         Ok(())
     }
@@ -325,6 +478,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut result = zero_i64;
         let mut current = entry;
 
+        let saved_fn_return_type_cls = self.fn_return_type;
         self.fn_return_type = i64_type;
         if let Some(body) = &method.value.body {
             for stmt in &body.statements {
@@ -333,7 +487,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Some(v) = val { result = v; }
             }
         }
-        self.fn_return_type = self.i32_type();
+        self.fn_return_type = saved_fn_return_type_cls;
 
         if current.terminator().is_none() {
             let result_i64 = self.ensure_i64(result, current)?;
@@ -353,6 +507,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_types: vec![i64_type; all_params],
             return_type: Some(i64_type),
             has_rest: false,
+            has_this_param: false,
         });
         Ok(())
     }
@@ -382,6 +537,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut result = zero_i64;
         let mut current = entry;
 
+        let saved_fn_return_type_cls = self.fn_return_type;
         self.fn_return_type = i64_type;
         if let Some(body) = &method.value.body {
             for stmt in &body.statements {
@@ -390,7 +546,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Some(v) = val { result = v; }
             }
         }
-        self.fn_return_type = self.i32_type();
+        self.fn_return_type = saved_fn_return_type_cls;
 
         if current.terminator().is_none() {
             let result_i64 = self.ensure_i64(result, current)?;
@@ -410,6 +566,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_types: vec![i64_type],
             return_type: Some(i64_type),
             has_rest: false,
+            has_this_param: false,
         });
         Ok(())
     }
@@ -444,6 +601,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let mut current = entry;
 
+        let saved_fn_return_type_cls = self.fn_return_type;
         self.fn_return_type = i64_type;
         if let Some(body) = &method.value.body {
             for stmt in &body.statements {
@@ -451,7 +609,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 current = next;
             }
         }
-        self.fn_return_type = self.i32_type();
+        self.fn_return_type = saved_fn_return_type_cls;
 
         if current.terminator().is_none() {
             current.append_operation(func::r#return(&[zero_i64], self.loc));
@@ -470,6 +628,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_types: vec![i64_type, i64_type],
             return_type: Some(i64_type),
             has_rest: false,
+            has_this_param: false,
         });
         Ok(())
     }
@@ -508,6 +667,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut result = zero_i64;
         let mut current = entry;
 
+        let saved_fn_return_type_cls = self.fn_return_type;
         self.fn_return_type = i64_type;
         if let Some(body) = &method.value.body {
             for stmt in &body.statements {
@@ -516,7 +676,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Some(v) = val { result = v; }
             }
         }
-        self.fn_return_type = self.i32_type();
+        self.fn_return_type = saved_fn_return_type_cls;
 
         if current.terminator().is_none() {
             let result_i64 = self.ensure_i64(result, current)?;
@@ -536,6 +696,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_types: vec![i64_type; n_params],
             return_type: Some(i64_type),
             has_rest: false,
+            has_this_param: false,
         });
         Ok(())
     }

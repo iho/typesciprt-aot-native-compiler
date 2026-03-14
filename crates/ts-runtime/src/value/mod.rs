@@ -157,8 +157,12 @@ pub struct TsRegExp {
 pub struct TsFunction {
     /// Pointer to the compiled native function.
     pub fn_ptr: *const u8,
-    /// Number of declared parameters (NOT counting env).
+    /// Number of declared parameters (NOT counting env or this).
     pub arity: u8,
+    /// 1 if the function expects `this` as its first MLIR parameter.
+    pub has_this: u8,
+    /// 1 if the last MLIR parameter is a rest array (excess args get bundled into it).
+    pub has_rest: u8,
     /// Captured environment (TsArray) or UNDEFINED if not a closure.
     pub env: TsVal,
 }
@@ -177,6 +181,37 @@ pub struct TsResponse {
     pub headers: TsVal, // TsHeaders (tag=7)
 }
 
+/// A heap-allocated JavaScript Symbol (tag=10).
+/// Unique identity value; the `id` is a globally-monotonic counter.
+/// `description` is the optional string passed to Symbol() — owned by this struct.
+pub struct TsSymbol {
+    pub id: u64,
+    pub description: TsVal, // TsString or UNDEFINED
+}
+
+/// A heap-allocated JavaScript Set (tag=11).
+/// Stores unique values in insertion order using same-value-zero equality.
+pub struct TsSet {
+    pub entries: Vec<TsVal>,
+}
+
+/// A heap-allocated JavaScript WeakMap (tag=12).
+/// Keys are stored as raw pointers (not retained); values are strongly retained.
+pub struct TsWeakMap {
+    pub entries: Vec<(*mut u8, TsVal)>,
+}
+
+// TsWeakMap contains raw pointers but is accessed only from a single thread per object.
+unsafe impl Send for TsWeakMap {}
+
+/// A heap-allocated JavaScript WeakSet (tag=13).
+/// Members are stored as raw pointers (not retained).
+pub struct TsWeakSet {
+    pub entries: Vec<*mut u8>,
+}
+
+unsafe impl Send for TsWeakSet {}
+
 // ── Submodule declarations ────────────────────────────────────────────────────
 
 pub mod func;
@@ -192,12 +227,17 @@ pub mod uri;
 pub mod globals;
 pub mod http;
 pub mod url;
+pub mod symbol;
+pub mod set;
+pub mod weak;
+pub mod container;
 
 // ── Re-exports from submodules ────────────────────────────────────────────────
 
 pub use func::{
-    ts_func_new, ts_closure_new, ts_closure_get_env,
+    ts_func_new, ts_func_new_this, ts_closure_new, ts_closure_new_rest, ts_closure_get_env,
     ts_func_call0, ts_func_call1, ts_func_call2, ts_func_call3, ts_func_call4,
+    ts_method_call0, ts_method_call1, ts_method_call2, ts_method_call3, ts_method_call4,
 };
 pub use object::{
     ts_obj_new, ts_error_new, ts_obj_get, ts_obj_set, ts_obj_delete, ts_obj_delete_key,
@@ -216,7 +256,7 @@ pub use array::{
 pub use string_val::{
     ts_string_new, ts_string_concat,
     ts_val_to_string, ts_val_length,
-    ts_str_index_of, ts_str_includes, ts_val_index_of, ts_val_includes,
+    ts_str_index_of, ts_str_index_of_from, ts_str_last_index_of, ts_str_includes, ts_val_index_of, ts_val_includes,
     ts_str_slice, ts_str_to_upper, ts_str_to_lower, ts_str_trim,
     ts_str_split, ts_str_replace, ts_str_replace_all,
     ts_str_starts_with, ts_str_ends_with,
@@ -248,7 +288,7 @@ pub use operators::{
     ts_parse_int, ts_parse_float,
     ts_is_nan_val, ts_is_finite_val,
     ts_typeof, ts_val_strict_eq, ts_is_nullish, ts_is_truthy, ts_val_not, ts_is_undefined,
-    ts_is_array, ts_func_spread_call,
+    ts_is_array, ts_func_spread_call, ts_method_spread_call,
     ts_coerce_number, ts_coerce_string, ts_coerce_bool,
 };
 pub use json::{ts_json_stringify, ts_json_parse};
@@ -264,6 +304,22 @@ pub use http::{
     ts_val_text, ts_val_json,
 };
 pub use url::{ts_url_new, ts_urlsearchparams_new, ts_urlsearchparams_to_string, ts_urlsearchparams_append, ts_urlsearchparams_get_all};
+pub use symbol::{ts_symbol_new, ts_symbol_description};
+pub use set::{
+    ts_set_new, ts_set_new_from_iter,
+    ts_set_add, ts_set_has, ts_set_delete, ts_set_clear,
+    ts_set_size, ts_set_keys, ts_set_values, ts_set_entries, ts_set_for_each,
+};
+pub use weak::{
+    ts_weakmap_new, ts_weakmap_set, ts_weakmap_get, ts_weakmap_has, ts_weakmap_delete,
+    ts_weakset_new, ts_weakset_add, ts_weakset_has, ts_weakset_delete,
+};
+pub use container::{
+    ts_container_get, ts_container_set, ts_container_add,
+    ts_container_has, ts_container_delete, ts_container_clear,
+    ts_container_size, ts_container_keys, ts_container_values,
+    ts_container_entries, ts_container_for_each,
+};
 
 // ── ARC: retain / release ─────────────────────────────────────────────────────
 
@@ -292,7 +348,11 @@ pub unsafe extern "C" fn ts_release_val(val: TsVal) {
             6 => Some(regexp::ts_regexp_destructor as unsafe extern "C" fn(*mut u8)),
             7 => Some(http::ts_headers_destructor as unsafe extern "C" fn(*mut u8)),
             8 => Some(http::ts_response_destructor as unsafe extern "C" fn(*mut u8)),
-            9 => Some(map::ts_map_destructor as unsafe extern "C" fn(*mut u8)), // URLSearchParams
+            9  => Some(map::ts_map_destructor as unsafe extern "C" fn(*mut u8)), // URLSearchParams
+            10 => Some(symbol::ts_symbol_destructor as unsafe extern "C" fn(*mut u8)),
+            11 => Some(set::ts_set_destructor as unsafe extern "C" fn(*mut u8)),
+            12 => Some(weak::ts_weakmap_destructor as unsafe extern "C" fn(*mut u8)),
+            13 => Some(weak::ts_weakset_destructor as unsafe extern "C" fn(*mut u8)),
             _ => None,
         };
 

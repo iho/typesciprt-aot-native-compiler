@@ -245,15 +245,19 @@ pub unsafe extern "C" fn ts_arr_filter(arr: TsVal, callback: TsVal) -> TsVal {
 
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_for_each(arr: TsVal, callback: TsVal) -> TsVal {
+    eprintln!("[DEBUG] ts_arr_for_each: arr={:016x}", arr.0);
     if arr.is_ptr() && heap_tag(arr) == 1 {
         let arr_ptr = arr.as_ptr() as *const TsArray;
         let len = (*arr_ptr).elements.len();
+        eprintln!("[DEBUG] ts_arr_for_each: len={}", len);
         for i in 0..len {
             let elem = { let r = &*arr_ptr; r.elements[i] };
+            eprintln!("[DEBUG] ts_arr_for_each: calling dispatch_callback for elem[{}]={:016x}", i, elem.0);
             ts_retain_val(elem);
             let index = TsVal::from_i32(i as i32);
             ts_retain_val(arr);
             let result = dispatch_callback(callback, &[elem, index, arr]);
+            eprintln!("[DEBUG] ts_arr_for_each: dispatch_callback returned");
             ts_release_val(arr);
             ts_release_val(elem);
             ts_release_val(result);

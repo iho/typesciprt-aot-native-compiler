@@ -61,6 +61,9 @@ struct FuncSig<'c> {
     return_type: Option<melior::ir::Type<'c>>,
     /// True if the last MLIR param is a rest array (i64 TsArray).
     has_rest: bool,
+    /// True if the function has an explicit TypeScript `this` parameter.
+    /// In this case the first MLIR param is the `this` value.
+    has_this_param: bool,
 }
  
 #[derive(Clone)]
@@ -85,6 +88,37 @@ fn load_import_static(path: &std::path::Path) -> Option<oxc_ast::ast::Program<'s
     ts_frontend::parse_typescript(alloc, source, &path.display().to_string()).ok()
 }
 
+/// Resolve a relative import source string to an actual `.ts` file path.
+/// Tries `<src>.ts`, then `<src>/index.ts` for directory-style imports.
+fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !src.starts_with("./") && !src.starts_with("../") { return None; }
+    let joined = base_dir.join(src);
+    // Normalize away `.` components in the path.
+    let mut p = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => { p.pop(); }
+            c => p.push(c),
+        }
+    }
+    if p.extension().is_none() {
+        // Try file: <path>.ts
+        let ts = p.with_extension("ts");
+        if ts.exists() { return Some(ts); }
+        // Try directory index: <path>/index.ts
+        let idx = p.join("index.ts");
+        if idx.exists() { return Some(idx); }
+        // Return the .ts path anyway (will fail gracefully as "not found")
+        return Some(ts);
+    }
+    if p.extension().map_or(false, |e| e != "ts") {
+        let ts = p.with_extension("ts");
+        if ts.exists() { return Some(ts); }
+    }
+    Some(p)
+}
+
 /// Collect local import paths declared in a parsed program, relative to `base_dir`.
 fn collect_local_imports(
     program: &oxc_ast::ast::Program<'_>,
@@ -93,17 +127,23 @@ fn collect_local_imports(
     use oxc_ast::ast::ImportOrExportKind;
     let mut paths = Vec::new();
     for stmt in &program.body {
-        if let Statement::ImportDeclaration(import) = stmt {
-            if import.import_kind == ImportOrExportKind::Type { continue; }
-            let src = import.source.value.as_str();
-            if src.starts_with("./") || src.starts_with("../") {
-                let mut p = base_dir.join(src);
-                if p.extension().is_none() {
-                    p.set_extension("ts");
-                } else if p.extension().map_or(false, |e| e != "ts") {
-                    let ts = p.with_extension("ts");
-                    if ts.exists() { p = ts; }
-                }
+        let src_opt: Option<&str> = match stmt {
+            Statement::ImportDeclaration(import) => {
+                if import.import_kind == ImportOrExportKind::Type { None }
+                else { Some(import.source.value.as_str()) }
+            }
+            Statement::ExportNamedDeclaration(exp) => {
+                if exp.export_kind == ImportOrExportKind::Type { None }
+                else { exp.source.as_ref().map(|s| s.value.as_str()) }
+            }
+            Statement::ExportAllDeclaration(exp) => {
+                if exp.export_kind == ImportOrExportKind::Type { None }
+                else { Some(exp.source.value.as_str()) }
+            }
+            _ => None,
+        };
+        if let Some(src) = src_opt {
+            if let Some(p) = resolve_local_import(src, base_dir) {
                 paths.push(p);
             }
         }
@@ -137,10 +177,38 @@ fn process_import_recursive<'c, 'm>(
     lowerer.collect_function_signatures(&imported);
     lowerer.collect_class_definitions(&imported);
     lowerer.collect_enum_definitions(&imported);
+
+    // Build a map: local_class_name → exported_alias_name from `export { Foo as Bar }` patterns.
+    // This is needed so that when a class is re-exported under a different name, the MLIR functions
+    // are generated under the alias name (e.g., `class Hono` exported as `HonoBase` → `__class_HonoBase_*`).
+    let mut class_export_aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for stmt in &imported.body {
+        if let Statement::ExportNamedDeclaration(exp) = stmt {
+            if exp.declaration.is_none() {
+                for spec in &exp.specifiers {
+                    use oxc_ast::ast::ExportSpecifier;
+                    let local_name = spec.local.name().to_string();
+                    let exported_name = spec.exported.name().to_string();
+                    if local_name != exported_name {
+                        class_export_aliases.insert(local_name, exported_name);
+                    }
+                }
+            }
+        }
+    }
+
     for stmt in &imported.body {
         match stmt {
             Statement::ClassDeclaration(class) => {
-                lowerer.lower_class_declaration(class)?;
+                if let Some(id) = &class.id {
+                    let original_name = id.name.to_string();
+                    if let Some(alias) = class_export_aliases.get(&original_name) {
+                        // Lower under the exported alias name (e.g., Hono → HonoBase)
+                        lowerer.lower_class_declaration_with_name(alias, class)?;
+                    } else {
+                        lowerer.lower_class_declaration(class)?;
+                    }
+                }
             }
             Statement::ExportNamedDeclaration(exp) => {
                 if let Some(Declaration::ClassDeclaration(class)) = &exp.declaration {
@@ -170,6 +238,13 @@ fn process_import_recursive<'c, 'm>(
         }
     }
     lowerer.lower_module_const_functions(&imported)?;
+
+    // Emit an init function for non-function module-level const declarations
+    // (e.g. `export const METHODS = ['get', 'post', ...]`).  These cannot be
+    // lowered as hoisted functions; instead we generate a `__init_module_N()`
+    // function and call it at the start of `main`.
+    lowerer.lower_imported_module_init(&imported)?;
+
     Ok(())
 }
 
@@ -203,6 +278,9 @@ pub fn lower_program<'c>(
         lowered_classes: std::collections::HashSet::new(),
         closure_env_indices: HashMap::new(),
         current_fn_params: std::collections::HashSet::new(),
+        module_init_fns: Vec::new(),
+        module_init_fn_count: 0,
+        class_name_aliases: HashMap::new(),
     };
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
@@ -353,6 +431,15 @@ struct Lowerer<'c, 'm> {
     /// the call site's post-call ts_release_val is the one that balances the pre-call
     /// ts_retain_val done by lower_expression for each argument.
     current_fn_params: std::collections::HashSet<String>,
+    /// Names of module-init MLIR functions generated for imported files.
+    /// Called at the start of `main` to initialize imported module-level const values.
+    module_init_fns: Vec<String>,
+    /// Counter for generating unique module init function names.
+    module_init_fn_count: usize,
+    /// Maps original class name → lowered alias name when a class is exported under a different name.
+    /// E.g. hono-base.ts: `class Hono` exported as `HonoBase` → maps "Hono" → "HonoBase".
+    /// Used so that `new Hono(...)` inside hono-base.ts resolves to `__class_HonoBase_constructor`.
+    class_name_aliases: HashMap<String, String>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
@@ -666,10 +753,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_arr_push_all",    &[i64_type, i64_type], &[]);
         add_func("ts_arr_join",        &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_index_of",    &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_val_index_of",    &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_val_includes",    &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_str_index_of",    &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_str_includes",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_val_index_of",       &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_val_includes",       &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_index_of",       &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_index_of_from",  &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_last_index_of",  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_includes",       &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_slice",       &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_str_to_upper",    &[i64_type], &[i64_type]);
         add_func("ts_str_to_lower",    &[i64_type], &[i64_type]);
@@ -711,12 +800,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // v1.2: first-class functions / arrow functions / array HOFs
         add_func("ts_func_new",        &[ptr_type, i32_type], &[i64_type]);
-        add_func("ts_closure_new",     &[ptr_type, i32_type, i64_type], &[i64_type]);
+        add_func("ts_func_new_this",   &[ptr_type, i32_type], &[i64_type]);
+        add_func("ts_closure_new",      &[ptr_type, i32_type, i64_type], &[i64_type]);
+        add_func("ts_closure_new_rest", &[ptr_type, i32_type, i64_type], &[i64_type]);
         add_func("ts_func_call0",      &[i64_type], &[i64_type]);
         add_func("ts_func_call1",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_func_call2",      &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_func_call3",      &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_func_call4",      &[i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call0",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call1",    &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call2",    &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call3",    &[i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call4",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_map",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_filter",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_for_each",    &[i64_type, i64_type], &[i64_type]);
@@ -763,7 +859,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_json_parse",      &[i64_type], &[i64_type]);
         add_func("ts_coerce_number",   &[i64_type], &[i64_type]);
         add_func("ts_coerce_string",   &[i64_type], &[i64_type]);
-        add_func("ts_func_spread_call",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_func_spread_call",       &[i64_type, i64_type],             &[i64_type]);
+        add_func("ts_method_spread_call",     &[i64_type, i64_type, i64_type],   &[i64_type]);
         add_func("ts_encode_uri_component",&[i64_type], &[i64_type]);
         add_func("ts_decode_uri_component",&[i64_type], &[i64_type]);
         add_func("ts_encode_uri",          &[i64_type], &[i64_type]);
@@ -829,6 +926,49 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Heap profiler init (no-op unless ts-runtime built with --features dhat-heap)
         add_func("ts_dhat_init",                  &[], &[]);
+
+        // Symbol
+        add_func("ts_symbol_new",                 &[i64_type], &[i64_type]);
+        add_func("ts_symbol_description",         &[i64_type], &[i64_type]);
+
+        // Set
+        add_func("ts_set_new",                    &[], &[i64_type]);
+        add_func("ts_set_new_from_iter",          &[i64_type], &[i64_type]);
+        add_func("ts_set_add",                    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_set_has",                    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_set_delete",                 &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_set_clear",                  &[i64_type], &[]);
+        add_func("ts_set_size",                   &[i64_type], &[i64_type]);
+        add_func("ts_set_keys",                   &[i64_type], &[i64_type]);
+        add_func("ts_set_values",                 &[i64_type], &[i64_type]);
+        add_func("ts_set_entries",                &[i64_type], &[i64_type]);
+        add_func("ts_set_for_each",               &[i64_type, i64_type], &[i64_type]);
+
+        // WeakMap
+        add_func("ts_weakmap_new",                &[], &[i64_type]);
+        add_func("ts_weakmap_set",                &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_weakmap_get",                &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_weakmap_has",                &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_weakmap_delete",             &[i64_type, i64_type], &[i64_type]);
+
+        // WeakSet
+        add_func("ts_weakset_new",                &[], &[i64_type]);
+        add_func("ts_weakset_add",                &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_weakset_has",                &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_weakset_delete",             &[i64_type, i64_type], &[i64_type]);
+
+        // Polymorphic container dispatch
+        add_func("ts_container_get",              &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_container_set",              &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_container_add",              &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_container_has",              &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_container_delete",           &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_container_clear",            &[i64_type], &[]);
+        add_func("ts_container_size",             &[i64_type], &[i64_type]);
+        add_func("ts_container_keys",             &[i64_type], &[i64_type]);
+        add_func("ts_container_values",           &[i64_type], &[i64_type]);
+        add_func("ts_container_entries",          &[i64_type], &[i64_type]);
+        add_func("ts_container_for_each",         &[i64_type, i64_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -853,11 +993,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     let Some(id) = &func.id else { continue };
                     let name = id.name.to_string();
                     let has_rest = func.params.rest.is_some();
-                    let n = func.params.items.len() + if has_rest { 1 } else { 0 };
+                    let has_this_param = func.this_param.is_some();
+                    let n = func.params.items.len()
+                        + if has_rest { 1 } else { 0 }
+                        + if has_this_param { 1 } else { 0 };
                     self.funcs.insert(name, FuncSig {
                         param_types: vec![i64_type; n],
                         return_type: Some(i64_type),
                         has_rest,
+                        has_this_param,
                     });
                 }
                 Statement::ExportNamedDeclaration(export) => {
@@ -865,11 +1009,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
                             let has_rest = func.params.rest.is_some();
-                            let n = func.params.items.len() + if has_rest { 1 } else { 0 };
+                            let has_this_param = func.this_param.is_some();
+                            let n = func.params.items.len()
+                                + if has_rest { 1 } else { 0 }
+                                + if has_this_param { 1 } else { 0 };
                             self.funcs.insert(name, FuncSig {
                                 param_types: vec![i64_type; n],
                                 return_type: Some(i64_type),
                                 has_rest,
+                                has_this_param,
                             });
                         }
                     }
@@ -883,11 +1031,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
                             let has_rest = func.params.rest.is_some();
-                            let n = func.params.items.len() + if has_rest { 1 } else { 0 };
+                            let has_this_param = func.this_param.is_some();
+                            let n = func.params.items.len()
+                                + if has_rest { 1 } else { 0 }
+                                + if has_this_param { 1 } else { 0 };
                             self.funcs.insert(name, FuncSig {
                                 param_types: vec![i64_type; n],
                                 return_type: Some(i64_type),
                                 has_rest,
+                                has_this_param,
                             });
                         }
                     }
@@ -923,20 +1075,42 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         param_types: vec![i64_type; n],
                         return_type: Some(i64_type),
                         has_rest,
+                        has_this_param: false,
                     });
                 }
                 Expression::FunctionExpression(func_expr) => {
                     let has_rest = func_expr.params.rest.is_some();
-                    let n = func_expr.params.items.len() + if has_rest { 1 } else { 0 };
+                    let has_this_param = func_expr.this_param.is_some();
+                    let n = func_expr.params.items.len()
+                        + if has_rest { 1 } else { 0 }
+                        + if has_this_param { 1 } else { 0 };
                     self.funcs.insert(name, FuncSig {
                         param_types: vec![i64_type; n],
                         return_type: Some(i64_type),
                         has_rest,
+                        has_this_param,
                     });
                 }
                 Expression::Identifier(id) => {
                     // `const alias = someFunc` — record as alias for call dispatch.
                     self.builtin_aliases.insert(name, id.name.to_string());
+                }
+                Expression::ClassExpression(class_expr) => {
+                    // `const Foo = class ...` — register constructor signature
+                    let ctor = class_expr.body.body.iter().find_map(|elem| {
+                        use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
+                        if let ClassElement::MethodDefinition(m) = elem {
+                            if m.kind == MethodDefinitionKind::Constructor { Some(m) } else { None }
+                        } else { None }
+                    });
+                    let n = ctor.map(|c| c.value.params.items.len()).unwrap_or(0);
+                    let ctor_name = format!("__class_{}_constructor", name);
+                    self.funcs.insert(ctor_name, FuncSig {
+                        param_types: vec![i64_type; 1 + n], // +1 for self
+                        return_type: Some(i64_type),
+                        has_rest: false,
+                        has_this_param: false,
+                    });
                 }
                 _ => {
                     // Non-function const (object, array, literal, etc.) — it's a module global.
@@ -1071,8 +1245,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let return_type = i64_type;
 
         let has_rest = func.params.rest.is_some();
+        let has_this_param = func.this_param.is_some();
         // Use i64 for all params to support NaN-boxed values (including `undefined` for defaults).
-        let n_params = func.params.items.len() + if has_rest { 1 } else { 0 };
+        // If has_this_param, MLIR param 0 is `this`; regular params start at index `this_offset`.
+        let this_offset: usize = if has_this_param { 1 } else { 0 };
+        let n_params = func.params.items.len()
+            + if has_rest { 1 } else { 0 }
+            + this_offset;
         let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
             (0..n_params).map(|_| (i64_type, self.loc)).collect();
         let func_type = FunctionType::new(
@@ -1084,17 +1263,23 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
         let mut param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // If the function has a `this` parameter, bind MLIR param 0 to "this" in scope.
+        if has_this_param {
+            let this_val: Value<'_, '_> = entry.argument(0)?.into();
+            scope.insert("this".to_string(), this_val);
+            param_names.insert("this".to_string());
+        }
         for (i, param) in func.params.items.iter().enumerate() {
             if let BindingPattern::BindingIdentifier(id) = &param.pattern {
                 let pname = id.name.to_string();
-                scope.insert(pname.clone(), entry.argument(i)?.into());
+                scope.insert(pname.clone(), entry.argument(i + this_offset)?.into());
                 param_names.insert(pname);
             }
         }
         // Bind the rest parameter (last MLIR param) as a TsArray in scope.
         if let Some(rest_param) = &func.params.rest {
             if let BindingPattern::BindingIdentifier(rest_id) = &rest_param.rest.argument {
-                let rest_arg_idx = func.params.items.len();
+                let rest_arg_idx = func.params.items.len() + this_offset;
                 let rest_val: Value<'_, '_> = entry.argument(rest_arg_idx)?.into();
                 let rname = rest_id.name.to_string();
                 scope.insert(rname.clone(), rest_val);
@@ -1111,7 +1296,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let BindingPattern::BindingIdentifier(id) = &param.pattern else { continue };
             let param_name = id.name.to_string();
 
-            let param_val: Value<'_, '_> = entry.argument(i)?.into();
+            let param_val: Value<'_, '_> = entry.argument(i + this_offset)?.into();
             let param_i64 = self.ensure_i64(param_val, current_block)?;
 
             let is_undef: Value<'_, '_> = current_block.append_operation(func::call(
@@ -1149,6 +1334,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ))
             .result(0)?.into();
 
+        let saved_fn_return_type = self.fn_return_type;
+        let saved_is_async = self.is_async;
         self.fn_return_type = return_type;
         self.is_async = func.r#async;
         if let Some(body) = &func.body {
@@ -1285,8 +1472,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.terminate_with_return(current_block, result_value)?;
         }
 
-        self.is_async = false;
-        self.fn_return_type = i32_type;
+        self.is_async = saved_is_async;
+        self.fn_return_type = saved_fn_return_type;
 
         let op = func::func(
             self.ctx,
@@ -1302,6 +1489,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_types: vec![i64_type; param_specs.len()],
             return_type: Some(return_type),
             has_rest,
+            has_this_param,
         });
         Ok(())
     }
@@ -1423,6 +1611,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         )).result(0)?.into();
 
         let is_async = is_async_override.unwrap_or(false);
+        let saved_fn_return_type = self.fn_return_type;
+        let saved_is_async = self.is_async;
         self.fn_return_type = return_type;
         self.is_async = is_async;
         if let Some(body) = body {
@@ -1432,7 +1622,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Some(v) = val { result_value = v; }
             }
         }
-        self.is_async = false;
+        self.is_async = saved_is_async;
 
         for (_, v) in &scope {
             let v_i64 = self.ensure_i64(*v, current_block)?;
@@ -1457,7 +1647,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         } else {
             self.terminate_with_return(current_block, result_value)?;
         }
-        self.fn_return_type = i32_type;
+        self.fn_return_type = saved_fn_return_type;
 
         let op = func::func(
             self.ctx,

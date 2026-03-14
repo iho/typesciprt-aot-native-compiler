@@ -6,6 +6,7 @@ use super::string_val::ts_string_new;
 use super::array::{ts_arr_new, ts_arr_set, ts_arr_push};
 use super::map::ts_map_get;
 use super::uri::rust_str_to_val;
+use super::symbol::symbol_to_key_string;
 
 pub unsafe extern "C" fn ts_obj_destructor(ptr: *mut u8) {
     let obj_ptr = ptr as *mut TsObject;
@@ -111,9 +112,15 @@ pub(super) unsafe fn tsval_to_key_string(key: TsVal) -> Option<String> {
     if key.is_int32() {
         return Some(key.as_i32().to_string());
     }
-    if key.is_ptr() && heap_tag(key) == 2 {
-        let ts_str = &*(key.as_ptr() as *const TsString);
-        return Some(ts_str.inner.clone());
+    if key.is_ptr() {
+        match heap_tag(key) {
+            2  => {
+                let ts_str = &*(key.as_ptr() as *const TsString);
+                return Some(ts_str.inner.clone());
+            }
+            10 => return symbol_to_key_string(key), // Symbol → "\x01sym{id}"
+            _  => {}
+        }
     }
     if !key.is_nan_boxed() {
         return Some(key.as_f64().to_string());
@@ -152,6 +159,10 @@ pub unsafe extern "C" fn ts_val_has_key(obj: TsVal, key: TsVal) -> TsVal {
         let has = map.entries.iter().any(|(k, _)| ts_val_strict_eq(*k, kv) != 0);
         return TsVal::from_bool(has);
     }
+    if tag == 11 {
+        // TsSet — `key in set` checks membership
+        return super::set::ts_set_has(obj, key);
+    }
     TsVal::from_bool(false)
 }
 
@@ -180,19 +191,12 @@ pub unsafe extern "C" fn ts_obj_set_val_key(obj: TsVal, key: TsVal, val: TsVal) 
         return;
     }
 
-    let key_string = if key.is_int32() {
-        key.as_i32().to_string()
-    } else if key.is_ptr() && heap_tag(key) == 2 {
-        let ts_str = &*(key.as_ptr() as *const TsString);
-        ts_str.inner.clone()
-    } else if !key.is_nan_boxed() {
-        key.as_f64().to_string()
-    } else {
-        return; // skip null, undefined, bool, object keys
-    };
-    let mut bytes = key_string.into_bytes();
-    bytes.push(0u8);
-    ts_obj_set(obj, bytes.as_ptr() as *const i8, val);
+    if let Some(key_string) = tsval_to_key_string(key) {
+        let mut bytes = key_string.into_bytes();
+        bytes.push(0u8);
+        ts_obj_set(obj, bytes.as_ptr() as *const i8, val);
+    }
+    // skip null, undefined, bool, unrecognised object keys
 }
 
 /// Generic getter for `obj[key]` — works for arrays (integer index), objects (string key),
@@ -238,20 +242,14 @@ pub unsafe extern "C" fn ts_val_get_key(obj: TsVal, key: TsVal) -> TsVal {
         }
         return UNDEFINED;
     }
-    // Object (or array) with string key
-    let key_string = if key.is_int32() {
-        key.as_i32().to_string()
-    } else if key.is_ptr() && heap_tag(key) == 2 {
-        let ts_str = &*(key.as_ptr() as *const TsString);
-        ts_str.inner.clone()
-    } else if !key.is_nan_boxed() {
-        key.as_f64().to_string()
+    // Object (or array) with string or symbol key
+    if let Some(key_string) = tsval_to_key_string(key) {
+        let mut bytes = key_string.into_bytes();
+        bytes.push(0u8);
+        ts_obj_get(obj, bytes.as_ptr() as *const i8)
     } else {
-        return UNDEFINED;
-    };
-    let mut bytes = key_string.into_bytes();
-    bytes.push(0u8);
-    ts_obj_get(obj, bytes.as_ptr() as *const i8)
+        UNDEFINED
+    }
 }
 
 /// Returns a new TsObject with all enumerable own properties EXCEPT those in `keys_arr`.

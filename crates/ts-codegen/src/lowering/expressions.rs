@@ -51,6 +51,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Expression::TSTypeAssertion(ts_assert) => {
                 self.lower_expression(&ts_assert.expression, block, region, scope)
             }
+            Expression::TSNonNullExpression(ts_nn) => {
+                self.lower_expression(&ts_nn.expression, block, region, scope)
+            }
             Expression::StaticMemberExpression(member) => {
                 // Math constants: Math.PI, Math.E, Math.LN2, …
                 if let Expression::Identifier(obj_id) = &member.object {
@@ -110,11 +113,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 block = nb;
                 let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("member access: object produced no value"))?;
 
-                // .size  →  ts_map_size(obj)  (for Map)
+                // .size  →  ts_container_size(obj)  (Map, Set, URLSearchParams, …)
                 if member.property.name == "size" {
                     let obj_i64 = self.ensure_i64(obj, block)?;
                     let sz: Value<'c, 'b> = block.append_operation(func::call(
-                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_size"),
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_size"),
                         &[obj_i64], &[self.i64_type()], self.loc,
                     )).result(0)?.into();
                     block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
@@ -283,7 +286,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             let i64t = self.i64_type();
                             let i32t = self.i32_type();
                             let sig = self.funcs[&name].clone();
-                            let arity = sig.param_types.len() as i64;
+                            // Arity for TsFunction excludes the implicit `this` MLIR param.
+                            let this_offset = if sig.has_this_param { 1 } else { 0 };
+                            let arity = (sig.param_types.len() - this_offset) as i64;
                             let ptr_type = melior::dialect::llvm::r#type::pointer(self.ctx, 0);
                             let func_type_val = melior::ir::r#type::FunctionType::new(
                                 self.ctx,
@@ -308,8 +313,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             let arity_val: Value<'c, 'b> = block.append_operation(arith::constant(
                                 self.ctx, IntegerAttribute::new(i32t, arity).into(), self.loc,
                             )).result(0)?.into();
+                            let constructor_name = if sig.has_this_param { "ts_func_new_this" } else { "ts_func_new" };
                             let fn_val: Value<'c, 'b> = block.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_new"),
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, constructor_name),
                                 &[fn_ptr, arity_val], &[i64t], self.loc,
                             )).result(0)?.into();
                             return Ok((Some(fn_val), block));
@@ -343,7 +349,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         ));
                         Ok((Some(v), block))
                     }
-                    None => bail!("'this' used outside of a class method"),
+                    None => bail!("'this' used outside of a class method, scope keys: {:?}", scope.keys().collect::<Vec<_>>()),
                 }
             }
             Expression::AwaitExpression(aw) => {
@@ -460,15 +466,56 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 block = nb;
                 let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("private method call: receiver produced no value"))?;
                 let obj_i64 = self.ensure_i64(obj, block)?;
-                // Lower args
+                // Lower args — handle spread by unpacking array elements
                 let mut args = vec![obj_i64];
-                for arg in &call.arguments {
-                    let expr = arg.as_expression()
-                        .ok_or_else(|| anyhow::anyhow!("spread in private method call"))?;
-                    let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
-                    block = nb;
-                    let v = v_opt.ok_or_else(|| anyhow::anyhow!("private method arg produced no value"))?;
-                    args.push(self.ensure_i64(v, block)?);
+                let has_spread = call.arguments.iter().any(|a| a.as_expression().is_none());
+                if has_spread {
+                    // Single-spread pattern: this.#method(...arr) — unpack arr into positional args.
+                    // Determine expected param count from signature (minus 1 for `this`).
+                    let n_params = self.funcs.get(&mangled)
+                        .map(|s| s.param_types.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    for arg in &call.arguments {
+                        if let Some(expr) = arg.as_expression() {
+                            let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                            block = nb;
+                            let v = v_opt.ok_or_else(|| anyhow::anyhow!("private method arg produced no value"))?;
+                            args.push(self.ensure_i64(v, block)?);
+                        } else {
+                            // Spread element: unpack from array using ts_arr_get
+                            use oxc_ast::ast::Argument;
+                            let Argument::SpreadElement(spread) = arg else { unreachable!() };
+                            let (arr_opt, nb) = self.lower_expression(&spread.argument, block, region, scope)?;
+                            block = nb;
+                            let arr = arr_opt.ok_or_else(|| anyhow::anyhow!("spread array produced no value"))?.into();
+                            let arr_i64 = self.ensure_i64(arr, block)?;
+                            let i32t = self.i32_type();
+                            let remaining = n_params.saturating_sub(args.len() - 1); // -1 for `this`
+                            for idx in 0..remaining {
+                                let idx_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                                    self.ctx,
+                                    IntegerAttribute::new(i32t, idx as i64).into(),
+                                    self.loc,
+                                )).result(0)?.into();
+                                let elem: Value<'c, 'b> = block.append_operation(func::call(
+                                    self.ctx,
+                                    FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                                    &[arr_i64, idx_val],
+                                    &[self.i64_type()],
+                                    self.loc,
+                                )).result(0)?.into();
+                                args.push(elem);
+                            }
+                        }
+                    }
+                } else {
+                    for arg in &call.arguments {
+                        let expr = arg.as_expression().unwrap();
+                        let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        let v = v_opt.ok_or_else(|| anyhow::anyhow!("private method arg produced no value"))?;
+                        args.push(self.ensure_i64(v, block)?);
+                    }
                 }
                 let op = block.append_operation(func::call(
                     self.ctx,
@@ -528,10 +575,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
-        // console.log(a, b, …) → print each arg space-separated, then newline
+        // console.log/error/warn/info/debug(a, b, …) → print each arg space-separated, then newline
         if let Expression::StaticMemberExpression(member) = &call.callee {
             if matches!(&member.object, Expression::Identifier(id) if id.name == "console")
-                && member.property.name == "log"
+                && matches!(member.property.name.as_str(), "log" | "error" | "warn" | "info" | "debug")
             {
                 let nargs = call.arguments.len();
                 for (i, arg) in call.arguments.iter().enumerate() {
@@ -763,7 +810,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             match callee_name {
                 "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "Number" | "String" | "Boolean"
                 | "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError"
-                | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI" => {
+                | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
+                | "Symbol" => {
                     if !self.funcs.contains_key(callee_name) {
                         let i64t = self.i64_type();
                         let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
@@ -865,6 +913,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 let v = arg_vals.first().copied().unwrap_or(undef_i64);
                                 block.append_operation(func::call(
                                     self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_decode_uri"),
+                                    &[v], &[i64t], self.loc,
+                                )).result(0)?.into()
+                            }
+                            "Symbol" => {
+                                let v = arg_vals.first().copied().unwrap_or(undef_i64);
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_symbol_new"),
                                     &[v], &[i64t], self.loc,
                                 )).result(0)?.into()
                             }
@@ -1233,7 +1288,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             .ok_or_else(|| anyhow::anyhow!("method call: object produced no value"))?;
                         let obj_i64 = self.ensure_i64(obj, block)?;
 
-                        // Lower arguments.
+                        // Lower arguments. If any spread is present, fall through to dynamic dispatch.
+                        let has_spread = call.arguments.iter().any(|a| matches!(a, oxc_ast::ast::Argument::SpreadElement(_)));
+                        if has_spread {
+                            // Fall through to dynamic dispatch below.
+                        } else {
                         let mut args = vec![obj_i64];
                         for arg in &call.arguments {
                             let expr = arg.as_expression()
@@ -1254,6 +1313,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             self.loc,
                         ));
                         return Ok((Some(op.result(0)?.into()), block));
+                        } // end if !has_spread
                     }
                 }
             }
@@ -1262,8 +1322,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // ── Built-in array / string method dispatch ──────────────────────────
         if let Expression::StaticMemberExpression(member) = &call.callee {
             let method_name = member.property.name.as_str().to_string();
-            let is_builtin = matches!(method_name.as_str(),
-                "push" | "pop" | "indexOf" | "includes" | "join" |
+            // If the receiver is a known user-defined class instance, skip builtin dispatch
+            // and fall through to dynamic method dispatch below.  This prevents e.g.
+            // `app.get(path, handler)` from being mistakenly compiled as ts_map_get.
+            let receiver_is_user_class = if let Expression::Identifier(id) = &member.object {
+                self.var_class_types
+                    .get(id.name.as_str())
+                    .map(|cn| self.classes.contains_key(cn.as_str()))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            let n_call_args = call.arguments.len();
+            let is_builtin = !receiver_is_user_class && (
+                // "add" is a container op only with 1 arg (Set.add/WeakSet.add);
+                // with more args it's a user-defined method (e.g. router.add(method, path, arr)).
+                (method_name == "add" && n_call_args == 1) ||
+                matches!(method_name.as_str(),
+                "push" | "pop" | "indexOf" | "lastIndexOf" | "includes" | "join" |
                 "slice" | "toUpperCase" | "toLowerCase" | "trim" | "split" |
                 // Array HOFs
                 "map" | "filter" | "forEach" | "reduce" | "find" |
@@ -1271,7 +1347,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // String methods
                 "replace" | "replaceAll" | "startsWith" | "endsWith" |
                 "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" |
-                // Map methods
+                // Container methods (Map, Set, WeakMap, WeakSet) — "add" handled above
                 "set" | "get" | "has" | "delete" | "clear" | "keys" | "values" | "entries" |
                 // RegExp methods
                 "test" | "exec" |
@@ -1281,7 +1357,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 "text" | "json" |
                 // URLSearchParams
                 "toString" | "getAll"
-            );
+            ));
             if is_builtin {
                 // Evaluate receiver
                 let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
@@ -1328,9 +1404,25 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                     "indexOf" => {
                         let search = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        if let Some(&from) = arg_vals.get(1) {
+                            Some(block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_str_index_of_from"),
+                                &[obj_i64, search, from], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        } else {
+                            Some(block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_val_index_of"),
+                                &[obj_i64, search], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                    }
+                    "lastIndexOf" => {
+                        let search = arg_vals.first().copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
                             self.ctx,
-                            FlatSymbolRefAttribute::new(self.ctx, "ts_val_index_of"),
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_str_last_index_of"),
                             &[obj_i64, search], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
@@ -1406,7 +1498,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     "forEach" => {
                         let cb = arg_vals.first().copied().unwrap_or(undefined_i64);
                         block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_for_each"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_for_each"),
                             &[obj_i64, cb], &[i64t], self.loc,
                         ));
                         None
@@ -1545,58 +1637,65 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[obj_i64, count], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
-                    // Map methods
+                    // ── Container methods (Map / Set / WeakMap / WeakSet) ─────
+                    "add" => {
+                        let val = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_add"),
+                            &[obj_i64, val], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
                     "set" => {
                         let key = arg_vals.first().copied().unwrap_or(undefined_i64);
                         let val = arg_vals.get(1).copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_set"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_set"),
                             &[obj_i64, key, val], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "get" => {
                         let key = arg_vals.first().copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_get"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_get"),
                             &[obj_i64, key], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "has" => {
                         let key = arg_vals.first().copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_has"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_has"),
                             &[obj_i64, key], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "delete" => {
                         let key = arg_vals.first().copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_delete"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_delete"),
                             &[obj_i64, key], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "clear" => {
                         block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_clear"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_clear"),
                             &[obj_i64], &[], self.loc,
                         ));
                         None
                     }
                     "keys" => {
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_keys"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_keys"),
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "values" => {
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_values"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_values"),
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "entries" => {
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_entries"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_container_entries"),
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
@@ -1692,6 +1791,33 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         // Generic fallback: evaluate callee as a dynamic function value and dispatch.
+        // For member expression callees, use ts_method_callN so that functions with
+        // an explicit TypeScript `this` parameter receive the receiver as `this`.
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+            block = nb;
+            if let Some(obj_val) = obj_opt {
+                let i64t = self.i64_type();
+                let obj_i64 = self.ensure_i64(obj_val, block)?;
+                let key_ptr = self.get_string_ptr(member.property.name.as_str(), block)?;
+                let fn_val: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                    &[obj_i64, key_ptr], &[i64t], self.loc,
+                )).result(0)?.into();
+                let result = self.lower_method_call(fn_val, obj_i64, &call.arguments, block, region, scope)?;
+                let (result_val, nb) = result;
+                block = nb;
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[fn_val], &[], self.loc,
+                ));
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[obj_i64], &[], self.loc,
+                ));
+                return Ok((result_val, block));
+            }
+        }
         let (fn_opt, nb) = self.lower_expression(&call.callee, block, region, scope)?;
         block = nb;
         if let Some(fn_val) = fn_opt {
@@ -1700,6 +1826,113 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         tracing::debug!("skipping unimplemented call expression");
         Ok((None, block))
+    }
+
+    // ── Method call dispatch: passes receiver as `this` if has_this=1 ────
+
+    pub(super) fn lower_method_call<'b>(
+        &mut self,
+        fn_val: Value<'c, 'b>,
+        obj_val: Value<'c, 'b>,
+        arguments: &[oxc_ast::ast::Argument<'_>],
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let i64t = self.i64_type();
+        let fn_i64 = self.ensure_i64(fn_val, block)?;
+
+        let has_spread = arguments.iter().any(|a| matches!(a, oxc_ast::ast::Argument::SpreadElement(_)));
+
+        if has_spread {
+            // Build an args array, push normal args and spread the spread arrays, then call
+            // ts_method_spread_call(fn, obj, args_arr).
+            let zero_i32: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
+            )).result(0)?.into();
+            let args_arr: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                &[zero_i32], &[i64t], self.loc,
+            )).result(0)?.into();
+            let mut temp_vals: Vec<Value<'c, 'b>> = Vec::new();
+            for arg in arguments {
+                match arg {
+                    oxc_ast::ast::Argument::SpreadElement(spread) => {
+                        let (v_opt, nb) = self.lower_expression(&spread.argument, block, region, scope)?;
+                        block = nb;
+                        if let Some(v) = v_opt {
+                            let v_i64 = self.ensure_i64(v, block)?;
+                            block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push_all"),
+                                &[args_arr, v_i64], &[], self.loc,
+                            ));
+                            temp_vals.push(v_i64);
+                        }
+                    }
+                    _ => {
+                        if let Some(expr) = arg.as_expression() {
+                            let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                            block = nb;
+                            if let Some(v) = v_opt {
+                                let v_i64 = self.ensure_i64(v, block)?;
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                                    &[args_arr, v_i64], &[i64t], self.loc,
+                                ));
+                                temp_vals.push(v_i64);
+                            }
+                        }
+                    }
+                }
+            }
+            let result: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_method_spread_call"),
+                &[fn_i64, obj_val, args_arr], &[i64t], self.loc,
+            )).result(0)?.into();
+            for tv in &temp_vals {
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[*tv], &[], self.loc,
+                ));
+            }
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[args_arr], &[], self.loc,
+            ));
+            return Ok((Some(result), block));
+        }
+
+        // No spread: evaluate args then call ts_method_callN.
+        let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
+        for arg in arguments {
+            if let Some(expr) = arg.as_expression() {
+                let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                block = nb;
+                if let Some(v) = v_opt {
+                    arg_vals.push(self.ensure_i64(v, block)?);
+                }
+            }
+        }
+        let call_fn = match arg_vals.len() {
+            0 => "ts_method_call0",
+            1 => "ts_method_call1",
+            2 => "ts_method_call2",
+            3 => "ts_method_call3",
+            _ => "ts_method_call4",
+        };
+        let mut call_args = vec![fn_i64, obj_val];
+        call_args.extend(arg_vals.iter().take(4).copied());
+        let result: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, call_fn),
+            &call_args, &[i64t], self.loc,
+        )).result(0)?.into();
+        for av in &arg_vals {
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[*av], &[], self.loc,
+            ));
+        }
+        Ok((Some(result), block))
     }
 
     // ── Dynamic function dispatch (fn_val)(args) ─────────────────────────
@@ -2045,7 +2278,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let Expression::Identifier(callee_id) = &new_expr.callee else {
             bail!("new: only simple class names are supported as constructors");
         };
-        let class_name = callee_id.name.to_string();
+        // Resolve class name aliases (e.g. `class Hono` exported as `HonoBase` →
+        // `new Hono(...)` inside hono-base.ts should call `__class_HonoBase_constructor`).
+        let class_name = {
+            let raw = callee_id.name.as_str();
+            self.class_name_aliases.get(raw).cloned().unwrap_or_else(|| raw.to_string())
+        };
 
         // Built-in constructors
         if class_name == "RegExp" {
@@ -2269,14 +2507,59 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     block = nb;
                     if let Some(arr) = arr_opt {
                         let arr_i64 = self.ensure_i64(arr, block)?;
-                        // Iterate pairs
-                        // Simple: call ts_map_from_arr if available, or do inline loop
-                        // For now just skip population (no ts_map_from_arr yet)
+                        // Iterate pairs: call ts_map_from_arr if available, or do inline loop
+                        // TODO: implement ts_map_from_arr for efficient batch population
                         let _ = arr_i64;
                     }
                 }
             }
             return Ok((Some(map_val), block));
+        }
+
+        if class_name == "Set" {
+            let i64t = self.i64_type();
+            // new Set()  or  new Set(iterable)
+            if new_expr.arguments.is_empty() {
+                let set_val: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_set_new"),
+                    &[], &[i64t], self.loc,
+                )).result(0)?.into();
+                return Ok((Some(set_val), block));
+            } else if let Some(expr) = new_expr.arguments[0].as_expression() {
+                let (iter_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                block = nb;
+                let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                let iter_i64 = iter_opt
+                    .map(|v| self.ensure_i64(v, block))
+                    .transpose()?
+                    .unwrap_or(undef_i64);
+                let set_val: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_set_new_from_iter"),
+                    &[iter_i64], &[i64t], self.loc,
+                )).result(0)?.into();
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[iter_i64], &[], self.loc));
+                return Ok((Some(set_val), block));
+            }
+        }
+
+        if class_name == "WeakMap" {
+            let i64t = self.i64_type();
+            let wm_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_weakmap_new"),
+                &[], &[i64t], self.loc,
+            )).result(0)?.into();
+            return Ok((Some(wm_val), block));
+        }
+
+        if class_name == "WeakSet" {
+            let i64t = self.i64_type();
+            let ws_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_weakset_new"),
+                &[], &[i64t], self.loc,
+            )).result(0)?.into();
+            return Ok((Some(ws_val), block));
         }
 
         // Built-in URL constructor: new URL(href, base?) → TsObject with url properties
@@ -2335,6 +2618,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         };
 
         let i64_type = self.i64_type();
+        let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+            self.ctx, IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+        )).result(0)?.into();
+
         let mut args: Vec<Value<'c, 'b>> = Vec::new();
         for arg in &new_expr.arguments {
             let expr = arg.as_expression()
@@ -2344,6 +2631,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let v = v_opt.ok_or_else(|| anyhow::anyhow!("new arg produced no value"))?;
             args.push(self.ensure_i64(v, block)?);
         }
+
+        // Pad with undefined if fewer args than constructor params; truncate if more.
+        let expected = sig.param_types.len();
+        while args.len() < expected {
+            args.push(undef_i64);
+        }
+        args.truncate(expected);
 
         let result_types: Vec<melior::ir::Type<'c>> =
             sig.return_type.iter().copied().collect();
@@ -2455,7 +2749,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             arrow.params.items.iter().collect();
         let rest_name = arrow.params.rest.as_ref()
             .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument { Some(id.name.as_str()) } else { None });
-        let (fn_val, nb) = self.lower_arrow_like(&params, rest_name, Some(&arrow.body), None, block, region, scope)?;
+        let (block_body, expr_body) = if arrow.expression {
+            (None, Some(&*arrow.body))
+        } else {
+            (Some(&*arrow.body), None)
+        };
+        let (fn_val, nb) = self.lower_arrow_like(&params, rest_name, block_body, expr_body, block, region, scope)?;
         Ok((Some(fn_val), nb))
     }
 
@@ -2681,6 +2980,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         let mut result_val: Option<Value<'_, '_>> = None;
+        // Track whether this is an expression-body arrow (=> expr) vs block-body ({ ... }).
+        // Expression-body arrows return the expression's value (no release before return).
+        // Block-body arrows always return UNDEFINED unless there's an explicit `return` stmt.
+        let is_expr_body = block_body.is_none() && expr_body.is_some();
 
         let body_opt = block_body.or(expr_body);
         if let Some(body) = body_opt {
@@ -2778,10 +3081,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
 
                     arrow_scope.insert(fn_name, fn_val);
+                } else if is_expr_body {
+                    // Expression-body arrow (=> expr): lower the expression directly without
+                    // releasing it so the owned reference is preserved for the return value.
+                    if let oxc_ast::ast::Statement::ExpressionStatement(es) = stmt {
+                        let (val_opt, nb) = self.lower_expression(&es.expression, current_block, &arrow_region, &mut arrow_scope)?;
+                        current_block = nb;
+                        if let Some(val) = val_opt {
+                            result_val = Some(self.ensure_i64(val, current_block)?);
+                        }
+                    } else {
+                        // Unexpected non-expression statement in expr body; treat like block body.
+                        let (_, nb) = self.lower_statement(stmt, current_block, &arrow_region, &mut arrow_scope, &[])?;
+                        current_block = nb;
+                    }
                 } else {
-                    let (v, nb) = self.lower_statement(stmt, current_block, &arrow_region, &mut arrow_scope, &[])?;
+                    // Block-body arrow: process statement but DO NOT propagate result_val.
+                    // Block-body arrows always return UNDEFINED unless there is an explicit
+                    // `return` statement (which calls func.return directly).
+                    let (_, nb) = self.lower_statement(stmt, current_block, &arrow_region, &mut arrow_scope, &[])?;
                     current_block = nb;
-                    if let Some(val) = v { result_val = Some(val); }
                 }
             }
         }
@@ -2819,6 +3138,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_types: vec![i64_type; total_mlir_params],
             return_type: Some(i64_type),
             has_rest: false,
+            has_this_param: false,
         });
 
         // Get a function reference via func.constant, then cast to !llvm.ptr.
@@ -2889,14 +3209,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 ));
             }
 
+            let closure_fn_name = if has_rest { "ts_closure_new_rest" } else { "ts_closure_new" };
             let result = block.append_operation(func::call(
                 self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "ts_closure_new"),
+                FlatSymbolRefAttribute::new(self.ctx, closure_fn_name),
                 &[fn_ptr, arity_val, env_arr],
                 &[i64_type],
                 self.loc,
             )).result(0)?.into();
-            // ts_closure_new retains env; release our temporary ref
+            // ts_closure_new(_rest) retains env; release our temporary ref
             block.append_operation(func::call(
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
                 &[env_arr], &[], self.loc,
@@ -3156,6 +3477,26 @@ fn collect_free_vars_stmt(
             collect_fv_expr(&for_in.right, params, locals, outer_keys, out);
             collect_free_vars_stmt(&for_in.body, params, locals, outer_keys, out);
         }
+        Statement::ForStatement(for_stmt) => {
+            if let Some(init) = &for_stmt.init {
+                if let Some(expr) = init.as_expression() {
+                    collect_fv_expr(expr, params, locals, outer_keys, out);
+                } else if let oxc_ast::ast::ForStatementInit::VariableDeclaration(vd) = init {
+                    for d in &vd.declarations {
+                        if let Some(init_expr) = &d.init {
+                            collect_fv_expr(init_expr, params, locals, outer_keys, out);
+                        }
+                    }
+                }
+            }
+            if let Some(test) = &for_stmt.test {
+                collect_fv_expr(test, params, locals, outer_keys, out);
+            }
+            if let Some(update) = &for_stmt.update {
+                collect_fv_expr(update, params, locals, outer_keys, out);
+            }
+            collect_free_vars_stmt(&for_stmt.body, params, locals, outer_keys, out);
+        }
         Statement::WhileStatement(w) => {
             collect_fv_expr(&w.test, params, locals, outer_keys, out);
             collect_free_vars_stmt(&w.body, params, locals, outer_keys, out);
@@ -3241,8 +3582,15 @@ fn collect_fv_expr(
         Expression::CallExpression(call) => {
             collect_fv_expr(&call.callee, params, locals, outer_keys, out);
             for arg in &call.arguments {
-                if let Some(e) = arg.as_expression() {
-                    collect_fv_expr(e, params, locals, outer_keys, out);
+                match arg {
+                    oxc_ast::ast::Argument::SpreadElement(spread) => {
+                        collect_fv_expr(&spread.argument, params, locals, outer_keys, out);
+                    }
+                    _ => {
+                        if let Some(e) = arg.as_expression() {
+                            collect_fv_expr(e, params, locals, outer_keys, out);
+                        }
+                    }
                 }
             }
         }
@@ -3263,8 +3611,15 @@ fn collect_fv_expr(
         }
         Expression::ArrayExpression(arr) => {
             for elem in &arr.elements {
-                if let Some(e) = elem.as_expression() {
-                    collect_fv_expr(e, params, locals, outer_keys, out);
+                match elem {
+                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(spread) => {
+                        collect_fv_expr(&spread.argument, params, locals, outer_keys, out);
+                    }
+                    _ => {
+                        if let Some(e) = elem.as_expression() {
+                            collect_fv_expr(e, params, locals, outer_keys, out);
+                        }
+                    }
                 }
             }
         }
@@ -3327,6 +3682,28 @@ fn collect_fv_expr(
         Expression::PrivateFieldExpression(m) => {
             collect_fv_expr(&m.object, params, locals, outer_keys, out);
         }
+        Expression::UpdateExpression(update) => {
+            use oxc_ast::ast::SimpleAssignmentTarget;
+            match &update.argument {
+                SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    let name = id.name.as_str();
+                    if !params.contains(name) && !locals.contains(name) && outer_keys.contains(name) {
+                        if !out.contains(&name.to_string()) { out.push(name.to_string()); }
+                    }
+                }
+                SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                    collect_fv_expr(&m.object, params, locals, outer_keys, out);
+                }
+                SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                    collect_fv_expr(&m.object, params, locals, outer_keys, out);
+                    collect_fv_expr(&m.expression, params, locals, outer_keys, out);
+                }
+                SimpleAssignmentTarget::PrivateFieldExpression(m) => {
+                    collect_fv_expr(&m.object, params, locals, outer_keys, out);
+                }
+                _ => {}
+            }
+        }
         _ => {}
     }
 }
@@ -3340,6 +3717,14 @@ fn collect_fv_assignment_target(
 ) {
     use oxc_ast::ast::AssignmentTarget;
     match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+            let name = id.name.as_str();
+            if !params.contains(name) && !locals.contains(name) && outer_keys.contains(name) {
+                if !out.contains(&name.to_string()) {
+                    out.push(name.to_string());
+                }
+            }
+        }
         AssignmentTarget::StaticMemberExpression(m) => {
             collect_fv_expr(&m.object, params, locals, outer_keys, out);
         }

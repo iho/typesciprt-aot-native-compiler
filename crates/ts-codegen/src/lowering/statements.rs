@@ -32,6 +32,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.loc,
         ));
 
+        // Call module init functions for imported files (initialize imported const values).
+        for init_fn_name in self.module_init_fns.clone() {
+            current_block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, &init_fn_name),
+                &[],
+                &[],
+                self.loc,
+            ));
+        }
+
         for stmt in &program.body {
             // Function declarations are emitted separately; skip here.
             if matches!(stmt, Statement::FunctionDeclaration(_)) {
@@ -298,6 +309,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         scope.insert(name.clone(), undef);
                     }
                     if let Some(init) = &declarator.init {
+                        // Class expression: `const Foo = class<T> extends Bar<T> { ... }`
+                        // Lower as a class declaration with the variable name as the class name.
+                        if let Expression::ClassExpression(class_expr) = init {
+                            self.lower_class_declaration_with_name(&name, class_expr)?;
+                            // Store undefined as placeholder (class is accessed statically via new Foo())
+                            let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                                self.loc,
+                            )).result(0)?.into();
+                            scope.insert(name.clone(), undef);
+                            continue;
+                        }
                         // Type inference: record class name for `let x = new Foo()`.
                         if let Expression::NewExpression(new_expr) = init {
                             if let Expression::Identifier(id) = &new_expr.callee {
@@ -991,7 +1015,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.terminate_with_br(cur, normal_block, &ok_vals);
 
         // ── Catch block ───────────────────────────────────────────────────
-        if let (Some(ref cb), Some(handler)) = (&catch_block, &try_stmt.handler) {
+        if let (Some(cb), Some(handler)) = (&catch_block, &try_stmt.handler) {
             let mut catch_scope = scope.clone();
             // Rebuild scope from the phi block-arguments.
             for (i, k) in scope_keys.iter().enumerate() {
@@ -1044,7 +1068,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         // ── Finally block ─────────────────────────────────────────────────
-        if let (Some(ref fb), Some(finalizer)) = (&finally_block, &try_stmt.finalizer) {
+        if let (Some(fb), Some(finalizer)) = (&finally_block, &try_stmt.finalizer) {
             let mut fin_scope = scope.clone();
             for (i, k) in scope_keys.iter().enumerate() {
                 fin_scope.insert(k.clone(), fb.argument(i)?.into());
@@ -1477,6 +1501,137 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope.remove(&idx_key);
 
         Ok((None, exit_block))
+    }
+
+    // ── Module-level const init function for imported files ────────────────
+
+    /// Generate an `__init_module_N()` MLIR function that initializes all non-function
+    /// module-level const declarations from an imported file and stores them as module globals.
+    /// This function is called at the very start of `main`.
+    pub(super) fn lower_imported_module_init(&mut self, program: &Program<'_>) -> Result<()> {
+        use oxc_ast::ast::{ExportDefaultDeclarationKind, Declaration};
+
+        // Collect the non-function const declarations (arrays, objects, literals, etc.)
+        // We skip arrow functions and function expressions since those are handled by
+        // lower_module_const_functions already.
+        let mut has_init = false;
+        for stmt in &program.body {
+            let vd_opt: Option<&oxc_ast::ast::VariableDeclaration<'_>> = match stmt {
+                Statement::VariableDeclaration(vd) => Some(vd),
+                Statement::ExportNamedDeclaration(exp) => {
+                    if let Some(Declaration::VariableDeclaration(vd)) = &exp.declaration {
+                        Some(vd)
+                    } else { None }
+                }
+                _ => None,
+            };
+            if let Some(vd) = vd_opt {
+                for decl in &vd.declarations {
+                    if let Some(init) = &decl.init {
+                        let inner = Lowerer::strip_ts_casts(init);
+                        let is_fn = matches!(inner,
+                            Expression::ArrowFunctionExpression(_) |
+                            Expression::FunctionExpression(_)
+                        );
+                        if !is_fn {
+                            has_init = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if has_init { break; }
+        }
+        if !has_init { return Ok(()); }
+
+        let i32_type = self.i32_type();
+        let fn_name = format!("__init_module_{}", self.module_init_fn_count);
+        self.module_init_fn_count += 1;
+        let fn_type = FunctionType::new(self.ctx, &[], &[]);
+
+        let region = Region::new();
+        let entry = region.append_block(Block::new(&[]));
+        let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
+        let mut current_block = entry;
+
+        // Inject all currently known module globals so init code can reference them.
+        let i64_type = self.i64_type();
+        for global_name in self.module_global_names.clone() {
+            if !scope.contains_key(&global_name) {
+                let key_ptr = self.get_string_ptr(&global_name, current_block)?;
+                let val: Value<'_, '_> = current_block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                    &[key_ptr], &[i64_type], self.loc,
+                )).result(0)?.into();
+                scope.insert(global_name, val);
+            }
+        }
+
+        for stmt in &program.body {
+            let is_non_fn_var = match stmt {
+                Statement::VariableDeclaration(vd) => {
+                    vd.declarations.iter().any(|d| {
+                        if let Some(init) = &d.init {
+                            let inner = Lowerer::strip_ts_casts(init);
+                            !matches!(inner,
+                                Expression::ArrowFunctionExpression(_) |
+                                Expression::FunctionExpression(_)
+                            )
+                        } else { false }
+                    })
+                }
+                Statement::ExportNamedDeclaration(exp) => {
+                    if let Some(Declaration::VariableDeclaration(vd)) = &exp.declaration {
+                        vd.declarations.iter().any(|d| {
+                            if let Some(init) = &d.init {
+                                let inner = Lowerer::strip_ts_casts(init);
+                                !matches!(inner,
+                                    Expression::ArrowFunctionExpression(_) |
+                                    Expression::FunctionExpression(_)
+                                )
+                            } else { false }
+                        })
+                    } else { false }
+                }
+                _ => false,
+            };
+            if !is_non_fn_var { continue; }
+
+            // Lower the variable declaration (sets module globals via ts_set_module_global).
+            let (_, nb) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
+            current_block = nb;
+        }
+
+        // Release all loaded module globals (they were just borrowed for reading).
+        for (name, v) in &scope {
+            if self.module_global_names.contains(name) {
+                let v_i64 = self.ensure_i64(*v, current_block)?;
+                current_block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[v_i64], &[], self.loc,
+                ));
+            }
+        }
+
+        current_block.append_operation(func::r#return(&[], self.loc));
+
+        let op = func::func(
+            self.ctx,
+            StringAttribute::new(self.ctx, &fn_name),
+            TypeAttribute::new(fn_type.into()),
+            region,
+            &[],
+            self.loc,
+        );
+        self.module.body().append_operation(op);
+        self.funcs.insert(fn_name.clone(), FuncSig {
+            param_types: vec![],
+            return_type: None,
+            has_rest: false,
+            has_this_param: false,
+        });
+        self.module_init_fns.push(fn_name);
+        Ok(())
     }
 
 }

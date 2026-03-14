@@ -589,3 +589,33 @@ fn json_builtin() {
         1, // parsed.a = 1
     );
 }
+
+// ── Regression: builtin-method dispatch must not misroute user methods ────────
+
+/// A user-class `.add(method, path, handler)` (3 args) must dispatch via the
+/// normal dynamic method call path, NOT via `ts_container_add` (1-arg Set/WeakSet
+/// container operation).  Previously every `.add()` call was unconditionally
+/// treated as a container op, silently dropping the extra arguments.
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn custom_add_method_multi_arg() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/custom_add_method.ts"),
+        &root.join("target/test-custom-add"),
+        3, // router has 3 routes after three router.add() calls
+    );
+}
+
+/// `Set.add(value)` with exactly 1 argument must still route through
+/// `ts_container_add`, not fall through to slow dynamic dispatch.
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn set_add_single_arg() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/set_add.ts"),
+        &root.join("target/test-set-add"),
+        3, // set has 3 unique elements (10, 20, 30); duplicate 20 is ignored
+    );
+}

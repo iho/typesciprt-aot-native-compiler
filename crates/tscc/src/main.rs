@@ -98,6 +98,11 @@ fn main() -> Result<()> {
     // ── 4. Run MLIR passes ────────────────────────────────────────────────
 
     info!("running MLIR pass pipeline");
+    // Debug: dump MLIR to /tmp/hono_debug.mlir before passes
+    if std::env::var("DUMP_MLIR").is_ok() {
+        let s = module.as_operation().to_string();
+        std::fs::write("/tmp/hono_debug.mlir", &s).ok();
+    }
     run_lowering_pipeline(&cg.mlir, &mut module)
         .context("MLIR pass pipeline failed")?;
 

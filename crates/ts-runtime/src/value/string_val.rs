@@ -106,6 +106,41 @@ pub unsafe extern "C" fn ts_str_index_of(s_val: TsVal, search_val: TsVal) -> TsV
     TsVal::from_i32(-1)
 }
 
+/// `str.indexOf(search, fromIndex)` — returns first char-index >= fromIndex of `search` in `s`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_index_of_from(s_val: TsVal, search_val: TsVal, from_val: TsVal) -> TsVal {
+    if s_val.is_ptr() && heap_tag(s_val) == 2 && search_val.is_ptr() && heap_tag(search_val) == 2 {
+        let s = &*(s_val.as_ptr() as *const TsString);
+        let search = &*(search_val.as_ptr() as *const TsString);
+        let chars: Vec<char> = s.inner.chars().collect();
+        let from = if from_val.is_int32() {
+            (from_val.as_i32() as usize).min(chars.len())
+        } else {
+            0
+        };
+        // Convert char-index to byte-index for the slice
+        let byte_start: usize = chars[..from].iter().map(|c: &char| c.len_utf8()).sum();
+        if let Some(byte_pos) = s.inner[byte_start..].find(search.inner.as_str()) {
+            let char_pos = s.inner[..byte_start + byte_pos].chars().count();
+            return TsVal::from_i32(char_pos as i32);
+        }
+    }
+    TsVal::from_i32(-1)
+}
+
+/// `str.lastIndexOf(search)` — returns last char-index of `search` in `s` (or -1).
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_last_index_of(s_val: TsVal, search_val: TsVal) -> TsVal {
+    if s_val.is_ptr() && heap_tag(s_val) == 2 && search_val.is_ptr() && heap_tag(search_val) == 2 {
+        let s = &*(s_val.as_ptr() as *const TsString);
+        let search = &*(search_val.as_ptr() as *const TsString);
+        if let Some(pos) = s.inner.rfind(search.inner.as_str()) {
+            return TsVal::from_i32(s.inner[..pos].chars().count() as i32);
+        }
+    }
+    TsVal::from_i32(-1)
+}
+
 /// Polymorphic `indexOf`: dispatches to array or string variant at runtime.
 #[no_mangle]
 pub unsafe extern "C" fn ts_val_index_of(obj: TsVal, search: TsVal) -> TsVal {
