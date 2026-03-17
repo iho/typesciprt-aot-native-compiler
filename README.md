@@ -9,7 +9,26 @@ Values are represented using NaN-boxing (`TsVal = i64`) and memory is managed wi
 ### Prerequisites
 - Rust 1.70+
 - LLVM 21 (install via Homebrew on macOS: `brew install llvm`)
-- macOS with ARM64 CPU (or modify `.cargo/config.toml` for your architecture)
+- macOS with ARM64 CPU (or update the env vars below for your LLVM path)
+
+### Configure LLVM paths
+
+Copy the example config and update the paths to your LLVM 21 installation:
+
+```bash
+cp .cargo/example.toml .cargo/config.toml
+```
+
+Then edit `.cargo/config.toml` and set the three environment variables to point at your LLVM prefix:
+
+```toml
+[env]
+MLIR_SYS_210_PREFIX  = "/opt/homebrew/opt/llvm"   # ← update if different
+LLVM_SYS_210_PREFIX  = "/opt/homebrew/opt/llvm"
+TABLEGEN_210_PREFIX  = "/opt/homebrew/opt/llvm"
+```
+
+On a default Homebrew ARM64 Mac the paths above are correct. On Intel Mac or a custom install, replace `/opt/homebrew/opt/llvm` with the output of `brew --prefix llvm`.
 
 ### Build & Run
 
@@ -268,10 +287,33 @@ encodeURI(url);  decodeURI(encoded);
 
 ### Async & HTTP Server
 ```typescript
-// Built-in HTTP server (hyper + tokio)
+// Low-level built-in HTTP server (hyper + tokio)
 serve(3000, async (req: Request) => {
   return new Response("Hello!", { status: 200 });
 });
+```
+
+### Hono (unmodified)
+
+The compiler can compile and run the [Hono](https://hono.dev/) web framework from source without any modifications to Hono's files. Create an entry point:
+
+```typescript
+import { Hono } from './hono/src/index'
+
+const app = new Hono()
+app.get('/', (c) => c.text('Hello World'))
+app.get('/hello', (c) => c.text('Hello!'))
+
+Deno.serve({ port: 8080 }, app.fetch)
+```
+
+Then compile and run:
+
+```bash
+cargo run -p tscc -- my_app.ts -o my_app
+./my_app
+curl http://localhost:8080/        # Hello World
+curl http://localhost:8080/hello   # Hello!
 ```
 
 ---
@@ -356,24 +398,29 @@ Heap objects (Object, Array, String, Function, Map, Promise, RegExp) are ref-cou
 
 ### Heap Tags
 
-| Tag | Type       | Description                          |
-|-----|------------|--------------------------------------|
-| 0   | TsObject   | JS objects, classes, Request, Error  |
-| 1   | TsArray    | JS arrays, closure env arrays        |
-| 2   | TsString   | Interned strings                     |
-| 3   | TsPromise  | async/await promises                 |
-| 4   | TsFunction | Function pointer + env (closures)    |
-| 5   | TsMap      | Map built-in                         |
-| 6   | TsRegExp   | RegExp                               |
-| 7   | TsHeaders  | Headers (same layout as TsMap)       |
-| 8   | TsResponse | HTTP Response with status/body       |
+| Tag | Type              | Description                          |
+|-----|-------------------|--------------------------------------|
+| 0   | TsObject          | JS objects, classes, Request, Error  |
+| 1   | TsArray           | JS arrays, closure env arrays        |
+| 2   | TsString          | Interned strings                     |
+| 3   | TsPromise         | async/await promises                 |
+| 4   | TsFunction        | Function pointer + env (closures)    |
+| 5   | TsMap             | Map built-in                         |
+| 6   | TsRegExp          | RegExp                               |
+| 7   | TsHeaders         | Headers (same layout as TsMap)       |
+| 8   | TsResponse        | HTTP Response with status/body       |
+| 9   | URLSearchParams   | URL query parameter bag              |
+| 10  | TsSymbol          | Symbol                               |
+| 11  | TsSet             | Set built-in                         |
+| 12  | TsWeakMap         | WeakMap                              |
+| 13  | TsWeakSet         | WeakSet                              |
 
 ---
 
 ## Testing
 
 ```bash
-# Run all tests (49 tests, requires LLVM)
+# Run all tests (51 tests, requires LLVM)
 cargo test -p tscc -- --include-ignored --test-threads=1
 
 # Run specific test file
@@ -386,15 +433,12 @@ Always use `--test-threads=1` to avoid race conditions in concurrent LLVM codege
 
 ## What's Not Yet Implemented
 
-See [missing.md](./missing.md) for the full list. Key gaps:
+Key gaps:
 
-- `new URL(href)` / `URLSearchParams` — needed for Hono routing
-- `Response.text()` / `Response.json()` — needed for HTTP body handling
 - `fetch()` global — no HTTP client yet
-- Async class methods — class methods run synchronously
-- Floating-point arithmetic — numbers use i32 truncation
-- `switch` / `case` — not implemented
-- `WeakMap`, `Symbol`, generators — not implemented
+- Async class methods
+- `switch` / `case`
+- Generators / iterators
 
 ---
 
