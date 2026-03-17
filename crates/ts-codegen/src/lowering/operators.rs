@@ -645,6 +645,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             _ => bail!("update expression: only simple identifiers are supported"),
         };
         let name = id.name.to_string();
+
+        // Cell variable: read/write through the single-element TsArray cell.
+        if self.is_cell_var(&name) {
+            let cell_ptr = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("cell var undefined: {}", name))?;
+            let old_actual = self.cell_read(cell_ptr, block)?; // owned (ts_arr_get retains)
+            let old_i32 = self.ensure_i32(old_actual, block)?;
+            let one = self.lower_numeric_literal(1, block)?;
+            let new_i32: Value<'c, 'b> = match update.operator {
+                UpdateOperator::Increment => block.append_operation(arith::addi(old_i32, one, self.loc)).result(0)?.into(),
+                UpdateOperator::Decrement => block.append_operation(arith::subi(old_i32, one, self.loc)).result(0)?.into(),
+            };
+            let new_boxed = self.ensure_i64(new_i32, block)?;
+            self.cell_write(cell_ptr, new_boxed, block)?;
+            if update.prefix {
+                // Release the old value retained by cell_read (caller gets new value).
+                let old_i64 = self.ensure_i64(old_actual, block)?;
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                return Ok((Some(new_boxed), block));
+            } else {
+                // Return old value (owned via cell_read). New value is in cell.
+                return Ok((Some(old_actual), block));
+            }
+        }
+
         // ARC: Manual identifier read.
         let old_val = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
         let old_i64 = self.ensure_i64(old_val, block)?;
@@ -772,13 +796,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             _ => bail!("logical assignment (??= / ||= / &&=) to non-identifier targets not supported yet"),
         };
 
-        // Read LHS — manual identifier retain (equivalent to Identifier lowering).
-        let lhs_val = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
-        let lhs_i64 = self.ensure_i64(lhs_val, block)?;
-        block.append_operation(func::call(
-            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
-            &[lhs_i64], &[], self.loc,
-        ));
+        // Read LHS. For cell vars, read the actual value from the cell (not the cell pointer).
+        let lhs_i64 = if self.is_cell_var(&name) {
+            let cell_ptr = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
+            self.cell_read(cell_ptr, block)?
+        } else {
+            let lhs_val = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
+            let v = self.ensure_i64(lhs_val, block)?;
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                &[v], &[], self.loc,
+            ));
+            v
+        };
 
         // Compute condition i1: when true → evaluate RHS and assign; when false → keep LHS.
         let cond_i1: Value<'c, 'b> = match assign.operator {
@@ -864,7 +894,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // After merge: result is arg 0, other scope vars from args 1..
         let result: Value<'c, 'b> = merge_block.argument(0)?.into();
-        scope.insert(name, result);
+        if self.is_cell_var(&name) {
+            // Write new value back to cell; scope[name] stays as the cell pointer.
+            let cell_ptr = *orig_scope.get(&name).unwrap();
+            self.cell_write(cell_ptr, result, merge_block)?;
+        } else {
+            scope.insert(name, result);
+        }
         for (i, k) in other_keys.iter().enumerate() {
             scope.insert(k.clone(), merge_block.argument(i + 1)?.into());
         }
@@ -901,7 +937,54 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         match &assign.left {
             AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let name = id.name.to_string();
-                
+
+                // Cell variable: read/write through the single-element TsArray cell.
+                if self.is_cell_var(&name) {
+                    let cell_ptr = *scope.get(&name)
+                        .ok_or_else(|| anyhow::anyhow!("cell var undefined: {}", name))?;
+                    let new_val: Value<'c, 'b> = match assign.operator {
+                        AssignmentOperator::Assign => rhs,
+                        _ => {
+                            // Read actual value from cell.
+                            let lhs_actual = self.cell_read(cell_ptr, block)?;
+                            let lhs_i64 = self.ensure_i64(lhs_actual, block)?;
+                            let rhs_i64 = self.ensure_i64(rhs, block)?;
+                            let res: Value<'c, 'b> = match assign.operator {
+                                AssignmentOperator::Addition => {
+                                    let res = block.append_operation(func::call(
+                                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_add"),
+                                        &[lhs_i64, rhs_i64], &[self.i64_type()], self.loc,
+                                    )).result(0)?.into();
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                    res
+                                }
+                                AssignmentOperator::Subtraction => {
+                                    let lhs_i32 = self.ensure_i32(lhs_actual, block)?;
+                                    let rhs_i32 = self.ensure_i32(rhs, block)?;
+                                    let res_i32 = block.append_operation(arith::subi(lhs_i32, rhs_i32, self.loc)).result(0)?.into();
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                    res_i32
+                                }
+                                AssignmentOperator::Multiplication => {
+                                    let lhs_i32 = self.ensure_i32(lhs_actual, block)?;
+                                    let rhs_i32 = self.ensure_i32(rhs, block)?;
+                                    let res_i32 = block.append_operation(arith::muli(lhs_i32, rhs_i32, self.loc)).result(0)?.into();
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                    res_i32
+                                }
+                                _ => bail!("unsupported compound assignment operator for cell var"),
+                            };
+                            res
+                        }
+                    };
+                    // Write through cell. cell_write retains the new value internally.
+                    self.cell_write(cell_ptr, new_val, block)?;
+                    return Ok((Some(new_val), block));
+                }
+
                 // ARC: Get the new value (possibly compound).
                 let new_val = match assign.operator {
                     AssignmentOperator::Assign => rhs,
@@ -911,39 +994,83 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         let lhs = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
                         let lhs_i64 = self.ensure_i64(lhs, block)?;
                         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[lhs_i64], &[], self.loc));
-                        
-                        
-                        let lhs_i32 = self.ensure_i32(lhs, block)?;
-                        let rhs_i32 = self.ensure_i32(rhs, block)?;
-                        let res_i32 = match assign.operator {
-                            AssignmentOperator::Addition => block.append_operation(arith::addi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                            AssignmentOperator::Subtraction => block.append_operation(arith::subi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                            AssignmentOperator::Multiplication => block.append_operation(arith::muli(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+
+
+                        let lhs_i64 = self.ensure_i64(lhs, block)?;
+                        let rhs_i64 = self.ensure_i64(rhs, block)?;
+                        // Use ts_add for Addition (handles strings + integers at runtime).
+                        // For other operators use integer arithmetic.
+                        let result_val: Value<'c, 'b> = match assign.operator {
+                            AssignmentOperator::Addition => {
+                                let res = block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_add"),
+                                    &[lhs_i64, rhs_i64], &[self.i64_type()], self.loc,
+                                )).result(0)?.into();
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                // Retain res so both scope and the caller (ExpressionStatement)
+                                // hold an owned reference. ExpressionStatement will release
+                                // the caller's ref, leaving scope's ref intact.
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[res], &[], self.loc));
+                                return {
+                                    // Release old scope value, store new.
+                                    let is_unowned_param = self.current_fn_params.contains(&name);
+                                    if !is_unowned_param {
+                                        if let Some(&old_val) = scope.get(&name) {
+                                            let old_i64 = self.ensure_i64(old_val, block)?;
+                                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                                        }
+                                    } else {
+                                        self.current_fn_params.remove(&name);
+                                    }
+                                    scope.insert(name, res);
+                                    Ok((Some(res), block))
+                                };
+                            }
+                            AssignmentOperator::Subtraction => {
+                                let lhs_i32 = self.ensure_i32(lhs, block)?;
+                                let rhs_i32 = self.ensure_i32(rhs, block)?;
+                                let res_i32 = block.append_operation(arith::subi(lhs_i32, rhs_i32, self.loc)).result(0)?.into();
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                res_i32
+                            }
+                            AssignmentOperator::Multiplication => {
+                                let lhs_i32 = self.ensure_i32(lhs, block)?;
+                                let rhs_i32 = self.ensure_i32(rhs, block)?;
+                                let res_i32 = block.append_operation(arith::muli(lhs_i32, rhs_i32, self.loc)).result(0)?.into();
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                res_i32
+                            }
                             _ => bail!("unsupported compound assignment operator"),
                         };
-                        
-                        // ARC: Release operands of the compound operation.
-                        let lhs_i64 = self.ensure_i64(lhs, block)?;
-                        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
-                        let rhs_i64 = self.ensure_i64(rhs, block)?;
-                        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
-                        
-                        res_i32
+
+                        result_val
                     }
                 };
-                
-                // ARC: Release the old value in the scope.
-                if let Some(&old_val) = scope.get(&name) {
-                    let old_i64 = self.ensure_i64(old_val, block)?;
-                    block.append_operation(func::call(
-                        self.ctx,
-                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                        &[old_i64],
-                        &[],
-                        self.loc,
-                    ));
+
+                // ARC: Release the old value in the scope — unless it is still an
+                // unowned function parameter (params are "borrowed" refs from the
+                // caller; the caller's post-call ts_release_val owns them).
+                // Once a param is first assigned, it is promoted to a local (owned).
+                let is_unowned_param = self.current_fn_params.contains(&name);
+                if !is_unowned_param {
+                    if let Some(&old_val) = scope.get(&name) {
+                        let old_i64 = self.ensure_i64(old_val, block)?;
+                        block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[old_i64],
+                            &[],
+                            self.loc,
+                        ));
+                    }
+                } else {
+                    // Promote: param is now an owned local variable.
+                    self.current_fn_params.remove(&name);
                 }
-                
+
                 scope.insert(name.clone(), new_val);
 
                 // If this variable is a captured env var, write the mutation back to the env array.

@@ -106,6 +106,30 @@ pub unsafe extern "C" fn ts_arr_pop(arr_val: TsVal) -> TsVal {
     UNDEFINED
 }
 
+/// Prepend `val` to the beginning of `arr`. Returns the new length.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_unshift(arr_val: TsVal, val: TsVal) -> TsVal {
+    if arr_val.is_ptr() && heap_tag(arr_val) == 1 {
+        let arr = &mut *(arr_val.as_ptr() as *mut TsArray);
+        ts_retain_val(val);
+        arr.elements.insert(0, val);
+        return TsVal::from_i32(arr.elements.len() as i32);
+    }
+    TsVal::from_i32(0)
+}
+
+/// Remove and return the first element (or `undefined`).
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_shift(arr_val: TsVal) -> TsVal {
+    if arr_val.is_ptr() && heap_tag(arr_val) == 1 {
+        let arr = &mut *(arr_val.as_ptr() as *mut TsArray);
+        if arr.elements.is_empty() { return UNDEFINED; }
+        arr.elements.remove(0) // Transfer ownership to caller.
+    } else {
+        UNDEFINED
+    }
+}
+
 /// Append all elements of `src` to `dst` (implements `[...src, ...]`).
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_push_all(dst: TsVal, src: TsVal) {
@@ -245,19 +269,15 @@ pub unsafe extern "C" fn ts_arr_filter(arr: TsVal, callback: TsVal) -> TsVal {
 
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_for_each(arr: TsVal, callback: TsVal) -> TsVal {
-    eprintln!("[DEBUG] ts_arr_for_each: arr={:016x}", arr.0);
     if arr.is_ptr() && heap_tag(arr) == 1 {
         let arr_ptr = arr.as_ptr() as *const TsArray;
         let len = (*arr_ptr).elements.len();
-        eprintln!("[DEBUG] ts_arr_for_each: len={}", len);
         for i in 0..len {
             let elem = { let r = &*arr_ptr; r.elements[i] };
-            eprintln!("[DEBUG] ts_arr_for_each: calling dispatch_callback for elem[{}]={:016x}", i, elem.0);
             ts_retain_val(elem);
             let index = TsVal::from_i32(i as i32);
             ts_retain_val(arr);
             let result = dispatch_callback(callback, &[elem, index, arr]);
-            eprintln!("[DEBUG] ts_arr_for_each: dispatch_callback returned");
             ts_release_val(arr);
             ts_release_val(elem);
             ts_release_val(result);
@@ -473,5 +493,33 @@ pub unsafe extern "C" fn ts_arr_flat(arr: TsVal, depth: i32) -> TsVal {
         }
     }
     flatten(arr, result, depth);
+    result
+}
+
+/// `arr.concat(other)` — returns a new array with elements of `arr` followed by elements of `other`.
+/// `other` can be an array (spreads its elements) or any other value (appended as-is).
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_concat(arr: TsVal, other: TsVal) -> TsVal {
+    let result = ts_arr_new(0);
+    // Copy elements from arr
+    if arr.is_ptr() && heap_tag(arr) == 1 {
+        let arr_ptr = arr.as_ptr() as *const TsArray;
+        let len = (*arr_ptr).elements.len();
+        for i in 0..len {
+            let elem = { let r = &*arr_ptr; r.elements[i] };
+            ts_arr_push(result, elem);
+        }
+    }
+    // Append elements from other (spread if array, push otherwise)
+    if other.is_ptr() && heap_tag(other) == 1 {
+        let other_ptr = other.as_ptr() as *const TsArray;
+        let len = (*other_ptr).elements.len();
+        for i in 0..len {
+            let elem = { let r = &*other_ptr; r.elements[i] };
+            ts_arr_push(result, elem);
+        }
+    } else {
+        ts_arr_push(result, other);
+    }
     result
 }

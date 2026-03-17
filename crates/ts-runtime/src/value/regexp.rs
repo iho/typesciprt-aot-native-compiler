@@ -125,29 +125,66 @@ pub unsafe extern "C" fn ts_str_match(str_val: TsVal, re_val: TsVal) -> TsVal {
     }
 }
 
-/// str.replace(re_or_str, replacement_str) — already handles string→string;
-/// this handles regex → string replacement.
+/// str.replace(re_or_str, replacement_str_or_fn) — handles regex replacement with string or callback.
 #[no_mangle]
 pub unsafe extern "C" fn ts_str_replace_regex(str_val: TsVal, re_val: TsVal, rep_val: TsVal) -> TsVal {
     if !re_val.is_ptr() || heap_tag(re_val) != 6 {
-        // Fall back to string replace
         return ts_str_replace(str_val, re_val, rep_val);
     }
     let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
     let s = if let Some(s) = str_val_to_rust(str_val) { s } else { return str_val; };
-    let rep = if let Some(r) = str_val_to_rust(rep_val) { r } else { String::new() };
     let pattern = js_flags_to_regex_prefix(&re_obj.source, &re_obj.flags);
-    match Regex::new(&pattern) {
-        Ok(re) => {
-            let result = if re_obj.flags.contains('g') {
-                re.replace_all(&s, rep.as_str()).into_owned()
-            } else {
-                re.replace(&s, rep.as_str()).into_owned()
-            };
-            rust_str_to_val(result)
+    let re = match Regex::new(&pattern) {
+        Ok(r) => r,
+        Err(_) => return str_val,
+    };
+
+    // Callback replacer: rep_val is a TsFunction
+    if rep_val.is_ptr() && heap_tag(rep_val) == 4 {
+        use super::func::dispatch_callback;
+        let global = re_obj.flags.contains('g');
+        let mut result = String::new();
+        let mut last_end = 0;
+
+        for caps in re.captures_iter(&s) {
+            let full_match = caps.get(0).unwrap();
+            let match_start = full_match.start();
+            let match_end = full_match.end();
+
+            // Build args: [fullMatch, group1, group2, ...]
+            let mut args: Vec<TsVal> = Vec::with_capacity(caps.len());
+            for i in 0..caps.len() {
+                args.push(if let Some(m) = caps.get(i) {
+                    rust_str_to_val(m.as_str().to_string())
+                } else {
+                    super::UNDEFINED
+                });
+            }
+
+            result.push_str(&s[last_end..match_start]);
+
+            let ret_val = dispatch_callback(rep_val, &args);
+            result.push_str(&str_val_to_rust(ret_val).unwrap_or_default());
+
+            for &arg in &args { super::ts_release_val(arg); }
+            super::ts_release_val(ret_val);
+
+            last_end = match_end;
+            if !global { break; }
         }
-        Err(_) => str_val,
+
+        result.push_str(&s[last_end..]);
+        return rust_str_to_val(result);
     }
+
+    // String replacement
+    let rep = if let Some(r) = str_val_to_rust(rep_val) { r } else { String::new() };
+    let result = if re_obj.flags.contains('g') {
+        re.replace_all(&s, rep.as_str()).into_owned()
+    } else {
+        re.replace(&s, rep.as_str()).into_owned()
+    };
+    rust_str_to_val(result)
 }
 
 /// Get .source property of RegExp.

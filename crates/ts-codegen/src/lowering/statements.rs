@@ -43,6 +43,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ));
         }
 
+        // Compute which top-level variables need cell treatment (mutated inside closures).
+        let saved_cell_vars = std::mem::replace(
+            &mut self.cell_vars,
+            crate::lowering::expressions::compute_cell_vars_for_body(&program.body),
+        );
+        let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+
         for stmt in &program.body {
             // Function declarations are emitted separately; skip here.
             if matches!(stmt, Statement::FunctionDeclaration(_)) {
@@ -66,6 +73,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.loc,
             ));
         }
+
+        self.cell_vars = saved_cell_vars;
+        self.cell_captures = saved_cell_captures;
 
         self.terminate_with_return(current_block, result_value)?;
 
@@ -306,7 +316,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
                             self.loc,
                         )).result(0)?.into();
-                        scope.insert(name.clone(), undef);
+                        if self.is_cell_var(&name) {
+                            let cell = self.alloc_cell(undef, block)?;
+                            scope.insert(name.clone(), cell);
+                        } else {
+                            scope.insert(name.clone(), undef);
+                        }
                     }
                     if let Some(init) = &declarator.init {
                         // Class expression: `const Foo = class<T> extends Bar<T> { ... }`
@@ -331,7 +346,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
                         block = nb;
                         if let Some(val) = val_opt {
-                            scope.insert(name.clone(), val);
+                            if self.is_cell_var(&name) {
+                                let cell = self.alloc_cell(val, block)?;
+                                scope.insert(name.clone(), cell);
+                            } else {
+                                scope.insert(name.clone(), val);
+                            }
                             // If this is a module-level global, also store it in the runtime global map.
                             if self.module_global_names.contains(&name) {
                                 let val_i64 = self.ensure_i64(val, block)?;
@@ -783,6 +803,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Lower init (may introduce new variables into scope).
         let mut current = block;
+        // Save scope before init so we can restore shadowed outer variables after the loop.
+        // e.g. `for (let i = 0, len = n; ...)` shadows outer `i` and `len`.
+        let pre_init_scope = scope.clone();
         if let Some(init) = &for_stmt.init {
             match init {
                 ForStatementInit::VariableDeclaration(vd) => {
@@ -884,6 +907,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         for (i, k) in scope_keys.iter().enumerate() {
             scope.insert(k.clone(), exit_block.argument(i)?.into());
+        }
+
+        // Restore outer-scope variables that were shadowed by the for-init's variable
+        // declarations (e.g. `for (let i = 0, len = n; ...)` shadows outer `i`/`len`).
+        // After the loop, block-scoped init vars are no longer visible; outer bindings resume.
+        if let Some(ForStatementInit::VariableDeclaration(vd)) = for_stmt.init.as_ref() {
+            for decl in &vd.declarations {
+                if let BindingPattern::BindingIdentifier(id) = &decl.id {
+                    let name = id.name.as_str();
+                    if let Some(&outer_val) = pre_init_scope.get(name) {
+                        // This init variable shadowed an outer binding — restore the outer value.
+                        scope.insert(name.to_string(), outer_val);
+                    } else {
+                        // Newly introduced by the init — remove from outer scope.
+                        scope.remove(name);
+                    }
+                }
+            }
         }
 
         Ok((None, exit_block))

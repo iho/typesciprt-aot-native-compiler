@@ -31,18 +31,35 @@ pub unsafe extern "C" fn ts_set_new() -> TsVal {
     TsVal::from_ptr(ptr as *mut u8)
 }
 
-/// `new Set(iterable)` — create a Set pre-populated from a TsArray iterable.
+/// `new Set(iterable)` — create a Set pre-populated from a TsArray or TsString iterable.
 #[no_mangle]
 pub unsafe extern "C" fn ts_set_new_from_iter(iter: TsVal) -> TsVal {
     let set_val = ts_set_new();
-    if iter.is_ptr() && heap_tag(iter) == 1 {
-        let arr = &*(iter.as_ptr() as *const TsArray);
-        // Clone element list first so we don't hold a borrow across ts_set_add
-        let elems: Vec<TsVal> = arr.elements.clone();
-        for el in elems {
-            // ts_set_add retains el internally; we don't own el here
-            let result = ts_set_add(set_val, el);
-            ts_release_val(result); // ts_set_add returns set_val with +1 refcount
+    if iter.is_ptr() {
+        match heap_tag(iter) {
+            1 => {
+                // TsArray: add each element
+                let arr = &*(iter.as_ptr() as *const TsArray);
+                let elems: Vec<TsVal> = arr.elements.clone();
+                for el in elems {
+                    let result = ts_set_add(set_val, el);
+                    ts_release_val(result);
+                }
+            }
+            2 => {
+                // TsString: add each Unicode character
+                use super::TsString;
+                use super::uri::rust_str_to_val;
+                let ts_str = &*(iter.as_ptr() as *const TsString);
+                let chars: Vec<String> = ts_str.inner.chars().map(|c| c.to_string()).collect();
+                for ch in chars {
+                    let ch_val = rust_str_to_val(ch);
+                    let result = ts_set_add(set_val, ch_val);
+                    ts_release_val(result);
+                    ts_release_val(ch_val);
+                }
+            }
+            _ => {}
         }
     }
     set_val

@@ -236,6 +236,7 @@ pub mod container;
 
 pub use func::{
     ts_func_new, ts_func_new_this, ts_closure_new, ts_closure_new_rest, ts_closure_get_env,
+    ts_func_bind,
     ts_func_call0, ts_func_call1, ts_func_call2, ts_func_call3, ts_func_call4,
     ts_method_call0, ts_method_call1, ts_method_call2, ts_method_call3, ts_method_call4,
 };
@@ -247,11 +248,11 @@ pub use object::{
 };
 pub use array::{
     ts_arr_new, ts_arr_get, ts_arr_set, ts_arr_len,
-    ts_arr_push, ts_arr_pop, ts_arr_push_all, ts_arr_join,
+    ts_arr_push, ts_arr_pop, ts_arr_unshift, ts_arr_shift, ts_arr_push_all, ts_arr_join,
     ts_arr_index_of, ts_arr_rest,
     ts_arr_map, ts_arr_filter, ts_arr_for_each, ts_arr_reduce,
     ts_arr_find, ts_arr_find_index, ts_arr_some, ts_arr_every,
-    ts_arr_sort, ts_arr_flat_map, ts_arr_flat,
+    ts_arr_sort, ts_arr_flat_map, ts_arr_flat, ts_arr_concat,
 };
 pub use string_val::{
     ts_string_new, ts_string_concat,
@@ -262,6 +263,7 @@ pub use string_val::{
     ts_str_starts_with, ts_str_ends_with,
     ts_str_pad_start, ts_str_pad_end,
     ts_str_char_at, ts_str_char_code_at, ts_str_repeat, ts_str_from_char_code,
+    ts_str_at,
 };
 pub use map::{
     ts_map_new, ts_map_set, ts_map_get, ts_map_has, ts_map_delete,

@@ -68,6 +68,13 @@ pub unsafe extern "C" fn ts_val_to_string(val: TsVal) -> TsVal {
             2 => { ts_retain_val(val); return val; }
             0 => return ts_string_new(b"[object Object]\0".as_ptr() as *const i8),
             1 => return ts_string_new(b"[object Array]\0".as_ptr() as *const i8),
+            6 => {
+                // RegExp: format as /source/flags
+                let re = &*(val.as_ptr() as *const crate::value::TsRegExp);
+                let s = format!("/{}/{}\0", re.source, re.flags);
+                return ts_string_new(s.as_ptr() as *const i8);
+            }
+            4 => return ts_string_new(b"function() { [native code] }\0".as_ptr() as *const i8),
             _ => {}
         }
     }
@@ -433,4 +440,24 @@ pub unsafe extern "C" fn ts_str_from_char_code(code_val: TsVal) -> TsVal {
         return ts_string_new(bytes.as_ptr() as *const i8);
     }
     ts_string_new(b"\0".as_ptr() as *const i8)
+}
+
+/// `s.at(index)` — return the character at index (supports negative indices) as a string.
+/// Returns `undefined` if index is out of bounds.
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_at(s_val: TsVal, idx_val: TsVal) -> TsVal {
+    use super::UNDEFINED;
+    if s_val.is_ptr() && heap_tag(s_val) == 2 {
+        let s = &*(s_val.as_ptr() as *const TsString);
+        let chars: Vec<char> = s.inner.chars().collect();
+        let len = chars.len() as i32;
+        let idx = if idx_val.is_int32() { idx_val.as_i32() } else { 0 };
+        let actual = if idx < 0 { len + idx } else { idx };
+        if actual >= 0 && actual < len {
+            let mut bytes = chars[actual as usize].to_string().into_bytes();
+            bytes.push(0u8);
+            return ts_string_new(bytes.as_ptr() as *const i8);
+        }
+    }
+    UNDEFINED
 }

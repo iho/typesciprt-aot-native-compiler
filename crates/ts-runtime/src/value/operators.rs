@@ -99,10 +99,22 @@ pub unsafe extern "C" fn ts_mod(a: TsVal, b: TsVal) -> TsVal {
 
 // ── Comparisons ───────────────────────────────────────────────────────────────
 
-#[no_mangle] pub unsafe extern "C" fn ts_lt(a: TsVal, b: TsVal) -> i32  { if ts_val_to_f64_raw(a) < ts_val_to_f64_raw(b) { 1 } else { 0 } }
-#[no_mangle] pub unsafe extern "C" fn ts_le(a: TsVal, b: TsVal) -> i32  { if ts_val_to_f64_raw(a) <= ts_val_to_f64_raw(b) { 1 } else { 0 } }
-#[no_mangle] pub unsafe extern "C" fn ts_gt(a: TsVal, b: TsVal) -> i32  { if ts_val_to_f64_raw(a) > ts_val_to_f64_raw(b) { 1 } else { 0 } }
-#[no_mangle] pub unsafe extern "C" fn ts_ge(a: TsVal, b: TsVal) -> i32  { if ts_val_to_f64_raw(a) >= ts_val_to_f64_raw(b) { 1 } else { 0 } }
+/// JS abstract relational comparison: strings compared lexicographically, else numerically.
+unsafe fn abstract_lt(a: TsVal, b: TsVal) -> Option<bool> {
+    if a.is_ptr() && heap_tag(a) == 2 && b.is_ptr() && heap_tag(b) == 2 {
+        let sa = &*(a.as_ptr() as *const TsString);
+        let sb = &*(b.as_ptr() as *const TsString);
+        return Some(sa.inner < sb.inner);
+    }
+    let fa = ts_val_to_f64_raw(a);
+    let fb = ts_val_to_f64_raw(b);
+    if fa.is_nan() || fb.is_nan() { None } else { Some(fa < fb) }
+}
+
+#[no_mangle] pub unsafe extern "C" fn ts_lt(a: TsVal, b: TsVal) -> i32 { abstract_lt(a, b).map_or(0, |v| v as i32) }
+#[no_mangle] pub unsafe extern "C" fn ts_le(a: TsVal, b: TsVal) -> i32 { abstract_lt(b, a).map_or(0, |v| !v as i32) }
+#[no_mangle] pub unsafe extern "C" fn ts_gt(a: TsVal, b: TsVal) -> i32 { abstract_lt(b, a).map_or(0, |v| v as i32) }
+#[no_mangle] pub unsafe extern "C" fn ts_ge(a: TsVal, b: TsVal) -> i32 { abstract_lt(a, b).map_or(0, |v| !v as i32) }
 
 // ── Math built-ins ────────────────────────────────────────────────────────────
 

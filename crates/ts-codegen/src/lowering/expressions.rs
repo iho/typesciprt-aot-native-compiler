@@ -224,6 +224,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
                 match scope.get(&name) {
                     Some(&v) => {
+                        // If this variable is a cell, read the actual value through the cell.
+                        if self.is_cell_var(&name) {
+                            let val = self.cell_read(v, block)?;
+                            return Ok((Some(val), block));
+                        }
                         let v_i64 = self.ensure_i64(v, block)?;
                         block.append_operation(func::call(
                             self.ctx,
@@ -938,14 +943,21 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
-        // Dynamic function call: callee is an identifier holding a TsFunction (i64) in scope
+        // Dynamic function call: callee is an identifier holding a TsFunction (i64) in scope.
+        // Local scope variables always take precedence over top-level function names.
         if let Expression::Identifier(callee_id) = &call.callee {
             let name = callee_id.name.as_str();
             let in_scope_as_i64 = scope.get(name)
                 .map(|v| v.r#type() == self.i64_type())
                 .unwrap_or(false);
-            if in_scope_as_i64 && !self.funcs.contains_key(name) {
-                let fn_val = scope[name];
+            if in_scope_as_i64 {
+                let raw = scope[name];
+                // If the callee is a cell var, read the actual function value through the cell.
+                let fn_val = if self.is_cell_var(name) {
+                    self.cell_read(raw, block)?
+                } else {
+                    raw
+                };
                 return self.lower_dynamic_call(fn_val, &call.arguments, block, region, scope);
             }
         }
@@ -1338,27 +1350,33 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // "add" is a container op only with 1 arg (Set.add/WeakSet.add);
                 // with more args it's a user-defined method (e.g. router.add(method, path, arr)).
                 (method_name == "add" && n_call_args == 1) ||
+                // "match" is a string builtin only with 1 arg (String.prototype.match(re));
+                // with 2+ args it's a user method (e.g. router.match(method, path)).
+                (method_name == "match" && n_call_args == 1) ||
                 matches!(method_name.as_str(),
-                "push" | "pop" | "indexOf" | "lastIndexOf" | "includes" | "join" |
-                "slice" | "toUpperCase" | "toLowerCase" | "trim" | "split" |
+                "push" | "pop" | "unshift" | "shift" | "indexOf" | "lastIndexOf" | "includes" | "join" |
+                "slice" | "concat" | "toUpperCase" | "toLowerCase" | "trim" | "split" |
                 // Array HOFs
                 "map" | "filter" | "forEach" | "reduce" | "find" |
                 "findIndex" | "some" | "every" | "sort" | "flatMap" | "flat" |
                 // String methods
                 "replace" | "replaceAll" | "startsWith" | "endsWith" |
-                "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" |
+                "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" | "at" |
                 // Container methods (Map, Set, WeakMap, WeakSet) — "add" handled above
                 "set" | "get" | "has" | "delete" | "clear" | "keys" | "values" | "entries" |
                 // RegExp methods
                 "test" | "exec" |
-                // String match/replace with RegExp
-                "match" |
                 // Request/Response body
                 "text" | "json" |
                 // URLSearchParams
                 "toString" | "getAll"
             ));
             if is_builtin {
+                // If any argument is a spread, handle specially or fall through to dynamic.
+                let has_spread = call.arguments.iter().any(|a| matches!(a, oxc_ast::ast::Argument::SpreadElement(_)));
+                if has_spread && method_name != "push" {
+                    // Fall through to dynamic dispatch for spread args on non-push builtins.
+                } else {
                 // Evaluate receiver
                 let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
                 block = nb;
@@ -1366,7 +1384,58 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     .ok_or_else(|| anyhow::anyhow!("builtin method: object produced no value"))?;
                 let obj_i64 = self.ensure_i64(obj, block)?;
 
-                // Evaluate all arguments
+                if has_spread {
+                    // push(...arr) → push_all for each spread arg
+                    let i64t = self.i64_type();
+                    let mut result_val: Option<Value<'c, 'b>> = None;
+                    for arg in &call.arguments {
+                        match arg {
+                            oxc_ast::ast::Argument::SpreadElement(spread) => {
+                                let (v_opt, nb) = self.lower_expression(&spread.argument, block, region, scope)?;
+                                block = nb;
+                                let arr = v_opt.ok_or_else(|| anyhow::anyhow!("push spread: no value"))?;
+                                let arr_i64 = self.ensure_i64(arr, block)?;
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push_all"),
+                                    &[obj_i64, arr_i64], &[], self.loc,
+                                ));
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                    &[arr_i64], &[], self.loc,
+                                ));
+                            }
+                            _ => {
+                                let expr = arg.as_expression().ok_or_else(|| anyhow::anyhow!("push arg error"))?;
+                                let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                                block = nb;
+                                let v = v_opt.ok_or_else(|| anyhow::anyhow!("push arg no value"))?;
+                                let v_i64 = self.ensure_i64(v, block)?;
+                                result_val = Some(block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                                    &[obj_i64, v_i64], &[i64t], self.loc,
+                                )).result(0)?.into());
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                    &[v_i64], &[], self.loc,
+                                ));
+                            }
+                        }
+                    }
+                    // push with no regular args returns length; use arr_len if no result set
+                    if result_val.is_none() {
+                        result_val = Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_len"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into());
+                    }
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[obj_i64], &[], self.loc,
+                    ));
+                    return Ok((result_val, block));
+                }
+
+                // Evaluate all arguments (no spread here)
                 let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
                 for arg in &call.arguments {
                     if let Some(expr) = arg.as_expression() {
@@ -1399,6 +1468,21 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         Some(block.append_operation(func::call(
                             self.ctx,
                             FlatSymbolRefAttribute::new(self.ctx, "ts_arr_pop"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "unshift" => {
+                        let val = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_unshift"),
+                            &[obj_i64, val], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "shift" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_shift"),
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
@@ -1553,6 +1637,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[obj_i64, cb], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
+                    "concat" => {
+                        let other = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_concat"),
+                            &[obj_i64, other], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
                     "flat" => {
                         // depth arg: default 1; extract i32 from NaN-boxed i64
                         let depth_i64 = arg_vals.first().copied().unwrap_or_else(|| {
@@ -1635,6 +1726,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_repeat"),
                             &[obj_i64, count], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "at" => {
+                        let idx = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_at"),
+                            &[obj_i64, idx], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     // ── Container methods (Map / Set / WeakMap / WeakSet) ─────
@@ -1787,6 +1885,42 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
 
                 return Ok((result, block));
+                } // end else { // no spread or push-with-spread handled above
+            }
+        }
+
+        // Special case: fn.bind(thisArg) → ts_func_bind(fn, thisArg)
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            if member.property.name.as_str() == "bind" {
+                let (fn_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+                block = nb;
+                if let Some(fn_val) = fn_opt {
+                    let i64t = self.i64_type();
+                    let fn_i64 = self.ensure_i64(fn_val, block)?;
+                    let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                        self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                    )).result(0)?.into();
+                    let this_arg = if let Some(arg) = call.arguments.first() {
+                        if let Some(expr) = arg.as_expression() {
+                            let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                            block = nb;
+                            v_opt.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                        } else { undef_i64 }
+                    } else { undef_i64 };
+                    let bound: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_bind"),
+                        &[fn_i64, this_arg], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[fn_i64], &[], self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[this_arg], &[], self.loc,
+                    ));
+                    return Ok((Some(bound), block));
+                }
             }
         }
 
@@ -1918,10 +2052,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             1 => "ts_method_call1",
             2 => "ts_method_call2",
             3 => "ts_method_call3",
-            _ => "ts_method_call4",
+            4 => "ts_method_call4",
+            5 => "ts_method_call5",
+            6 => "ts_method_call6",
+            7 => "ts_method_call7",
+            _ => "ts_method_call8",
         };
+        let max_args = arg_vals.len().min(8);
         let mut call_args = vec![fn_i64, obj_val];
-        call_args.extend(arg_vals.iter().take(4).copied());
+        call_args.extend(arg_vals.iter().take(max_args).copied());
         let result: Value<'c, 'b> = block.append_operation(func::call(
             self.ctx, FlatSymbolRefAttribute::new(self.ctx, call_fn),
             &call_args, &[i64t], self.loc,
@@ -2177,32 +2316,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         if !optional {
-            // Non-optional: use the existing computed member handler.
-            let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
-            block = nb;
-            let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("chain computed: object produced no value"))?;
-            let obj_i64 = self.ensure_i64(obj, block)?;
-            let (idx_opt, nb) = self.lower_expression(&member.expression, block, region, scope)?;
-            block = nb;
-            let idx = idx_opt.ok_or_else(|| anyhow::anyhow!("chain computed: index produced no value"))?;
-            let idx_i32 = self.ensure_i32(idx, block)?;
-            let val: Value<'c, 'b> = block.append_operation(func::call(
-                self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
-                &[obj_i64, idx_i32],
-                &[self.i64_type()],
-                self.loc,
-            )).result(0)?.into();
-            block.append_operation(func::call(
-                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                &[obj_i64], &[], self.loc,
-            ));
-            let idx_i64 = self.ensure_i64(idx, block)?;
-            block.append_operation(func::call(
-                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                &[idx_i64], &[], self.loc,
-            ));
-            return Ok((Some(val), block));
+            // Non-optional: delegate to the generic computed member handler (uses ts_val_get_key).
+            return self.lower_computed_member_expression(member, block, region, scope);
         }
 
         // Optional: obj?.[idx]
@@ -2239,15 +2354,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         )).result(0)?.into();
         null_block.append_operation(cf::br(&merge_block, &[undef_val], self.loc));
 
-        // Re-evaluate the index in the access block.
+        // Re-evaluate the index in the access block and use ts_val_get_key (handles strings, arrays, maps).
         let (idx_opt, nb) = self.lower_expression(&member.expression, access_block, region, scope)?;
         let access_block_after_idx = nb;
         let idx = idx_opt.ok_or_else(|| anyhow::anyhow!("optional computed: index produced no value"))?;
-        let idx_i32 = self.ensure_i32(idx, access_block_after_idx)?;
+        let idx_i64 = self.ensure_i64(idx, access_block_after_idx)?;
         let result: Value<'c, 'b> = access_block_after_idx.append_operation(func::call(
             self.ctx,
-            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
-            &[obj_i64, idx_i32],
+            FlatSymbolRefAttribute::new(self.ctx, "ts_val_get_key"),
+            &[obj_i64, idx_i64],
             &[self.i64_type()],
             self.loc,
         )).result(0)?.into();
@@ -2255,7 +2370,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
             &[obj_i64], &[], self.loc,
         ));
-        let idx_i64 = self.ensure_i64(idx, access_block_after_idx)?;
         access_block_after_idx.append_operation(func::call(
             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
             &[idx_i64], &[], self.loc,
@@ -2933,6 +3047,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 HashMap::new()
             },
         );
+        // Compute cell_vars for this closure body (locally-declared vars mutated in nested closures).
+        // Also compute cell_captures: free vars that are cells in the outer scope.
+        let inner_cell_captures: NameSet = free_vars.iter()
+            .filter(|v| self.is_cell_var(v))
+            .cloned()
+            .collect();
+        let inner_cell_vars = compute_cell_vars_for_body(body_stmts);
+        let saved_cell_vars = std::mem::replace(&mut self.cell_vars, inner_cell_vars);
+        let saved_cell_captures = std::mem::replace(&mut self.cell_captures, inner_cell_captures);
         self.fn_return_type = i64_type;
         self.is_async = false;
 
@@ -3009,78 +3132,88 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
 
-            // Process all statements in source order. FunctionDeclarations are handled inline
-            // (closure created at their declaration position, not truly hoisted), which is
-            // correct for the common case where inner functions are declared before they're called.
+            // ── Hoist pass: lower all inner FunctionDeclarations first ───────────
+            // JavaScript hoists function declarations to the top of the enclosing
+            // function scope. We replicate that by creating closures for all inner
+            // named function declarations before processing any other statements.
+            // This ensures calls like `return dispatch(0); function dispatch(i){…}`
+            // work correctly even though `dispatch` is declared after its first use.
             for stmt in &body.statements {
-                if let oxc_ast::ast::Statement::FunctionDeclaration(inner_fn) = stmt {
-                    let Some(fn_id) = &inner_fn.id else { continue };
-                    let fn_name = fn_id.name.to_string();
-                    let inner_params: Vec<&oxc_ast::ast::FormalParameter<'_>> =
-                        inner_fn.params.items.iter().collect();
-                    let inner_body = inner_fn.body.as_deref();
-                    let inner_rest = inner_fn.params.rest.as_ref()
-                        .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument { Some(id.name.as_str()) } else { None });
-                    let saved_async = self.is_async;
-                    self.is_async = inner_fn.r#async;
-                    let (fn_val, nb) = self.lower_arrow_like(
-                        &inner_params,
-                        inner_rest,
-                        inner_body,
-                        None,
-                        current_block,
-                        &arrow_region,
-                        &mut arrow_scope,
-                    )?;
-                    self.is_async = saved_async;
-                    current_block = nb;
+                let oxc_ast::ast::Statement::FunctionDeclaration(inner_fn) = stmt else { continue };
+                let Some(fn_id) = &inner_fn.id else { continue };
+                let fn_name = fn_id.name.to_string();
+                let inner_params: Vec<&oxc_ast::ast::FormalParameter<'_>> =
+                    inner_fn.params.items.iter().collect();
+                let inner_body = inner_fn.body.as_deref();
+                let inner_rest = inner_fn.params.rest.as_ref()
+                    .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument { Some(id.name.as_str()) } else { None });
+                let saved_async = self.is_async;
+                self.is_async = inner_fn.r#async;
+                let (fn_val, nb) = self.lower_arrow_like(
+                    &inner_params,
+                    inner_rest,
+                    inner_body,
+                    None,
+                    current_block,
+                    &arrow_region,
+                    &mut arrow_scope,
+                )?;
+                self.is_async = saved_async;
+                current_block = nb;
 
-                    // Fix up self-reference: if fn_name is captured by the closure (recursive),
-                    // the env slot was set to undefined (pre-seed). Patch it with the actual closure.
-                    {
-                        let mut inner_outer_keys: NameSet = arrow_scope.keys().cloned().collect();
-                        let mut inner_param_set: NameSet = NameSet::new();
-                        for p in &inner_fn.params.items {
-                            if let BindingPattern::BindingIdentifier(id) = &p.pattern {
-                                inner_param_set.insert(id.name.to_string());
-                            }
-                        }
-                        inner_outer_keys.insert(fn_name.clone());
-                        let mut inner_free_vars: Vec<String> = Vec::new();
-                        if let Some(inner_body_ref) = inner_fn.body.as_deref() {
-                            collect_free_vars_stmts(
-                                &inner_body_ref.statements,
-                                &inner_param_set,
-                                &inner_outer_keys,
-                                &mut inner_free_vars,
-                            );
-                            let mut seen = std::collections::HashSet::new();
-                            inner_free_vars.retain(|v| seen.insert(v.clone()));
-                        }
-                        if let Some(self_idx) = inner_free_vars.iter().position(|v| v == &fn_name) {
-                            let env_arr = current_block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_closure_get_env"),
-                                &[fn_val], &[i64_type], self.loc,
-                            )).result(0)?.into();
-                            let self_idx_val = current_block.append_operation(
-                                arith::constant(self.ctx,
-                                    IntegerAttribute::new(self.i32_type(), self_idx as i64).into(),
-                                    self.loc,
-                                )
-                            ).result(0)?.into();
-                            current_block.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
-                                &[env_arr, self_idx_val, fn_val], &[], self.loc,
-                            ));
-                            current_block.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                                &[env_arr], &[], self.loc,
-                            ));
+                // Fix up self-reference: if fn_name is captured by the closure (recursive),
+                // the env slot was set to undefined (pre-seed). Patch it with the actual closure.
+                {
+                    let mut inner_outer_keys: NameSet = arrow_scope.keys().cloned().collect();
+                    let mut inner_param_set: NameSet = NameSet::new();
+                    for p in &inner_fn.params.items {
+                        if let BindingPattern::BindingIdentifier(id) = &p.pattern {
+                            inner_param_set.insert(id.name.to_string());
                         }
                     }
+                    inner_outer_keys.insert(fn_name.clone());
+                    let mut inner_free_vars: Vec<String> = Vec::new();
+                    if let Some(inner_body_ref) = inner_fn.body.as_deref() {
+                        collect_free_vars_stmts(
+                            &inner_body_ref.statements,
+                            &inner_param_set,
+                            &inner_outer_keys,
+                            &mut inner_free_vars,
+                        );
+                        let mut seen = std::collections::HashSet::new();
+                        inner_free_vars.retain(|v| seen.insert(v.clone()));
+                    }
+                    if let Some(self_idx) = inner_free_vars.iter().position(|v| v == &fn_name) {
+                        let env_arr = current_block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_closure_get_env"),
+                            &[fn_val], &[i64_type], self.loc,
+                        )).result(0)?.into();
+                        let self_idx_val = current_block.append_operation(
+                            arith::constant(self.ctx,
+                                IntegerAttribute::new(self.i32_type(), self_idx as i64).into(),
+                                self.loc,
+                            )
+                        ).result(0)?.into();
+                        current_block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                            &[env_arr, self_idx_val, fn_val], &[], self.loc,
+                        ));
+                        current_block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[env_arr], &[], self.loc,
+                        ));
+                    }
+                }
 
-                    arrow_scope.insert(fn_name, fn_val);
+                arrow_scope.insert(fn_name, fn_val);
+            }
+
+            // ── Main pass: process non-FunctionDeclaration statements ────────────
+            for stmt in &body.statements {
+                if matches!(stmt, oxc_ast::ast::Statement::FunctionDeclaration(_)) {
+                    // Already handled in the hoist pass above.
+                    continue;
                 } else if is_expr_body {
                     // Expression-body arrow (=> expr): lower the expression directly without
                     // releasing it so the owned reference is preserved for the return value.
@@ -3109,6 +3242,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.is_async = saved_is_async;
         self.current_fn_params = saved_fn_params;
         self.closure_env_indices = saved_env_indices;
+        self.cell_vars = saved_cell_vars;
+        self.cell_captures = saved_cell_captures;
 
         // Default return: UNDEFINED
         let default_undef: Value<'_, '_> = current_block.append_operation(arith::constant(
@@ -3184,11 +3319,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             for (idx, var_name) in free_vars.iter().enumerate() {
                 let captured_val = if let Some(&v) = outer_scope.get(var_name) {
                     let v_i64 = self.ensure_i64(v, block)?;
-                    // Retain: env array takes ownership
-                    block.append_operation(func::call(
-                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
-                        &[v_i64], &[], self.loc,
-                    ));
+                    // ts_arr_set retains internally; no explicit retain needed here
                     v_i64
                 } else {
                     // Not found in scope: use undefined
@@ -3737,4 +3868,263 @@ fn collect_fv_assignment_target(
         }
         _ => {}
     }
+}
+
+// ── Mutable-capture cell analysis ────────────────────────────────────────────
+
+/// Scan statements for assignments (=, +=, ||=, etc.) to variables in `target_vars`.
+/// Does NOT recurse into nested closures (ArrowFunctionExpression / FunctionExpression).
+fn scan_stmts_for_assignments(
+    stmts: &[oxc_ast::ast::Statement<'_>],
+    target_vars: &NameSet,
+    result: &mut NameSet,
+) {
+    for stmt in stmts {
+        scan_stmt_for_assignments(stmt, target_vars, result);
+    }
+}
+
+fn scan_stmt_for_assignments(
+    stmt: &oxc_ast::ast::Statement<'_>,
+    target_vars: &NameSet,
+    result: &mut NameSet,
+) {
+    use oxc_ast::ast::Statement;
+    match stmt {
+        Statement::ExpressionStatement(es) => scan_expr_for_assignments(&es.expression, target_vars, result),
+        Statement::ReturnStatement(rs) => {
+            if let Some(arg) = &rs.argument { scan_expr_for_assignments(arg, target_vars, result); }
+        }
+        Statement::VariableDeclaration(vd) => {
+            for d in &vd.declarations {
+                if let Some(init) = &d.init { scan_expr_for_assignments(init, target_vars, result); }
+            }
+        }
+        Statement::IfStatement(if_stmt) => {
+            scan_expr_for_assignments(&if_stmt.test, target_vars, result);
+            scan_stmt_for_assignments(&if_stmt.consequent, target_vars, result);
+            if let Some(alt) = &if_stmt.alternate { scan_stmt_for_assignments(alt, target_vars, result); }
+        }
+        Statement::BlockStatement(block) => {
+            for s in &block.body { scan_stmt_for_assignments(s, target_vars, result); }
+        }
+        Statement::ForStatement(f) => {
+            if let Some(test) = &f.test { scan_expr_for_assignments(test, target_vars, result); }
+            if let Some(update) = &f.update { scan_expr_for_assignments(update, target_vars, result); }
+            scan_stmt_for_assignments(&f.body, target_vars, result);
+        }
+        Statement::ForOfStatement(f) => { scan_stmt_for_assignments(&f.body, target_vars, result); }
+        Statement::ForInStatement(f) => { scan_stmt_for_assignments(&f.body, target_vars, result); }
+        Statement::WhileStatement(w) => {
+            scan_expr_for_assignments(&w.test, target_vars, result);
+            scan_stmt_for_assignments(&w.body, target_vars, result);
+        }
+        Statement::TryStatement(t) => {
+            for s in &t.block.body { scan_stmt_for_assignments(s, target_vars, result); }
+            if let Some(h) = &t.handler {
+                for s in &h.body.body { scan_stmt_for_assignments(s, target_vars, result); }
+            }
+            if let Some(f) = &t.finalizer {
+                for s in &f.body { scan_stmt_for_assignments(s, target_vars, result); }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_expr_for_assignments(
+    expr: &oxc_ast::ast::Expression<'_>,
+    target_vars: &NameSet,
+    result: &mut NameSet,
+) {
+    use oxc_ast::ast::Expression;
+    match expr {
+        Expression::AssignmentExpression(ae) => {
+            match &ae.left {
+                oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    if target_vars.contains(id.name.as_str()) { result.insert(id.name.to_string()); }
+                }
+                _ => {}
+            }
+            scan_expr_for_assignments(&ae.right, target_vars, result);
+        }
+        Expression::UpdateExpression(ue) => {
+            if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &ue.argument {
+                if target_vars.contains(id.name.as_str()) { result.insert(id.name.to_string()); }
+            }
+        }
+        Expression::CallExpression(call) => {
+            scan_expr_for_assignments(&call.callee, target_vars, result);
+            for arg in &call.arguments {
+                if let Some(e) = arg.as_expression() { scan_expr_for_assignments(e, target_vars, result); }
+            }
+        }
+        Expression::ConditionalExpression(c) => {
+            scan_expr_for_assignments(&c.test, target_vars, result);
+            scan_expr_for_assignments(&c.consequent, target_vars, result);
+            scan_expr_for_assignments(&c.alternate, target_vars, result);
+        }
+        Expression::LogicalExpression(l) => {
+            scan_expr_for_assignments(&l.left, target_vars, result);
+            scan_expr_for_assignments(&l.right, target_vars, result);
+        }
+        Expression::BinaryExpression(b) => {
+            scan_expr_for_assignments(&b.left, target_vars, result);
+            scan_expr_for_assignments(&b.right, target_vars, result);
+        }
+        Expression::ParenthesizedExpression(pe) => {
+            scan_expr_for_assignments(&pe.expression, target_vars, result);
+        }
+        Expression::UnaryExpression(ue) => {
+            scan_expr_for_assignments(&ue.argument, target_vars, result);
+        }
+        Expression::SequenceExpression(s) => {
+            for e in &s.expressions { scan_expr_for_assignments(e, target_vars, result); }
+        }
+        // DO NOT recurse into closures — they have their own scope
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {}
+        _ => {}
+    }
+}
+
+/// Walk statements/expressions looking for directly-nested closures.
+/// For each closure found, scan its body for assignments to `outer_vars`.
+/// Returns the set of outer_vars that are assigned in any directly-nested closure.
+fn find_vars_mutated_in_closures(
+    stmts: &[oxc_ast::ast::Statement<'_>],
+    outer_vars: &NameSet,
+    result: &mut NameSet,
+) {
+    for stmt in stmts {
+        fvmic_stmt(stmt, outer_vars, result);
+    }
+}
+
+fn fvmic_stmt(stmt: &oxc_ast::ast::Statement<'_>, outer_vars: &NameSet, result: &mut NameSet) {
+    use oxc_ast::ast::Statement;
+    match stmt {
+        Statement::ExpressionStatement(es) => fvmic_expr(&es.expression, outer_vars, result),
+        Statement::ReturnStatement(rs) => {
+            if let Some(arg) = &rs.argument { fvmic_expr(arg, outer_vars, result); }
+        }
+        Statement::VariableDeclaration(vd) => {
+            for d in &vd.declarations {
+                if let Some(init) = &d.init { fvmic_expr(init, outer_vars, result); }
+            }
+        }
+        Statement::IfStatement(if_stmt) => {
+            fvmic_expr(&if_stmt.test, outer_vars, result);
+            fvmic_stmt(&if_stmt.consequent, outer_vars, result);
+            if let Some(alt) = &if_stmt.alternate { fvmic_stmt(alt, outer_vars, result); }
+        }
+        Statement::BlockStatement(block) => {
+            for s in &block.body { fvmic_stmt(s, outer_vars, result); }
+        }
+        Statement::ForStatement(f) => {
+            if let Some(test) = &f.test { fvmic_expr(test, outer_vars, result); }
+            if let Some(update) = &f.update { fvmic_expr(update, outer_vars, result); }
+            fvmic_stmt(&f.body, outer_vars, result);
+        }
+        Statement::ForOfStatement(f) => {
+            fvmic_expr(&f.right, outer_vars, result);
+            fvmic_stmt(&f.body, outer_vars, result);
+        }
+        Statement::ForInStatement(f) => { fvmic_stmt(&f.body, outer_vars, result); }
+        Statement::WhileStatement(w) => {
+            fvmic_expr(&w.test, outer_vars, result);
+            fvmic_stmt(&w.body, outer_vars, result);
+        }
+        Statement::TryStatement(t) => {
+            for s in &t.block.body { fvmic_stmt(s, outer_vars, result); }
+            if let Some(h) = &t.handler {
+                for s in &h.body.body { fvmic_stmt(s, outer_vars, result); }
+            }
+            if let Some(f) = &t.finalizer {
+                for s in &f.body { fvmic_stmt(s, outer_vars, result); }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fvmic_expr(expr: &oxc_ast::ast::Expression<'_>, outer_vars: &NameSet, result: &mut NameSet) {
+    use oxc_ast::ast::Expression;
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            // Found a closure: scan its body for assignments to outer_vars
+            let mut closure_locals: NameSet = NameSet::new();
+            for p in &arrow.params.items {
+                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &p.pattern {
+                    closure_locals.insert(id.name.to_string());
+                }
+            }
+            for stmt in &arrow.body.statements { collect_locals_stmt(stmt, &mut closure_locals); }
+            let effective: NameSet = outer_vars.iter()
+                .filter(|v| !closure_locals.contains(*v))
+                .cloned().collect();
+            scan_stmts_for_assignments(&arrow.body.statements, &effective, result);
+        }
+        Expression::FunctionExpression(f) => {
+            if let Some(body) = &f.body {
+                let mut closure_locals: NameSet = NameSet::new();
+                for p in &f.params.items {
+                    if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &p.pattern {
+                        closure_locals.insert(id.name.to_string());
+                    }
+                }
+                for stmt in &body.statements { collect_locals_stmt(stmt, &mut closure_locals); }
+                let effective: NameSet = outer_vars.iter()
+                    .filter(|v| !closure_locals.contains(*v))
+                    .cloned().collect();
+                scan_stmts_for_assignments(&body.statements, &effective, result);
+            }
+        }
+        // Recurse into non-closure expressions to find nested closures
+        Expression::CallExpression(call) => {
+            fvmic_expr(&call.callee, outer_vars, result);
+            for arg in &call.arguments {
+                if let Some(e) = arg.as_expression() { fvmic_expr(e, outer_vars, result); }
+            }
+        }
+        Expression::AssignmentExpression(ae) => { fvmic_expr(&ae.right, outer_vars, result); }
+        Expression::BinaryExpression(b) => {
+            fvmic_expr(&b.left, outer_vars, result);
+            fvmic_expr(&b.right, outer_vars, result);
+        }
+        Expression::LogicalExpression(l) => {
+            fvmic_expr(&l.left, outer_vars, result);
+            fvmic_expr(&l.right, outer_vars, result);
+        }
+        Expression::ConditionalExpression(c) => {
+            fvmic_expr(&c.test, outer_vars, result);
+            fvmic_expr(&c.consequent, outer_vars, result);
+            fvmic_expr(&c.alternate, outer_vars, result);
+        }
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                if let Some(e) = elem.as_expression() { fvmic_expr(e, outer_vars, result); }
+            }
+        }
+        Expression::ParenthesizedExpression(pe) => { fvmic_expr(&pe.expression, outer_vars, result); }
+        Expression::StaticMemberExpression(m) => { fvmic_expr(&m.object, outer_vars, result); }
+        Expression::ComputedMemberExpression(m) => {
+            fvmic_expr(&m.object, outer_vars, result);
+            fvmic_expr(&m.expression, outer_vars, result);
+        }
+        Expression::SequenceExpression(s) => {
+            for e in &s.expressions { fvmic_expr(e, outer_vars, result); }
+        }
+        _ => {}
+    }
+}
+
+/// Compute the set of local variables in `stmts` that are mutated in directly-nested closures.
+/// These variables need to be "cell-ified" (wrapped in a single-element TsArray) so that
+/// mutations inside closures are visible to the outer scope after the closure runs.
+pub(super) fn compute_cell_vars_for_body(stmts: &[oxc_ast::ast::Statement<'_>]) -> NameSet {
+    let mut local_vars: NameSet = NameSet::new();
+    for stmt in stmts { collect_locals_stmt(stmt, &mut local_vars); }
+    let mut cell_vars: NameSet = NameSet::new();
+    find_vars_mutated_in_closures(stmts, &local_vars, &mut cell_vars);
+    cell_vars
 }

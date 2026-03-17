@@ -367,7 +367,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 let key_val: Option<Value<'c, 'b>> = match &p.key {
                     oxc_ast::ast::PropertyKey::Identifier(id_ref) => {
                         // Variable reference key
-                        if let Some(&v) = scope.get(id_ref.name.as_str()) {
+                        let name = id_ref.name.as_str();
+                        if let Some(&v) = scope.get(name) {
                             let v_i64 = self.ensure_i64(v, block)?;
                             block.append_operation(func::call(
                                 self.ctx,
@@ -375,8 +376,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 &[v_i64], &[], self.loc,
                             ));
                             Some(v_i64)
+                        } else if self.module_global_names.contains(name) {
+                            let key_ptr = self.get_string_ptr(name, block)?;
+                            let v_i64: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                                &[key_ptr], &[self.i64_type()], self.loc,
+                            )).result(0)?.into();
+                            block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                                &[v_i64], &[], self.loc,
+                            ));
+                            Some(v_i64)
                         } else {
-                            tracing::warn!("computed property key: undefined variable {}", id_ref.name);
+                            tracing::warn!("computed property key: undefined variable {}", name);
                             None
                         }
                     }

@@ -177,8 +177,7 @@ pub unsafe extern "C" fn ts_container_entries(container: TsVal) -> TsVal {
 /// `container.forEach(cb)` — Array: cb(el,i,arr); Map: cb(v,k,map); Set: cb(v,v,set).
 #[no_mangle]
 pub unsafe extern "C" fn ts_container_for_each(container: TsVal, callback: TsVal) -> TsVal {
-    eprintln!("[DEBUG] ts_container_for_each: container.0={:016x} heap_tag={}", container.0, if container.is_ptr() { heap_tag(container) as i32 } else { -1 });
-    if !container.is_ptr() { return UNDEFINED; }
+if !container.is_ptr() { return UNDEFINED; }
     match heap_tag(container) {
         0         => obj_dynamic_call(container, b"forEach\0", callback, UNDEFINED, UNDEFINED, 1),
         1         => ts_arr_for_each(container, callback),

@@ -1,3 +1,6 @@
 [submodule "hono"]
 	path = hono
 	url = git@github.com:honojs/hono.git
+[submodule "nest"]
+	path = nest
+	url = git@github.com:nestjs/nest.git

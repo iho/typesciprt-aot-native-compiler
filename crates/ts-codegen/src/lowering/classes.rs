@@ -460,11 +460,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
         scope.insert("this".to_string(), entry.argument(0)?.into());
         self.var_class_types.insert("this".to_string(), class_name.to_string());
+        let mut param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        param_names.insert("this".to_string());
         for (i, param) in method.value.params.items.iter().enumerate() {
             if let BindingPattern::BindingIdentifier(id) = &param.pattern {
                 scope.insert(id.name.to_string(), entry.argument(1 + i)?.into());
+                param_names.insert(id.name.to_string());
             }
         }
+        if let Some(rest) = &method.value.params.rest {
+            if let BindingPattern::BindingIdentifier(id) = &rest.rest.argument {
+                param_names.insert(id.name.to_string());
+            }
+        }
+        let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
 
         let zero_i64: Value<'_, '_> = entry
             .append_operation(arith::constant(
@@ -479,20 +488,50 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut current = entry;
 
         let saved_fn_return_type_cls = self.fn_return_type;
+        let saved_is_async = self.is_async;
         self.fn_return_type = i64_type;
+        self.is_async = method.value.r#async;
         if let Some(body) = &method.value.body {
+            let saved_cell_vars = std::mem::replace(
+                &mut self.cell_vars,
+                crate::lowering::expressions::compute_cell_vars_for_body(&body.statements),
+            );
+            let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
             for stmt in &body.statements {
                 let (val, next) = self.lower_statement(stmt, current, &region, &mut scope, &[])?;
                 current = next;
                 if let Some(v) = val { result = v; }
             }
+            self.cell_vars = saved_cell_vars;
+            self.cell_captures = saved_cell_captures;
         }
         self.fn_return_type = saved_fn_return_type_cls;
 
         if current.terminator().is_none() {
-            let result_i64 = self.ensure_i64(result, current)?;
-            current.append_operation(func::r#return(&[result_i64], self.loc));
+            if self.is_async {
+                let result_i64 = self.ensure_i64(result, current)?;
+                let promise: melior::ir::Value<'_, '_> = current.append_operation(melior::dialect::func::call(
+                    self.ctx,
+                    melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
+                    &[result_i64],
+                    &[i64_type],
+                    self.loc,
+                )).result(0)?.into();
+                current.append_operation(melior::dialect::func::call(
+                    self.ctx,
+                    melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[result_i64],
+                    &[],
+                    self.loc,
+                ));
+                current.append_operation(melior::dialect::func::r#return(&[promise], self.loc));
+            } else {
+                let result_i64 = self.ensure_i64(result, current)?;
+                current.append_operation(melior::dialect::func::r#return(&[result_i64], self.loc));
+            }
         }
+        self.is_async = saved_is_async;
+        self.current_fn_params = saved_fn_params;
 
         self.module.body().append_operation(func::func(
             self.ctx,
@@ -528,6 +567,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
         scope.insert("this".to_string(), entry.argument(0)?.into());
         self.var_class_types.insert("this".to_string(), class_name.to_string());
+        let mut param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        param_names.insert("this".to_string());
+        let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
 
         let zero_i64: Value<'_, '_> = entry
             .append_operation(arith::constant(
@@ -547,6 +589,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
         self.fn_return_type = saved_fn_return_type_cls;
+        self.current_fn_params = saved_fn_params;
 
         if current.terminator().is_none() {
             let result_i64 = self.ensure_i64(result, current)?;
@@ -668,20 +711,49 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut current = entry;
 
         let saved_fn_return_type_cls = self.fn_return_type;
+        let saved_is_async_static = self.is_async;
         self.fn_return_type = i64_type;
+        self.is_async = method.value.r#async;
         if let Some(body) = &method.value.body {
+            let saved_cell_vars_s = std::mem::replace(
+                &mut self.cell_vars,
+                crate::lowering::expressions::compute_cell_vars_for_body(&body.statements),
+            );
+            let saved_cell_captures_s = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
             for stmt in &body.statements {
                 let (val, next) = self.lower_statement(stmt, current, &region, &mut scope, &[])?;
                 current = next;
                 if let Some(v) = val { result = v; }
             }
+            self.cell_vars = saved_cell_vars_s;
+            self.cell_captures = saved_cell_captures_s;
         }
         self.fn_return_type = saved_fn_return_type_cls;
 
         if current.terminator().is_none() {
-            let result_i64 = self.ensure_i64(result, current)?;
-            current.append_operation(func::r#return(&[result_i64], self.loc));
+            if self.is_async {
+                let result_i64 = self.ensure_i64(result, current)?;
+                let promise: melior::ir::Value<'_, '_> = current.append_operation(melior::dialect::func::call(
+                    self.ctx,
+                    melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
+                    &[result_i64],
+                    &[i64_type],
+                    self.loc,
+                )).result(0)?.into();
+                current.append_operation(melior::dialect::func::call(
+                    self.ctx,
+                    melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[result_i64],
+                    &[],
+                    self.loc,
+                ));
+                current.append_operation(melior::dialect::func::r#return(&[promise], self.loc));
+            } else {
+                let result_i64 = self.ensure_i64(result, current)?;
+                current.append_operation(func::r#return(&[result_i64], self.loc));
+            }
         }
+        self.is_async = saved_is_async_static;
 
         self.module.body().append_operation(func::func(
             self.ctx,

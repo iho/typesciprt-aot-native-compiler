@@ -68,6 +68,8 @@ pub unsafe extern "C" fn ts_obj_get(obj_val: TsVal, key_ptr: *const i8) -> TsVal
             _ => return UNDEFINED,
         }
     }
+    // Only tag=0 (TsObject) has a properties HashMap. All other heap types return UNDEFINED.
+    if tag != 0 { return UNDEFINED; }
     let obj = ptr as *mut TsObject;
     if let Some(&val) = (&*obj).properties.get(&key) {
         ts_retain_val(val);

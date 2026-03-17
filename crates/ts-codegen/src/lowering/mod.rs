@@ -281,6 +281,8 @@ pub fn lower_program<'c>(
         module_init_fns: Vec::new(),
         module_init_fn_count: 0,
         class_name_aliases: HashMap::new(),
+        cell_vars: std::collections::HashSet::new(),
+        cell_captures: std::collections::HashSet::new(),
     };
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
@@ -440,9 +442,128 @@ struct Lowerer<'c, 'm> {
     /// E.g. hono-base.ts: `class Hono` exported as `HonoBase` → maps "Hono" → "HonoBase".
     /// Used so that `new Hono(...)` inside hono-base.ts resolves to `__class_HonoBase_constructor`.
     class_name_aliases: HashMap<String, String>,
+    /// Local variables in the current function body that are "cell-ified":
+    /// they are stored as single-element TsArrays so closures can mutate them
+    /// and the outer scope sees the updated value.
+    cell_vars: std::collections::HashSet<String>,
+    /// Variables captured from an outer scope that are cells (set when entering a closure body).
+    cell_captures: std::collections::HashSet<String>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
+    /// Returns true if `name` is a cell variable in the current function context
+    /// (either a locally-cellified var or a cell capture from outer scope).
+    #[inline]
+    pub(crate) fn is_cell_var(&self, name: &str) -> bool {
+        self.cell_vars.contains(name) || self.cell_captures.contains(name)
+    }
+
+    /// Read the actual value from a cell pointer.
+    /// `cell_ptr_val` is the scope value (a TsArray* wrapped in TsVal).
+    /// Returns a retained reference to the inner value (ts_arr_get retains).
+    pub(crate) fn cell_read<'b>(
+        &mut self,
+        cell_ptr_val: melior::ir::Value<'c, 'b>,
+        block: melior::ir::BlockRef<'c, 'b>,
+    ) -> anyhow::Result<melior::ir::Value<'c, 'b>> {
+        let i64_type = self.i64_type();
+        let i32_type = self.i32_type();
+        let cell_i64 = self.ensure_i64(cell_ptr_val, block)?;
+        let idx_zero: melior::ir::Value<'c, 'b> = block.append_operation(
+            melior::dialect::arith::constant(
+                self.ctx,
+                melior::ir::attribute::IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )
+        ).result(0)?.into();
+        let val: melior::ir::Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+            self.ctx,
+            melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+            &[cell_i64, idx_zero],
+            &[i64_type],
+            self.loc,
+        )).result(0)?.into();
+        Ok(val)
+    }
+
+    /// Write a value to a cell.
+    /// Calls ts_arr_set(cell_ptr, 0, val). ts_arr_set retains val internally.
+    pub(crate) fn cell_write<'b>(
+        &mut self,
+        cell_ptr_val: melior::ir::Value<'c, 'b>,
+        new_val: melior::ir::Value<'c, 'b>,
+        block: melior::ir::BlockRef<'c, 'b>,
+    ) -> anyhow::Result<()> {
+        let i32_type = self.i32_type();
+        let cell_i64 = self.ensure_i64(cell_ptr_val, block)?;
+        let new_i64 = self.ensure_i64(new_val, block)?;
+        let idx_zero: melior::ir::Value<'c, 'b> = block.append_operation(
+            melior::dialect::arith::constant(
+                self.ctx,
+                melior::ir::attribute::IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )
+        ).result(0)?.into();
+        block.append_operation(melior::dialect::func::call(
+            self.ctx,
+            melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+            &[cell_i64, idx_zero, new_i64],
+            &[],
+            self.loc,
+        ));
+        Ok(())
+    }
+
+    /// Allocate a single-element TsArray cell holding `initial_val`.
+    /// Returns the cell pointer (i64). ts_arr_set retains `initial_val` for the cell;
+    /// the caller's copy of `initial_val` is released (ownership transferred to cell).
+    pub(crate) fn alloc_cell<'b>(
+        &mut self,
+        initial_val: melior::ir::Value<'c, 'b>,
+        block: melior::ir::BlockRef<'c, 'b>,
+    ) -> anyhow::Result<melior::ir::Value<'c, 'b>> {
+        let i64_type = self.i64_type();
+        let i32_type = self.i32_type();
+        let cap_one: melior::ir::Value<'c, 'b> = block.append_operation(
+            melior::dialect::arith::constant(
+                self.ctx,
+                melior::ir::attribute::IntegerAttribute::new(i32_type, 1).into(),
+                self.loc,
+            )
+        ).result(0)?.into();
+        let cell: melior::ir::Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+            self.ctx,
+            melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+            &[cap_one],
+            &[i64_type],
+            self.loc,
+        )).result(0)?.into();
+        let init_i64 = self.ensure_i64(initial_val, block)?;
+        let idx_zero: melior::ir::Value<'c, 'b> = block.append_operation(
+            melior::dialect::arith::constant(
+                self.ctx,
+                melior::ir::attribute::IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )
+        ).result(0)?.into();
+        block.append_operation(melior::dialect::func::call(
+            self.ctx,
+            melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+            &[cell, idx_zero, init_i64],
+            &[],
+            self.loc,
+        ));
+        // ts_arr_set retains init_val for the cell; release our owned copy.
+        block.append_operation(melior::dialect::func::call(
+            self.ctx,
+            melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[init_i64],
+            &[],
+            self.loc,
+        ));
+        Ok(cell)
+    }
+
     // ── Built-in wrapper functions ─────────────────────────────────────────
 
     /// Returns (wrapper_fn_name, arity, [runtime_fn_name]) for a known JS built-in function.
@@ -750,6 +871,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_val_length",      &[i64_type], &[i64_type]);
         add_func("ts_arr_push",        &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_pop",         &[i64_type], &[i64_type]);
+        add_func("ts_arr_unshift",     &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_shift",       &[i64_type], &[i64_type]);
         add_func("ts_arr_push_all",    &[i64_type, i64_type], &[]);
         add_func("ts_arr_join",        &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_index_of",    &[i64_type, i64_type], &[i64_type]);
@@ -801,6 +924,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // v1.2: first-class functions / arrow functions / array HOFs
         add_func("ts_func_new",        &[ptr_type, i32_type], &[i64_type]);
         add_func("ts_func_new_this",   &[ptr_type, i32_type], &[i64_type]);
+        add_func("ts_func_bind",       &[i64_type, i64_type], &[i64_type]);
         add_func("ts_closure_new",      &[ptr_type, i32_type, i64_type], &[i64_type]);
         add_func("ts_closure_new_rest", &[ptr_type, i32_type, i64_type], &[i64_type]);
         add_func("ts_func_call0",      &[i64_type], &[i64_type]);
@@ -813,6 +937,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_method_call2",    &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_method_call3",    &[i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_method_call4",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call5",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call6",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call7",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_method_call8",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_map",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_filter",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_for_each",    &[i64_type, i64_type], &[i64_type]);
@@ -824,6 +952,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_arr_sort",        &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_flat_map",    &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_flat",        &[i64_type, i32_type], &[i64_type]);
+        add_func("ts_arr_concat",      &[i64_type, i64_type], &[i64_type]);
 
         // v1.4: Map built-in
         add_func("ts_map_new",      &[], &[i64_type]);
@@ -848,6 +977,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_str_char_code_at",   &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_repeat",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_from_char_code", &[i64_type], &[i64_type]);
+        add_func("ts_str_at",             &[i64_type, i64_type], &[i64_type]);
 
         // v1.5: generic computed member get, destructuring rest, Map.entries
         add_func("ts_val_get_key", &[i64_type, i64_type], &[i64_type]);
@@ -1326,10 +1456,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             scope.insert(param_name, final_param);
             current_block = merge_block;
         }
-        let mut result_value: Value<'_, '_> = entry
+        // Implicit return value is always UNDEFINED for regular functions.
+        // Explicit `return expr` is handled by lower_return_statement which emits func.return directly.
+        let result_value: Value<'_, '_> = entry
             .append_operation(arith::constant(
                 self.ctx,
-                IntegerAttribute::new(return_type, 0).into(),
+                IntegerAttribute::new(return_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
                 self.loc,
             ))
             .result(0)?.into();
@@ -1339,6 +1471,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.fn_return_type = return_type;
         self.is_async = func.r#async;
         if let Some(body) = &func.body {
+            // Compute cell_vars: local variables mutated in nested closures (need heap cell boxing).
+            let saved_cell_vars = std::mem::replace(
+                &mut self.cell_vars,
+                crate::lowering::expressions::compute_cell_vars_for_body(&body.statements),
+            );
+            let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+
             // Pre-seed ALL local bindings (vars + inner function names) as undefined.
             let undef_placeholder: Value<'_, '_> = current_block.append_operation(arith::constant(
                 self.ctx,
@@ -1431,11 +1570,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
                     scope.insert(fn_name, fn_val);
                 } else {
-                    let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
+                    let (_, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
                     current_block = next;
-                    if let Some(v) = val { result_value = v; }
                 }
             }
+            self.cell_vars = saved_cell_vars;
+            self.cell_captures = saved_cell_captures;
         }
         // ARC: release scope variables before final return (skip parameters —
         // they are "borrowed" from the caller; the call site's post-call
