@@ -480,6 +480,72 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     None => bail!("'this' used outside of a class method, scope keys: {:?}", scope.keys().collect::<Vec<_>>()),
                 }
             }
+            Expression::YieldExpression(y) => {
+                // `yield expr` in a generator function:
+                // Push the value to the __generator_yields array and return undefined.
+                let i32_type = self.i32_type();
+                let i64_type = self.i64_type();
+                let yields_cell = scope.get("__generator_yields").copied()
+                    .ok_or_else(|| anyhow::anyhow!("yield used outside generator"))?;
+                let yields_i64 = self.ensure_i64(yields_cell, block)?;
+
+                let yield_val: Value<'c, 'b> = if let Some(arg) = &y.argument {
+                    let (v_opt, nb) = self.lower_expression(arg, block, region, scope)?;
+                    block = nb;
+                    let v = v_opt.ok_or_else(|| anyhow::anyhow!("yield arg produced no value"))?;
+                    self.ensure_i64(v, block)?
+                } else {
+                    block.append_operation(arith::constant(
+                        self.ctx,
+                        IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                        self.loc,
+                    )).result(0)?.into()
+                };
+
+                // If delegate (yield*), push all elements from the iterable
+                if y.delegate {
+                    let len_val: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_iterable_len"),
+                        &[yield_val], &[i64_type], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push_all"),
+                        &[yields_i64, yield_val], &[], self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[yield_val], &[], self.loc,
+                    ));
+                    let _ = len_val;
+                } else {
+                    let push_result: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                        &[yields_i64, yield_val], &[i64_type], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[push_result], &[], self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[yield_val], &[], self.loc,
+                    ));
+                }
+
+                // yield expression evaluates to undefined (we don't support .next(value))
+                let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                    self.loc,
+                )).result(0)?.into();
+                Ok((Some(undef), block))
+            }
             Expression::AwaitExpression(aw) => {
                 let (val_opt, nb) = self.lower_expression(&aw.argument, block, region, scope)?;
                 block = nb;
@@ -1880,7 +1946,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Date instance methods
                 "getTime" | "getFullYear" | "getMonth" | "getDate" | "getDay" |
                 "getHours" | "getMinutes" | "getSeconds" | "getMilliseconds" |
-                "toISOString" | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString"
+                "toISOString" | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString" |
+                // WeakRef
+                "deref"
             ));
             if is_builtin {
                 // If any argument is a spread, handle specially or fall through to dynamic.
@@ -2578,6 +2646,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     "toLocaleDateString"   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_locale_date_string"), &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
                     "toLocaleTimeString"   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_locale_time_string"), &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
                     "toLocaleString"       => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_string"),             &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    // ── WeakRef methods ────────────────────────────────────────
+                    "deref" => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_weakref_deref"), &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
                     _ => None,
                 };
 
@@ -3423,6 +3493,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 &[], &[i64t], self.loc,
             )).result(0)?.into();
             return Ok((Some(ws_val), block));
+        }
+
+        if class_name == "WeakRef" {
+            let i64t = self.i64_type();
+            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            let target_val = if let Some(arg) = new_expr.arguments.first() {
+                if let Some(e) = arg.as_expression() {
+                    let (v, b) = self.lower_expression(e, block, region, scope)?;
+                    block = b;
+                    v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                } else { undef_i64 }
+            } else { undef_i64 };
+            let wr_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_weakref_new"),
+                &[target_val], &[i64t], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[target_val], &[], self.loc));
+            return Ok((Some(wr_val), block));
         }
 
         if class_name == "Date" {

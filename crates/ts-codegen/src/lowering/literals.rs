@@ -375,18 +375,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 ));
             } else {
                 // Computed key: { [expr]: val }
-                // Try to extract the key as an identifier reference (most common computed case).
+                use oxc_ast::ast::PropertyKey as PK;
                 let key_val: Option<Value<'c, 'b>> = match &p.key {
-                    oxc_ast::ast::PropertyKey::Identifier(id_ref) => {
-                        // Variable reference key
+                    PK::Identifier(id_ref) => {
+                        // Variable reference — look up in scope
                         let name = id_ref.name.as_str();
                         if let Some(&v) = scope.get(name) {
                             let v_i64 = self.ensure_i64(v, block)?;
-                            block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
-                                &[v_i64], &[], self.loc,
-                            ));
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[v_i64], &[], self.loc));
                             Some(v_i64)
                         } else if self.module_global_names.contains(name) {
                             let key_ptr = self.get_string_ptr(name, block)?;
@@ -394,16 +390,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
                                 &[key_ptr], &[self.i64_type()], self.loc,
                             )).result(0)?.into();
-                            block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
-                                &[v_i64], &[], self.loc,
-                            ));
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[v_i64], &[], self.loc));
                             Some(v_i64)
                         } else {
                             tracing::warn!("computed property key: undefined variable {}", name);
                             None
                         }
+                    }
+                    PK::TemplateLiteral(tmpl) => {
+                        let (kv, nb) = self.lower_template_literal(tmpl, block, region, scope)?;
+                        block = nb;
+                        kv.map(|v| self.ensure_i64(v, block)).transpose()?
                     }
                     _ => {
                         tracing::debug!("skipping unsupported computed property key type");

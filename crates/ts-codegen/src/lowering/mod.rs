@@ -270,6 +270,7 @@ pub fn lower_program<'c>(
         var_class_types: HashMap::new(),
         fn_return_type: i32_type,
         is_async: false,
+        is_generator: false,
         enums: HashMap::new(),
         current_class: None,
         super_ctor: None,
@@ -412,6 +413,9 @@ struct Lowerer<'c, 'm> {
     fn_return_type: melior::ir::Type<'c>,
     /// Whether the function currently being lowered is `async`.
     is_async: bool,
+    /// Whether the function currently being lowered is a generator (`function*`).
+    /// When true, `yield` expressions push to a TsArray named `__generator_yields`.
+    is_generator: bool,
     /// Maps enum name → (member name → integer value) for compile-time resolution.
     enums: HashMap<String, HashMap<String, i64>>,
     current_class: Option<String>,
@@ -1211,6 +1215,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_date_to_locale_date_string", &[i64_type], &[i64_type]);
         add_func("ts_date_to_locale_time_string", &[i64_type], &[i64_type]);
         add_func("ts_date_to_string",             &[i64_type], &[i64_type]);
+        add_func("ts_weakref_new",                &[i64_type], &[i64_type]);
+        add_func("ts_weakref_deref",              &[i64_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -1706,8 +1712,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let saved_fn_return_type = self.fn_return_type;
         let saved_is_async = self.is_async;
+        let saved_is_generator = self.is_generator;
         self.fn_return_type = return_type;
         self.is_async = func.r#async;
+        self.is_generator = func.generator;
+
+        // For generator functions, allocate the yields array at function entry.
+        if func.generator {
+            let zero_i32: Value<'_, '_> = current_block.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )).result(0)?.into();
+            let yields_arr: Value<'_, '_> = current_block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                &[zero_i32], &[i64_type], self.loc,
+            )).result(0)?.into();
+            scope.insert("__generator_yields".to_string(), yields_arr);
+        }
+
         if let Some(body) = &func.body {
             // Compute cell_vars: local variables mutated in nested closures (need heap cell boxing).
             let saved_cell_vars = std::mem::replace(
@@ -1818,8 +1842,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // ARC: release scope variables before final return (skip parameters —
         // they are "borrowed" from the caller; the call site's post-call
         // ts_release_val balances the pre-call ts_retain_val).
+        // For generators, skip __generator_yields — we're returning it (transfer ownership).
         for (name, v) in &scope {
             if self.current_fn_params.contains(name) { continue; }
+            if func.generator && name == "__generator_yields" { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
@@ -1832,7 +1858,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Async: wrap the implicit return value in a resolved Promise.
         // ARC: ts_promise_resolve retains val internally; release our owned ref after the call.
-        if current_block.terminator().is_none() && func.r#async {
+        if current_block.terminator().is_none() && func.generator {
+            // Generator: return the collected yields array.
+            let yields_val = scope.get("__generator_yields")
+                .copied()
+                .unwrap_or(result_value);
+            let yields_i64 = self.ensure_i64(yields_val, current_block)?;
+            current_block.append_operation(func::r#return(&[yields_i64], self.loc));
+        } else if current_block.terminator().is_none() && func.r#async {
             let val_i64 = self.ensure_i64(result_value, current_block)?;
             let promise: Value<'_, '_> = current_block
                 .append_operation(func::call(
@@ -1851,6 +1884,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         self.is_async = saved_is_async;
+        self.is_generator = saved_is_generator;
         self.fn_return_type = saved_fn_return_type;
 
         let op = func::func(

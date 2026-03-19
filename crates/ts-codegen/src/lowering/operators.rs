@@ -1170,6 +1170,285 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             AssignmentTarget::PrivateFieldExpression(priv_member) => {
                 self.lower_private_field_assignment(&**priv_member, assign.operator, rhs, block, region, scope)
             }
+            AssignmentTarget::ArrayAssignmentTarget(arr_target) => {
+                use oxc_ast::ast::{AssignmentTargetMaybeDefault, AssignmentTarget as AT};
+                // Evaluate rhs once, then assign elements to each target slot.
+                // rhs is already evaluated.
+                let rhs_i64 = self.ensure_i64(rhs, block)?;
+                let i32_type = self.i32_type();
+                let i64_type = self.i64_type();
+                for (i, elem) in arr_target.elements.iter().enumerate() {
+                    let Some(maybe_default) = elem else { continue };
+                    // Get the binding target (skip default for now — just use the binding)
+                    let binding_target = match maybe_default {
+                        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(wtd) => &wtd.binding,
+                        other => {
+                            // AssignmentTargetMaybeDefault inherits from AssignmentTarget
+                            // via @inherit. We need to access it as AssignmentTarget.
+                            // Unfortunately there's no clean cast; extract Identifier variant.
+                            match other {
+                                AssignmentTargetMaybeDefault::AssignmentTargetIdentifier(id_ref) => {
+                                    let name = id_ref.name.to_string();
+                                    let idx_val: Value<'c, 'b> = block.append_operation(
+                                        melior::dialect::arith::constant(self.ctx,
+                                            melior::ir::attribute::IntegerAttribute::new(i32_type, i as i64).into(), self.loc)
+                                    ).result(0)?.into();
+                                    let elem_val: Value<'c, 'b> = block.append_operation(
+                                        melior::dialect::func::call(self.ctx,
+                                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                                            &[rhs_i64, idx_val], &[i64_type], self.loc)
+                                    ).result(0)?.into();
+                                    if self.is_cell_var(&name) {
+                                        let cell_ptr = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined cell: {name}"))?;
+                                        self.cell_write(cell_ptr, elem_val, block)?;
+                                    } else {
+                                        let old = scope.insert(name.clone(), elem_val);
+                                        if let Some(old_val) = old {
+                                            let old_i64 = self.ensure_i64(old_val, block)?;
+                                            block.append_operation(melior::dialect::func::call(self.ctx,
+                                                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                                &[old_i64], &[], self.loc));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                AssignmentTargetMaybeDefault::StaticMemberExpression(m) => {
+                                    // e.g. [arr[i], arr[j]] swap pattern
+                                    let idx_val: Value<'c, 'b> = block.append_operation(
+                                        melior::dialect::arith::constant(self.ctx,
+                                            melior::ir::attribute::IntegerAttribute::new(i32_type, i as i64).into(), self.loc)
+                                    ).result(0)?.into();
+                                    let elem_val: Value<'c, 'b> = block.append_operation(
+                                        melior::dialect::func::call(self.ctx,
+                                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                                            &[rhs_i64, idx_val], &[i64_type], self.loc)
+                                    ).result(0)?.into();
+                                    self.lower_static_member_assignment(&**m, oxc_ast::ast::AssignmentOperator::Assign, elem_val, block, region, scope)?;
+                                    continue;
+                                }
+                                AssignmentTargetMaybeDefault::ComputedMemberExpression(m) => {
+                                    let idx_val: Value<'c, 'b> = block.append_operation(
+                                        melior::dialect::arith::constant(self.ctx,
+                                            melior::ir::attribute::IntegerAttribute::new(i32_type, i as i64).into(), self.loc)
+                                    ).result(0)?.into();
+                                    let elem_val: Value<'c, 'b> = block.append_operation(
+                                        melior::dialect::func::call(self.ctx,
+                                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                                            &[rhs_i64, idx_val], &[i64_type], self.loc)
+                                    ).result(0)?.into();
+                                    self.lower_computed_member_assignment(&**m, oxc_ast::ast::AssignmentOperator::Assign, elem_val, block, region, scope)?;
+                                    continue;
+                                }
+                                _ => bail!("unsupported array assignment target element: {:?}", maybe_default),
+                            }
+                        }
+                    };
+                    // AssignmentTargetWithDefault: get element then apply default if undefined
+                    let wtd = match maybe_default {
+                        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(w) => w,
+                        _ => unreachable!(),
+                    };
+                    let idx_val: Value<'c, 'b> = block.append_operation(
+                        melior::dialect::arith::constant(self.ctx,
+                            melior::ir::attribute::IntegerAttribute::new(i32_type, i as i64).into(), self.loc)
+                    ).result(0)?.into();
+                    let elem_val: Value<'c, 'b> = block.append_operation(
+                        melior::dialect::func::call(self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                            &[rhs_i64, idx_val], &[i64_type], self.loc)
+                    ).result(0)?.into();
+                    // Apply default if undefined
+                    let is_undef: Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                        &[elem_val], &[self.i32_type()], self.loc,
+                    )).result(0)?.into();
+                    let is_undef_i1 = self.ensure_i1(is_undef, block)?;
+                    let default_block = region.append_block(melior::ir::Block::new(&[]));
+                    let use_elem_block = region.append_block(melior::ir::Block::new(&[]));
+                    let merge_block = region.append_block(melior::ir::Block::new(&[(i64_type, self.loc)]));
+                    block.append_operation(melior::dialect::cf::cond_br(self.ctx, is_undef_i1, &default_block, &use_elem_block, &[], &[], self.loc));
+                    // default branch
+                    let (def_opt, nb) = self.lower_expression(&wtd.init, default_block, region, scope)?;
+                    let def_block = nb;
+                    let def_val = self.ensure_i64(def_opt.unwrap_or(elem_val), def_block)?;
+                    def_block.append_operation(melior::dialect::cf::br(&merge_block, &[def_val], self.loc));
+                    // use elem branch
+                    let elem_i64 = self.ensure_i64(elem_val, use_elem_block)?;
+                    use_elem_block.append_operation(melior::dialect::cf::br(&merge_block, &[elem_i64], self.loc));
+                    // merge
+                    let final_val: Value<'c, 'b> = merge_block.argument(0)?.into();
+                    block = merge_block;
+                    // Assign final_val to the binding_target
+                    if let AT::AssignmentTargetIdentifier(id_ref) = binding_target {
+                        let name = id_ref.name.to_string();
+                        if self.is_cell_var(&name) {
+                            let cell_ptr = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined cell: {name}"))?;
+                            self.cell_write(cell_ptr, final_val, block)?;
+                        } else {
+                            let old = scope.insert(name.clone(), final_val);
+                            if let Some(old_val) = old {
+                                let old_i64 = self.ensure_i64(old_val, block)?;
+                                block.append_operation(melior::dialect::func::call(self.ctx,
+                                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                    &[old_i64], &[], self.loc));
+                            }
+                        }
+                    } else {
+                        bail!("unsupported array assignment target binding: {:?}", binding_target);
+                    }
+                }
+                // Handle rest element if present
+                if let Some(rest) = &arr_target.rest {
+                    let n_assigned = arr_target.elements.len();
+                    let n_val: Value<'c, 'b> = block.append_operation(
+                        melior::dialect::arith::constant(self.ctx,
+                            melior::ir::attribute::IntegerAttribute::new(i32_type, n_assigned as i64).into(), self.loc)
+                    ).result(0)?.into();
+                    let rest_arr: Value<'c, 'b> = block.append_operation(
+                        melior::dialect::func::call(self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_rest"),
+                            &[rhs_i64, n_val], &[i64_type], self.loc)
+                    ).result(0)?.into();
+                    if let AT::AssignmentTargetIdentifier(id_ref) = &rest.target {
+                        let name = id_ref.name.to_string();
+                        let old = scope.insert(name.clone(), rest_arr);
+                        if let Some(old_val) = old {
+                            let old_i64 = self.ensure_i64(old_val, block)?;
+                            block.append_operation(melior::dialect::func::call(self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[old_i64], &[], self.loc));
+                        }
+                    }
+                }
+                // Release the rhs array (we've been indexing it)
+                block.append_operation(melior::dialect::func::call(self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[rhs_i64], &[], self.loc));
+                Ok((Some(rhs_i64), block))
+            }
+            AssignmentTarget::ObjectAssignmentTarget(obj_target) => {
+                use oxc_ast::ast::AssignmentTargetProperty;
+                let rhs_i64 = self.ensure_i64(rhs, block)?;
+                let i64_type = self.i64_type();
+                for prop in &obj_target.properties {
+                    match prop {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id_prop) => {
+                            let name = id_prop.binding.name.to_string();
+                            let key_ptr = self.get_string_ptr(&name, block)?;
+                            let val: Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                                &[rhs_i64, key_ptr], &[i64_type], self.loc,
+                            )).result(0)?.into();
+                            // Apply default if needed
+                            let final_val = if let Some(default_expr) = &id_prop.init {
+                                let is_undef: Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                                    &[val], &[self.i32_type()], self.loc,
+                                )).result(0)?.into();
+                                let is_undef_i1 = self.ensure_i1(is_undef, block)?;
+                                let def_block = region.append_block(melior::ir::Block::new(&[]));
+                                let use_block = region.append_block(melior::ir::Block::new(&[]));
+                                let merge = region.append_block(melior::ir::Block::new(&[(i64_type, self.loc)]));
+                                block.append_operation(melior::dialect::cf::cond_br(self.ctx, is_undef_i1, &def_block, &use_block, &[], &[], self.loc));
+                                let (def_opt, nb) = self.lower_expression(default_expr, def_block, region, scope)?;
+                                let db = nb;
+                                let def_i64 = self.ensure_i64(def_opt.unwrap_or(val), db)?;
+                                db.append_operation(melior::dialect::cf::br(&merge, &[def_i64], self.loc));
+                                let use_i64 = self.ensure_i64(val, use_block)?;
+                                use_block.append_operation(melior::dialect::cf::br(&merge, &[use_i64], self.loc));
+                                let f: Value<'c, 'b> = merge.argument(0)?.into();
+                                block = merge;
+                                f
+                            } else { val };
+                            if self.is_cell_var(&name) {
+                                let cell_ptr = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined cell: {name}"))?;
+                                self.cell_write(cell_ptr, final_val, block)?;
+                            } else {
+                                let old = scope.insert(name.clone(), final_val);
+                                if let Some(ov) = old {
+                                    let ov_i64 = self.ensure_i64(ov, block)?;
+                                    block.append_operation(melior::dialect::func::call(self.ctx,
+                                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                        &[ov_i64], &[], self.loc));
+                                }
+                            }
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(kv) => {
+                            use oxc_ast::ast::{PropertyKey, AssignmentTargetMaybeDefault as ATMD};
+                            let key_str = match &kv.name {
+                                PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                                PropertyKey::StringLiteral(s) => s.value.to_string(),
+                                _ => bail!("unsupported object assignment target key: {:?}", kv.name),
+                            };
+                            let key_ptr = self.get_string_ptr(&key_str, block)?;
+                            let val: Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                                &[rhs_i64, key_ptr], &[i64_type], self.loc,
+                            )).result(0)?.into();
+                            // Assign to binding target
+                            match &kv.binding {
+                                ATMD::AssignmentTargetIdentifier(id_ref) => {
+                                    let name = id_ref.name.to_string();
+                                    if self.is_cell_var(&name) {
+                                        let cell_ptr = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined cell: {name}"))?;
+                                        self.cell_write(cell_ptr, val, block)?;
+                                    } else {
+                                        let old = scope.insert(name.clone(), val);
+                                        if let Some(ov) = old {
+                                            let ov_i64 = self.ensure_i64(ov, block)?;
+                                            block.append_operation(melior::dialect::func::call(self.ctx,
+                                                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                                &[ov_i64], &[], self.loc));
+                                        }
+                                    }
+                                }
+                                _ => bail!("unsupported object assignment target binding: {:?}", kv.binding),
+                            }
+                        }
+                    }
+                }
+                // Handle rest: { ...rest } = obj
+                if let Some(rest) = &obj_target.rest {
+                    use oxc_ast::ast::AssignmentTarget as AT2;
+                    // Collect key list
+                    let mut keys_arr: Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                        &[block.append_operation(melior::dialect::arith::constant(self.ctx,
+                            melior::ir::attribute::IntegerAttribute::new(self.i32_type(), 0).into(), self.loc)).result(0)?.into()],
+                        &[i64_type], self.loc,
+                    )).result(0)?.into();
+                    for prop in &obj_target.properties {
+                        if let AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id_prop) = prop {
+                            let k_str = self.lower_string_literal(&id_prop.binding.name.to_string(), block)?;
+                            let push_res: Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                                &[keys_arr, k_str], &[i64_type], self.loc,
+                            )).result(0)?.into();
+                            block.append_operation(melior::dialect::func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[push_res], &[], self.loc));
+                            block.append_operation(melior::dialect::func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[k_str], &[], self.loc));
+                        }
+                    }
+                    let rest_obj: Value<'c, 'b> = block.append_operation(melior::dialect::func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_rest"),
+                        &[rhs_i64, keys_arr], &[i64_type], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(melior::dialect::func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[keys_arr], &[], self.loc));
+                    if let AT2::AssignmentTargetIdentifier(id_ref) = &rest.target {
+                        let name = id_ref.name.to_string();
+                        let old = scope.insert(name.clone(), rest_obj);
+                        if let Some(ov) = old {
+                            let ov_i64 = self.ensure_i64(ov, block)?;
+                            block.append_operation(melior::dialect::func::call(self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[ov_i64], &[], self.loc));
+                        }
+                    }
+                }
+                block.append_operation(melior::dialect::func::call(self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[rhs_i64], &[], self.loc));
+                Ok((Some(rhs_i64), block))
+            }
             _ => bail!("unsupported assignment target: {:?}", assign.left),
         }
     }

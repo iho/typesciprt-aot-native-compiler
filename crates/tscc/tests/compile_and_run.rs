@@ -722,3 +722,39 @@ fn object_getter_setter() {
         42,
     );
 }
+
+/// Generator function: counter(10, 12) yields 10, 11, 12 → sum = 33
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn generator_basic() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/generator_basic.ts"),
+        &root.join("target/test-generator-basic"),
+        33,
+    );
+}
+
+/// Generator with yield* delegation: doubled(5) delegates to naturals(5) → sum = 15
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn generator_delegate() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/generator_delegate.ts"),
+        &root.join("target/test-generator-delegate"),
+        15,
+    );
+}
+
+/// Array and object destructuring assignment: swap + obj assign → exit 42
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn destructuring_assignment() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/destructuring_assignment.ts"),
+        &root.join("target/test-destructuring-assignment"),
+        42,
+    );
+}

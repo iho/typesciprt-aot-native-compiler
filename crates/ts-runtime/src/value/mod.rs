@@ -215,6 +215,13 @@ pub struct TsDate {
     pub millis: f64,
 }
 
+/// TsWeakRef heap type (tag=15).
+/// Holds a strong reference to the target (ARC doesn't support true weak refs).
+/// Functionally correct: deref() returns the target; GC-safety is not needed since we use ARC.
+pub struct TsWeakRef {
+    pub target: TsVal,
+}
+
 unsafe impl Send for TsWeakSet {}
 
 // ── Submodule declarations ────────────────────────────────────────────────────
@@ -238,6 +245,7 @@ pub mod weak;
 pub mod container;
 pub mod reflect;
 pub mod date;
+pub mod weakref;
 
 // ── Re-exports from submodules ────────────────────────────────────────────────
 
@@ -352,6 +360,7 @@ pub use container::{
     ts_container_size, ts_container_keys, ts_container_values,
     ts_container_entries, ts_container_for_each,
 };
+pub use weakref::{ts_weakref_new, ts_weakref_deref};
 pub use date::{
     ts_date_new, ts_date_from_val, ts_date_now,
     ts_date_get_time, ts_date_get_full_year, ts_date_get_month, ts_date_get_date,
@@ -393,6 +402,7 @@ pub unsafe extern "C" fn ts_release_val(val: TsVal) {
             12 => Some(weak::ts_weakmap_destructor as unsafe extern "C" fn(*mut u8)),
             13 => Some(weak::ts_weakset_destructor as unsafe extern "C" fn(*mut u8)),
             14 => Some(date::ts_date_destructor as unsafe extern "C" fn(*mut u8)),
+            15 => Some(weakref::ts_weakref_destructor as unsafe extern "C" fn(*mut u8)),
             _ => None,
         };
 
