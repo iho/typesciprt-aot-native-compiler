@@ -120,6 +120,75 @@ pub unsafe extern "C" fn ts_iterable_get(val: TsVal, idx: i32) -> TsVal {
     }
 }
 
+/// Normalize any iterable to a TsArray:
+/// - TsArray (tag=1): retain and return as-is.
+/// - TsString (tag=2): split into chars array.
+/// - TsObject (tag=0) with Symbol.iterator method: run iterator protocol, collect to array.
+/// - Otherwise: return empty array.
+#[no_mangle]
+pub unsafe extern "C" fn ts_normalize_iterable(val: TsVal) -> TsVal {
+    if !val.is_ptr() { return ts_arr_new(0); }
+    let tag = heap_tag(val);
+    if tag == 1 {
+        ts_retain_val(val);
+        return val;
+    }
+    if tag == 2 {
+        // String: split into array of single-char strings
+        let s = &*(val.as_ptr() as *const TsString);
+        let chars: Vec<char> = s.inner.chars().collect();
+        let arr = ts_arr_new(0);
+        for c in chars {
+            let mut bytes = c.to_string().into_bytes();
+            bytes.push(0u8);
+            let sv = super::string_val::ts_string_new(bytes.as_ptr() as *const i8);
+            let len = ts_arr_push(arr, sv);
+            ts_release_val(len);
+            ts_release_val(sv);
+        }
+        return arr;
+    }
+    if tag == 0 {
+        // Check for Symbol.iterator method: key = "\x01sym0" (null-terminated for CStr)
+        let iter_method = super::object::ts_obj_get(val, b"\x01sym0\0".as_ptr() as *const i8);
+        if !iter_method.is_undefined() {
+            // Call [Symbol.iterator]() to get the iterator object
+            let iterator = super::func::ts_method_call0(iter_method, val);
+            ts_release_val(iter_method);
+            if iterator.is_undefined() || iterator.is_null() { return ts_arr_new(0); }
+            // Collect: loop calling .next() until done
+            let result = ts_arr_new(0);
+            let done_key = "done\0".as_ptr() as *const i8;
+            let value_key = "value\0".as_ptr() as *const i8;
+            loop {
+                let next_method = super::object::ts_obj_get(iterator, "next\0".as_ptr() as *const i8);
+                if next_method.is_undefined() { break; }
+                let item = super::func::ts_method_call0(next_method, iterator);
+                ts_release_val(next_method);
+                if item.is_undefined() || item.is_null() { ts_release_val(item); break; }
+                let done = super::object::ts_obj_get(item, done_key);
+                let is_done = done.is_bool() && done == super::TRUE || done.is_ptr();
+                if done.is_bool() {
+                    let done_bool = (done.0 & 1) != 0;
+                    ts_release_val(done);
+                    if done_bool { ts_release_val(item); break; }
+                } else {
+                    ts_release_val(done);
+                }
+                let value = super::object::ts_obj_get(item, value_key);
+                ts_release_val(item);
+                let len = ts_arr_push(result, value);
+                ts_release_val(len);
+                ts_release_val(value);
+            }
+            ts_release_val(iterator);
+            return result;
+        }
+        ts_release_val(iter_method);
+    }
+    ts_arr_new(0)
+}
+
 /// Append `val` to the end of `arr`. Returns the new length.
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_push(arr_val: TsVal, val: TsVal) -> TsVal {

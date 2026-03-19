@@ -1730,9 +1730,23 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let (iter_opt, nb) = self.lower_expression(&for_of.right, block, region, scope)?;
         block = nb;
         let iter_val = iter_opt.ok_or_else(|| anyhow::anyhow!("for...of: iterable produced no value"))?;
-        let iter_i64 = self.ensure_i64(iter_val, block)?;
+        let iter_raw = self.ensure_i64(iter_val, block)?;
 
-        // Get iterable length — works for arrays and strings (returns TsVal; unbox to i32).
+        // Normalize to array (handles custom iterators with [Symbol.iterator]())
+        let iter_i64: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_normalize_iterable"),
+            &[iter_raw],
+            &[self.i64_type()],
+            self.loc,
+        )).result(0)?.into();
+        // Release the original iterable (ts_normalize_iterable retained the array)
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[iter_raw], &[], self.loc,
+        ));
+
+        // Get iterable length — now always an array.
         let len_tsval: Value<'c, 'b> = block.append_operation(func::call(
             self.ctx,
             FlatSymbolRefAttribute::new(self.ctx, "ts_iterable_len"),

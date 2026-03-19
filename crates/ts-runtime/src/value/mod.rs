@@ -265,7 +265,7 @@ pub use object::{
     ts_structured_clone,
 };
 pub use array::{
-    ts_arr_new, ts_arr_get, ts_arr_set, ts_arr_len, ts_iterable_len, ts_iterable_get,
+    ts_arr_new, ts_arr_get, ts_arr_set, ts_arr_len, ts_iterable_len, ts_iterable_get, ts_normalize_iterable,
     ts_arr_reverse, ts_arr_fill, ts_arr_splice, ts_arr_slice_range,
     ts_arr_includes, ts_arr_last_index_of, ts_arr_copy_within,
     ts_arr_push, ts_arr_pop, ts_arr_unshift, ts_arr_shift, ts_arr_push_all, ts_arr_join,
@@ -338,7 +338,7 @@ pub use http::{
     ts_val_text, ts_val_json,
 };
 pub use url::{ts_url_new, ts_urlsearchparams_new, ts_urlsearchparams_to_string, ts_urlsearchparams_append, ts_urlsearchparams_get_all};
-pub use symbol::{ts_symbol_new, ts_symbol_description};
+pub use symbol::{ts_symbol_new, ts_symbol_description, ts_symbol_iterator};
 pub use set::{
     ts_set_new, ts_set_new_from_iter,
     ts_set_add, ts_set_has, ts_set_delete, ts_set_clear,

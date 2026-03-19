@@ -402,6 +402,29 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         block = nb;
                         kv.map(|v| self.ensure_i64(v, block)).transpose()?
                     }
+                    PK::StaticMemberExpression(m) => {
+                        // e.g. { [Symbol.iterator]() {...} }
+                        // Only Symbol.iterator is currently supported.
+                        use oxc_ast::ast::Expression as E;
+                        if let E::Identifier(obj_id) = &m.object {
+                            if obj_id.name == "Symbol" && m.property.name.as_str() == "iterator" {
+                                let sym_val: Value<'c, 'b> = block.append_operation(func::call(
+                                    self.ctx,
+                                    FlatSymbolRefAttribute::new(self.ctx, "ts_symbol_iterator"),
+                                    &[],
+                                    &[self.i64_type()],
+                                    self.loc,
+                                )).result(0)?.into();
+                                Some(sym_val)
+                            } else {
+                                tracing::warn!("computed property key: unsupported StaticMemberExpression {}.{}", obj_id.name, m.property.name);
+                                None
+                            }
+                        } else {
+                            tracing::debug!("computed property key: unsupported StaticMemberExpression object type");
+                            None
+                        }
+                    }
                     _ => {
                         tracing::debug!("skipping unsupported computed property key type");
                         None

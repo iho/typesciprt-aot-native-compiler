@@ -125,6 +125,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                 }
 
+                // Symbol well-known values: Symbol.iterator → ts_symbol_iterator()
+                if let Expression::Identifier(obj_id) = &member.object {
+                    if obj_id.name == "Symbol" && member.property.name.as_str() == "iterator" {
+                        let sym_val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_symbol_iterator"),
+                            &[],
+                            &[self.i64_type()],
+                            self.loc,
+                        )).result(0)?.into();
+                        return Ok((Some(sym_val), block));
+                    }
+                }
+
                 // Enum constant access (e.g., Direction.Up).
                 if let Expression::Identifier(obj_id) = &member.object {
                     let obj_name = obj_id.name.as_str();
@@ -5065,6 +5079,20 @@ fn scan_expr_for_assignments(
         }
         Expression::SequenceExpression(s) => {
             for e in &s.expressions { scan_expr_for_assignments(e, target_vars, result); }
+        }
+        Expression::ObjectExpression(obj) => {
+            use oxc_ast::ast::ObjectPropertyKind;
+            for prop in &obj.properties {
+                match prop {
+                    ObjectPropertyKind::ObjectProperty(p) => scan_expr_for_assignments(&p.value, target_vars, result),
+                    ObjectPropertyKind::SpreadProperty(s) => scan_expr_for_assignments(&s.argument, target_vars, result),
+                }
+            }
+        }
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                if let Some(e) = elem.as_expression() { scan_expr_for_assignments(e, target_vars, result); }
+            }
         }
         // DO NOT recurse into closures — they have their own scope
         Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {}

@@ -8,8 +8,11 @@
 //!   cargo test -p tscc -- --include-ignored
 
 use std::{
+    io::{Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -62,6 +65,60 @@ fn compile_and_check(input: &Path, out: &Path, expected_exit: i32) {
         "wrong exit code for {} (expected {}, got {})",
         input.display(), expected_exit, code
     );
+}
+
+/// Compile `input.ts` → binary, start it as an HTTP server, run `test_fn`, then kill it.
+fn compile_and_check_http(input: &Path, out: &Path, port: u16, test_fn: impl Fn(u16)) {
+    ensure_tscc_built();
+
+    let compile = Command::new(tscc_bin())
+        .arg(input)
+        .arg("-o")
+        .arg(out)
+        .status()
+        .expect("tscc failed to spawn");
+    assert!(compile.success(), "tscc compilation failed for {}", input.display());
+
+    let mut server = Command::new(out)
+        .spawn()
+        .expect("server binary failed to spawn");
+
+    // Wait up to 5 seconds for the server to open its port.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let addr = format!("127.0.0.1:{}", port);
+    loop {
+        if TcpStream::connect(&addr).is_ok() { break; }
+        if Instant::now() >= deadline {
+            server.kill().ok();
+            panic!("server on port {} never became ready", port);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Short extra wait so the server finishes its accept loop setup.
+    std::thread::sleep(Duration::from_millis(100));
+
+    test_fn(port);
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+/// Send a raw HTTP GET request and return the response body.
+fn http_get(port: u16, path: &str) -> String {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("TCP connect failed");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let req = format!("GET {} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+    stream.write_all(req.as_bytes()).expect("write failed");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read failed");
+    // Split headers and body at the blank line.
+    if let Some(idx) = response.find("\r\n\r\n") {
+        response[idx + 4..].to_string()
+    } else {
+        response
+    }
 }
 
 // ── v0.1 – arithmetic & variables ────────────────────────────────────────────
@@ -756,5 +813,33 @@ fn destructuring_assignment() {
         &root.join("examples/destructuring_assignment.ts"),
         &root.join("target/test-destructuring-assignment"),
         42,
+    );
+}
+
+#[test]
+fn custom_iterator() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/custom_iterator.ts"),
+        &root.join("target/test-custom-iterator"),
+        15,
+    );
+}
+
+// ── Hono (real framework from git submodule) ──────────────────────────────────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn hono_integration() {
+    let root = repo_root();
+    compile_and_check_http(
+        &root.join("examples/hono_integration.ts"),
+        &root.join("target/test-hono-integration"),
+        19999,
+        |port| {
+            let body = http_get(port, "/");
+            assert_eq!(body.trim(), "Hello from Hono",
+                "GET / should return 'Hello from Hono', got: {:?}", body);
+        },
     );
 }

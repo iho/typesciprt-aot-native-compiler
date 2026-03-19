@@ -1217,6 +1217,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_date_to_string",             &[i64_type], &[i64_type]);
         add_func("ts_weakref_new",                &[i64_type], &[i64_type]);
         add_func("ts_weakref_deref",              &[i64_type], &[i64_type]);
+
+        // Symbol well-known values + iterables
+        add_func("ts_symbol_iterator",            &[], &[i64_type]);
+        add_func("ts_normalize_iterable",         &[i64_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
