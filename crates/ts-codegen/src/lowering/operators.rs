@@ -593,6 +593,42 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Handle member expression updates: obj.prop++ / obj.#prop++
         match &update.argument {
             oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                // Static class field: ClassName.field++ → module global read/write
+                if let Expression::Identifier(id) = &m.object {
+                    let class_name = id.name.as_str();
+                    let field_name = m.property.name.as_str();
+                    let is_static_field = self.classes.get(class_name)
+                        .map(|sig| sig.static_fields.contains(field_name))
+                        .unwrap_or(false);
+                    if is_static_field {
+                        let global_key = format!("__static_{}_{}", class_name, field_name);
+                        let key_ptr = self.get_string_ptr(&global_key, block)?;
+                        let i64t = self.i64_type();
+                        let old_i64: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                            &[key_ptr], &[i64t], self.loc,
+                        )).result(0)?.into();
+                        let old_i32 = self.ensure_i32(old_i64, block)?;
+                        let one = self.lower_numeric_literal(1, block)?;
+                        let new_i32: Value<'c, 'b> = match update.operator {
+                            UpdateOperator::Increment => block.append_operation(arith::addi(old_i32, one, self.loc)).result(0)?.into(),
+                            UpdateOperator::Decrement => block.append_operation(arith::subi(old_i32, one, self.loc)).result(0)?.into(),
+                        };
+                        let new_i64 = self.ensure_i64(new_i32, block)?;
+                        let key_ptr2 = self.get_string_ptr(&global_key, block)?;
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_set_module_global"),
+                            &[key_ptr2, new_i64], &[], self.loc,
+                        ));
+                        if update.prefix {
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                            return Ok((Some(new_i64), block));
+                        } else {
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[new_i64], &[], self.loc));
+                            return Ok((Some(old_i64), block));
+                        }
+                    }
+                }
                 let (obj_opt, nb) = self.lower_expression(&m.object, block, _region, scope)?;
                 block = nb;
                 let obj_val = obj_opt.ok_or_else(|| anyhow::anyhow!("update member: object produced no value"))?;
@@ -1149,6 +1185,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::AssignmentOperator;
+        // Static class field assignment: ClassName.field = value → ts_set_module_global
+        if operator == AssignmentOperator::Assign {
+            if let Expression::Identifier(id) = &member.object {
+                let class_name = id.name.as_str();
+                let field_name = member.property.name.as_str();
+                let is_static_field = self.classes.get(class_name)
+                    .map(|sig| sig.static_fields.contains(field_name))
+                    .unwrap_or(false);
+                if is_static_field {
+                    let global_key = format!("__static_{}_{}", class_name, field_name);
+                    let key_ptr = self.get_string_ptr(&global_key, block)?;
+                    let val_i64 = self.ensure_i64(rhs, block)?;
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_set_module_global"),
+                        &[key_ptr, val_i64], &[], self.loc,
+                    ));
+                    // ts_set_module_global retains; return rhs with its original ownership.
+                    return Ok((Some(rhs), block));
+                }
+            }
+        }
         if operator != AssignmentOperator::Assign {
             bail!("compound assignment to member expressions is not supported yet");
         }

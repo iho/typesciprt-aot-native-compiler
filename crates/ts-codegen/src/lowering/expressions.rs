@@ -92,6 +92,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                 }
 
+                // Static class field read: ClassName.fieldName → ts_get_module_global("__static_ClassName_fieldName")
+                if let Expression::Identifier(obj_id) = &member.object {
+                    let class_name = obj_id.name.as_str();
+                    let field_name = member.property.name.as_str();
+                    let is_static_field = self.classes.get(class_name)
+                        .map(|sig| sig.static_fields.contains(field_name))
+                        .unwrap_or(false);
+                    if is_static_field {
+                        let global_key = format!("__static_{}_{}", class_name, field_name);
+                        let key_ptr = self.get_string_ptr(&global_key, block)?;
+                        let val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                            &[key_ptr], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        return Ok((Some(val), block));
+                    }
+                }
+
                 // Check for getter dispatch before lowering the object.
                 let prop_name = member.property.name.to_string();
                 let getter_mangled: Option<String> = if let Expression::Identifier(id) = &member.object {
@@ -449,6 +467,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     &[src_ptr, flags_ptr], &[i64t], self.loc,
                 )).result(0)?.into();
                 Ok((Some(re_val), block))
+            }
+            // Sequence expression (comma operator): evaluate all, return last value.
+            Expression::SequenceExpression(seq) => {
+                let mut last: Option<Value<'c, 'b>> = None;
+                for (i, expr) in seq.expressions.iter().enumerate() {
+                    let (val_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    if i + 1 < seq.expressions.len() {
+                        // Release intermediate values (side-effects only).
+                        if let Some(v) = val_opt {
+                            let v_i64 = self.ensure_i64(v, block)?;
+                            block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[v_i64], &[], self.loc,
+                            ));
+                        }
+                    } else {
+                        last = val_opt;
+                    }
+                }
+                Ok((last, block))
             }
             _ => {
                 tracing::debug!("skipping unimplemented expression kind");

@@ -73,6 +73,7 @@ struct ClassSig {
     statics:  HashMap<String, String>,                  // static method name → mangled
     getters:  std::collections::HashSet<String>,        // property names with getters
     setters:  std::collections::HashSet<String>,        // property names with setters
+    static_fields: std::collections::HashSet<String>,  // static property names (stored as module globals)
     parent:   Option<String>,
 }
 
@@ -1403,12 +1404,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Expression::Identifier(id) = e { Some(id.name.to_string()) } else { None }
             });
 
+            // Collect static property field names.
+            let mut static_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for element in &class.body.body {
+                use oxc_ast::ast::ClassElement;
+                if let ClassElement::PropertyDefinition(prop) = element {
+                    if prop.r#static {
+                        if let Some(name) = prop.key.static_name() {
+                            static_fields.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+
             own_members.push((class_name.clone(), ClassSig {
                 constructor_name: format!("__class_{}_constructor", class_name),
                 methods,
                 statics,
                 getters,
                 setters,
+                static_fields,
                 parent,
             }));
         }

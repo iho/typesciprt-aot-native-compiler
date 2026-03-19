@@ -58,12 +58,23 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 for k in &psig.getters { getters.insert(k.clone()); }
                 for k in &psig.setters { setters.insert(k.clone()); }
             }
+            let mut static_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for elem in &class.body.body {
+                if let ClassElement::PropertyDefinition(prop) = elem {
+                    if prop.r#static {
+                        if let Some(name) = prop.key.static_name() {
+                            static_fields.insert(name.to_string());
+                        }
+                    }
+                }
+            }
             self.classes.insert(class_name.to_string(), ClassSig {
                 constructor_name: format!("__class_{}_constructor", class_name),
                 methods,
                 statics,
                 getters,
                 setters,
+                static_fields,
                 parent,
             });
         }
@@ -111,6 +122,94 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
         self.current_class = None;
         self.var_class_types.remove("this");
+
+        // Emit __init_static_ClassName function for static property initializers.
+        // Each static field `static count = 0` is stored as a module global `__static_ClassName_count`.
+        let static_prop_defs: Vec<(String, &oxc_ast::ast::Expression<'_>)> = class.body.body.iter()
+            .filter_map(|elem| {
+                if let ClassElement::PropertyDefinition(prop) = elem {
+                    if prop.r#static {
+                        if let Some(init) = &prop.value {
+                            if let Some(name) = prop.key.static_name() {
+                                return Some((name.to_string(), init));
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if !static_prop_defs.is_empty() {
+            let fn_name = format!("__init_static_{}", class_name);
+            let i64_type = self.i64_type();
+            let fn_type = FunctionType::new(self.ctx, &[], &[]);
+            let region = Region::new();
+            let entry = region.append_block(Block::new(&[]));
+            let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
+            let mut current = entry;
+
+            // Inject any known module globals so initializers can reference them.
+            for global_name in self.module_global_names.clone() {
+                if !scope.contains_key(&global_name) {
+                    let key_ptr = self.get_string_ptr(&global_name, current)?;
+                    let val: Value<'_, '_> = current.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                        &[key_ptr], &[i64_type], self.loc,
+                    )).result(0)?.into();
+                    scope.insert(global_name, val);
+                }
+            }
+
+            for (field_name, init_expr) in &static_prop_defs {
+                let (val_opt, nb) = self.lower_expression(init_expr, current, &region, &mut scope)?;
+                current = nb;
+                if let Some(val) = val_opt {
+                    let val_i64 = self.ensure_i64(val, current)?;
+                    let global_key = format!("__static_{}_{}", class_name, field_name);
+                    let key_ptr = self.get_string_ptr(&global_key, current)?;
+                    current.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_set_module_global"),
+                        &[key_ptr, val_i64], &[], self.loc,
+                    ));
+                    // ts_set_module_global retains; release our reference.
+                    current.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[val_i64], &[], self.loc,
+                    ));
+                }
+            }
+
+            // Release injected module globals.
+            for (name, v) in &scope {
+                if self.module_global_names.contains(name) {
+                    let v_i64 = self.ensure_i64(*v, current)?;
+                    current.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[v_i64], &[], self.loc,
+                    ));
+                }
+            }
+
+            current.append_operation(func::r#return(&[], self.loc));
+
+            self.module.body().append_operation(func::func(
+                self.ctx,
+                StringAttribute::new(self.ctx, &fn_name),
+                TypeAttribute::new(fn_type.into()),
+                region,
+                &[],
+                self.loc,
+            ));
+            self.funcs.insert(fn_name.clone(), FuncSig {
+                param_types: vec![],
+                return_type: None,
+                has_rest: false,
+                has_this_param: false,
+            });
+            self.module_init_fns.push(fn_name);
+        }
+
         // Remove the scoped alias now that the class body is fully lowered.
         if let Some(original_name) = scoped_alias {
             self.class_name_aliases.remove(&original_name);

@@ -645,3 +645,16 @@ fn labeled_break_continue() {
         5,
     );
 }
+
+/// Static class fields: Counter.count accessed and mutated inside static methods.
+/// Expected exit code = 3 (incremented 3 times).
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn static_class_fields() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/static_class_fields.ts"),
+        &root.join("target/test-static-class-fields"),
+        3,
+    );
+}
