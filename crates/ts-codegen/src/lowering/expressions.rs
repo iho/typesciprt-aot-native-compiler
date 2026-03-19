@@ -1123,7 +1123,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Evaluate all arguments
                 let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
                 let mut need_args = true;
-                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" || ns == "JSON" || ns == "Promise" || ns == "Reflect" {
+                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" || ns == "JSON" || ns == "Promise" || ns == "Reflect" || ns == "Date" {
                     for arg in &call.arguments {
                         if let Some(expr) = arg.as_expression() {
                             let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
@@ -1231,6 +1231,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             )).result(0)?.into())
                         }
                         // ── Array ─────────────────────────────────────────────
+                        ("Array", "from") => {
+                            let iterable = *arg_vals.first().unwrap_or(&undef_i64);
+                            // Second arg is optional mapFn; pass UNDEFINED when absent.
+                            let map_fn = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_from"),
+                                &[iterable, map_fn], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
                         ("Array", "isArray") => {
                             let v = *arg_vals.first().unwrap_or(&undef_i64);
                             let flag: Value<'c, 'b> = block.append_operation(func::call(
@@ -1278,6 +1287,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 &[v], &[i64t], self.loc,
                             )).result(0)?.into())
                         }
+                        // ── Date static ───────────────────────────────────────
+                        ("Date", "now") => {
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_now"),
+                                &[], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
                         _ => None,
                     };
 
@@ -1295,7 +1311,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         ("Array", "isArray") |
                         ("String", "fromCharCode") |
                         ("JSON", "stringify"|"parse") |
-                        ("Promise", "resolve"|"reject"|"all")
+                        ("Promise", "resolve"|"reject"|"all") |
+                        ("Date", "now")
                     ) {
                         return Ok((result_opt, block));
                     }
@@ -1420,7 +1437,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Request/Response body
                 "text" | "json" |
                 // URLSearchParams
-                "toString" | "getAll"
+                "toString" | "getAll" |
+                // Date instance methods
+                "getTime" | "getFullYear" | "getMonth" | "getDate" | "getDay" |
+                "getHours" | "getMinutes" | "getSeconds" | "getMilliseconds" |
+                "toISOString" | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString"
             ));
             if is_builtin {
                 // If any argument is a spread, handle specially or fall through to dynamic.
@@ -1920,6 +1941,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[obj_i64, name], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
+                    // ── Date instance methods ──────────────────────────────────
+                    "getTime"              => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_time"),              &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getFullYear"          => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_full_year"),         &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getMonth"             => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_month"),             &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getDate"              => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_date"),              &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getDay"               => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_day"),               &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getHours"             => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_hours"),             &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getMinutes"           => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_minutes"),           &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getSeconds"           => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_seconds"),           &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "getMilliseconds"      => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_get_milliseconds"),      &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "toISOString"          => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_iso_string"),         &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "toLocaleDateString"   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_locale_date_string"), &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "toLocaleTimeString"   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_locale_time_string"), &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    "toLocaleString"       => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_string"),             &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
                     _ => None,
                 };
 
@@ -2759,6 +2794,36 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 &[], &[i64t], self.loc,
             )).result(0)?.into();
             return Ok((Some(ws_val), block));
+        }
+
+        if class_name == "Date" {
+            let i64t = self.i64_type();
+            let date_val: Value<'c, 'b> = if new_expr.arguments.is_empty() {
+                // new Date() — current time
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_new"),
+                    &[], &[i64t], self.loc,
+                )).result(0)?.into()
+            } else {
+                // new Date(value) — from number or string
+                let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                let arg_val = if let Some(arg) = new_expr.arguments.first() {
+                    if let Some(e) = arg.as_expression() {
+                        let (v, b) = self.lower_expression(e, block, region, scope)?;
+                        block = b;
+                        v.map(|v| self.ensure_i64(v, block).unwrap_or(v)).unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                let result: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_from_val"),
+                    &[arg_val], &[i64t], self.loc,
+                )).result(0)?.into();
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[arg_val], &[], self.loc));
+                result
+            };
+            return Ok((Some(date_val), block));
         }
 
         // Built-in URL constructor: new URL(href, base?) → TsObject with url properties
@@ -4311,4 +4376,85 @@ pub(super) fn compute_cell_vars_for_body(stmts: &[oxc_ast::ast::Statement<'_>]) 
     let mut cell_vars: NameSet = NameSet::new();
     find_vars_mutated_in_closures(stmts, &local_vars, &mut cell_vars);
     cell_vars
+}
+
+/// Returns `true` if the statement list contains a direct reference to `arguments`
+/// (not inside a nested function declaration or arrow function, which have their own scope).
+pub(super) fn body_uses_arguments(stmts: &[oxc_ast::ast::Statement<'_>]) -> bool {
+    use oxc_ast::ast::{Statement, Expression, BindingPattern};
+    for stmt in stmts {
+        if stmt_uses_arguments(stmt) { return true; }
+    }
+    false
+}
+
+fn stmt_uses_arguments(stmt: &oxc_ast::ast::Statement<'_>) -> bool {
+    use oxc_ast::ast::Statement;
+    match stmt {
+        Statement::ExpressionStatement(e) => expr_uses_arguments(&e.expression),
+        Statement::ReturnStatement(r) => r.argument.as_ref().map_or(false, |e| expr_uses_arguments(e)),
+        Statement::IfStatement(i) => {
+            expr_uses_arguments(&i.test)
+                || stmt_uses_arguments(&i.consequent)
+                || i.alternate.as_ref().map_or(false, |s| stmt_uses_arguments(s))
+        }
+        Statement::BlockStatement(b) => b.body.iter().any(stmt_uses_arguments),
+        Statement::VariableDeclaration(v) => v.declarations.iter().any(|d| {
+            d.init.as_ref().map_or(false, |e| expr_uses_arguments(e))
+        }),
+        Statement::ForStatement(f) => {
+            f.test.as_ref().map_or(false, |e| expr_uses_arguments(e))
+                || f.update.as_ref().map_or(false, |e| expr_uses_arguments(e))
+                || stmt_uses_arguments(&f.body)
+        }
+        Statement::WhileStatement(w) => expr_uses_arguments(&w.test) || stmt_uses_arguments(&w.body),
+        Statement::ThrowStatement(t) => expr_uses_arguments(&t.argument),
+        Statement::TryStatement(t) => {
+            t.block.body.iter().any(stmt_uses_arguments)
+                || t.handler.as_ref().map_or(false, |h| h.body.body.iter().any(stmt_uses_arguments))
+                || t.finalizer.as_ref().map_or(false, |f| f.body.iter().any(stmt_uses_arguments))
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_arguments(expr: &oxc_ast::ast::Expression<'_>) -> bool {
+    use oxc_ast::ast::Expression;
+    match expr {
+        Expression::Identifier(id) => id.name == "arguments",
+        Expression::CallExpression(c) => {
+            expr_uses_arguments(&c.callee)
+                || c.arguments.iter().any(|a| a.as_expression().map_or(false, expr_uses_arguments))
+        }
+        Expression::BinaryExpression(b) => expr_uses_arguments(&b.left) || expr_uses_arguments(&b.right),
+        Expression::LogicalExpression(l) => expr_uses_arguments(&l.left) || expr_uses_arguments(&l.right),
+        Expression::StaticMemberExpression(s) => expr_uses_arguments(&s.object),
+        Expression::ComputedMemberExpression(c) => {
+            expr_uses_arguments(&c.object) || expr_uses_arguments(&c.expression)
+        }
+        Expression::AssignmentExpression(a) => expr_uses_arguments(&a.right),
+        Expression::ConditionalExpression(c) => {
+            expr_uses_arguments(&c.test) || expr_uses_arguments(&c.consequent) || expr_uses_arguments(&c.alternate)
+        }
+        // Arrow functions and function expressions do NOT share `arguments` — stop here.
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => false,
+        Expression::ArrayExpression(a) => a.elements.iter().any(|e| {
+            use oxc_ast::ast::ArrayExpressionElement;
+            match e {
+                ArrayExpressionElement::SpreadElement(s) => expr_uses_arguments(&s.argument),
+                _ => e.as_expression().map_or(false, expr_uses_arguments),
+            }
+        }),
+        Expression::ObjectExpression(o) => o.properties.iter().any(|p| {
+            use oxc_ast::ast::ObjectPropertyKind;
+            match p {
+                ObjectPropertyKind::ObjectProperty(op) => expr_uses_arguments(&op.value),
+                _ => false,
+            }
+        }),
+        Expression::UnaryExpression(u) => expr_uses_arguments(&u.argument),
+        Expression::UpdateExpression(_) => false,
+        Expression::TemplateLiteral(t) => t.expressions.iter().any(expr_uses_arguments),
+        _ => false,
+    }
 }

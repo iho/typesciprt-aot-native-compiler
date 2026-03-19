@@ -533,6 +533,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 let op_val = self.ensure_i32(operand, block)?;
                 block.append_operation(arith::subi(zero, op_val, self.loc)).result(0)?.into()
             }
+            UnaryOperator::UnaryPlus => {
+                // +x — coerce to number; for now just pass through (already a number-ish value).
+                let i64t = self.i64_type();
+                let op_i64 = self.ensure_i64(operand, block)?;
+                block.append_operation(func::call(
+                    self.ctx,
+                    FlatSymbolRefAttribute::new(self.ctx, "ts_coerce_number"),
+                    &[op_i64], &[i64t], self.loc,
+                )).result(0)?.into()
+            }
             UnaryOperator::LogicalNot => {
                 let x = self.ensure_i1(operand, block)?;
                 let zero_i1 = block
@@ -544,6 +554,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     .result(0)?
                     .into();
                 block.append_operation(arith::cmpi(self.ctx, arith::CmpiPredicate::Eq, x, zero_i1, self.loc)).result(0)?.into()
+            }
+            UnaryOperator::Void => {
+                // `void expr` — evaluate for side effects, return undefined.
+                // The operand is already evaluated above. Release it, then return undefined.
+                let i64t = self.i64_type();
+                let operand_i64 = self.ensure_i64(operand, block)?;
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[operand_i64], &[], self.loc));
+                let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                    self.loc,
+                )).result(0)?.into();
+                return Ok((Some(undef), block));
             }
             _ => bail!("unsupported unary operator: {:?}", unary.operator),
         };

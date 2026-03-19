@@ -632,3 +632,16 @@ fn switch_statement() {
         31,
     );
 }
+
+/// Labeled break and continue: break out of outer loop and continue to next outer iteration.
+/// Expected exit code = 5 (labeled_break=2 + labeled_continue=3).
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn labeled_break_continue() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/labeled_break.ts"),
+        &root.join("target/test-labeled-break"),
+        5,
+    );
+}

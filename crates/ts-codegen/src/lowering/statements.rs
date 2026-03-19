@@ -198,7 +198,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         match stmt {
             Statement::ExpressionStatement(es) => {
@@ -262,8 +262,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 Ok((last, cur))
             }
 
-            Statement::BreakStatement(_) => {
-                if let Some((_, exit_block, scope_keys)) = loops.last() {
+            Statement::BreakStatement(brk) => {
+                // Find target: labeled break searches for matching label; unlabeled breaks innermost.
+                let target = if let Some(label) = brk.label.as_ref() {
+                    let lname = label.name.as_str();
+                    loops.iter().rev().find(|(_, _, _, lbl)| lbl.as_deref() == Some(lname))
+                } else {
+                    loops.last()
+                };
+                if let Some((_, exit_block, scope_keys, _)) = target {
                     // Coerce each scope value to the expected phi arg type of exit_block.
                     // Switch exit blocks force i64; loop exit blocks may use other types.
                     let mut vals: Vec<Value<'c, 'b>> = Vec::new();
@@ -278,13 +285,21 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     let dead = region.append_block(Block::new(&[]));
                     Ok((None, dead))
                 } else {
-                    bail!("break statement outside of loop");
+                    bail!("break statement outside of loop or missing label");
                 }
             }
-            Statement::ContinueStatement(_) => {
+            Statement::ContinueStatement(cont) => {
                 // Skip switch entries (None continue target) to find the enclosing loop.
-                let loop_entry = loops.iter().rev()
-                    .find_map(|(cont_opt, _, keys)| cont_opt.map(|h| (h, keys)));
+                // For labeled continue, find the entry with that label.
+                let loop_entry = if let Some(label) = cont.label.as_ref() {
+                    let lname = label.name.as_str();
+                    loops.iter().rev()
+                        .find(|(cont_opt, _, _, lbl)| cont_opt.is_some() && lbl.as_deref() == Some(lname))
+                        .map(|(cont_opt, _, keys, _)| (cont_opt.unwrap(), keys))
+                } else {
+                    loops.iter().rev()
+                        .find_map(|(cont_opt, _, keys, _)| cont_opt.map(|h| (h, keys)))
+                };
                 if let Some((header_block, scope_keys)) = loop_entry {
                     let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
                     self.terminate_with_br(block, &header_block, &vals);
@@ -410,6 +425,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
             Statement::ImportDeclaration(_) => {
                 Ok((None, block)) // handled in the import pre-pass in lower_program
+            }
+            Statement::LabeledStatement(labeled) => {
+                // Set `pending_label` so the inner loop/switch attaches this label to its
+                // loops entry, enabling `break <label>` / `continue <label>` to find it.
+                self.pending_label = Some(labeled.label.name.to_string());
+                let result = self.lower_statement(&labeled.body, block, region, scope, loops);
+                // Clear in case the body wasn't a loop/switch and never consumed the label.
+                self.pending_label = None;
+                result
             }
             _ => {
                 tracing::debug!("skipping unimplemented statement kind");
@@ -777,7 +801,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         mut block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let (cond_opt, nb) = self.lower_expression(&if_stmt.test, block, region, scope)?;
         block = nb;
@@ -850,7 +874,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
         // Normalize all scope values to i64 to avoid type mismatches in phi nodes.
@@ -894,7 +918,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Lower the loop body.
         let mut body_scope = header_scope.clone();
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((Some(header_block), exit_block, scope_keys.clone()));
+        inner_loops.push((Some(header_block), exit_block, scope_keys.clone(), self.pending_label.take()));
         let (_, body_end) =
             self.lower_statement(&while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
         let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
@@ -930,7 +954,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         mut block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let i64t = self.i64_type();
 
@@ -986,7 +1010,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Use `None` for continue so that `continue` inside a switch propagates to
         // the enclosing loop (handled by ContinueStatement searching backwards).
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((None, exit_block, scope_keys.clone()));
+        inner_loops.push((None, exit_block, scope_keys.clone(), self.pending_label.take()));
 
         // Build each labeled case's check + body.
         for (idx, case) in labeled_cases.iter().enumerate() {
@@ -1167,7 +1191,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Lower init (may introduce new variables into scope).
         let mut current = block;
@@ -1239,8 +1263,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut body_scope = header_scope.clone();
         let mut inner_loops = loops.to_vec();
         // continue jumps to the update_block, while break jumps to the exit_block.
-        inner_loops.push((Some(update_block), exit_block, scope_keys.clone()));
-        
+        inner_loops.push((Some(update_block), exit_block, scope_keys.clone(), self.pending_label.take()));
+
         let (_, body_end) =
             self.lower_statement(&for_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
 
@@ -1334,7 +1358,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let i32_type = self.i32_type();
         let i64_type = self.i64_type();
@@ -1514,7 +1538,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         mut block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Determine the loop variable binding.
         // `loop_var` is the name used to hold the raw element in body_scope (always internal or user).
@@ -1652,7 +1676,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((Some(update_block), exit_block, scope_keys.clone()));
+        inner_loops.push((Some(update_block), exit_block, scope_keys.clone(), self.pending_label.take()));
         let (_, body_end) = self.lower_statement(&for_of.body, body_block, region, &mut body_scope, &inner_loops)?;
 
         // Release destructured sub-variables before leaving the body.
@@ -1738,7 +1762,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         mut block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Evaluate the object.
         let (obj_opt, nb) = self.lower_expression(&for_in.right, block, region, scope)?;
@@ -1849,7 +1873,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         body_scope.insert(loop_var.clone(), key_val);
 
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((Some(update_block), exit_block, scope_keys.clone()));
+        inner_loops.push((Some(update_block), exit_block, scope_keys.clone(), self.pending_label.take()));
         let (_, body_end) = self.lower_statement(&for_in.body, body_block, region, &mut body_scope, &inner_loops)?;
 
         if let Some(&loop_val) = body_scope.get(&loop_var) {

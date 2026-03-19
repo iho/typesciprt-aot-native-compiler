@@ -210,6 +210,11 @@ pub struct TsWeakSet {
     pub entries: Vec<*mut u8>,
 }
 
+/// TsDate heap type (tag=14). Stores Unix timestamp in milliseconds.
+pub struct TsDate {
+    pub millis: f64,
+}
+
 unsafe impl Send for TsWeakSet {}
 
 // ── Submodule declarations ────────────────────────────────────────────────────
@@ -232,6 +237,7 @@ pub mod set;
 pub mod weak;
 pub mod container;
 pub mod reflect;
+pub mod date;
 
 // ── Re-exports from submodules ────────────────────────────────────────────────
 
@@ -330,6 +336,13 @@ pub use container::{
     ts_container_size, ts_container_keys, ts_container_values,
     ts_container_entries, ts_container_for_each,
 };
+pub use date::{
+    ts_date_new, ts_date_from_val, ts_date_now,
+    ts_date_get_time, ts_date_get_full_year, ts_date_get_month, ts_date_get_date,
+    ts_date_get_day, ts_date_get_hours, ts_date_get_minutes, ts_date_get_seconds,
+    ts_date_get_milliseconds, ts_date_to_iso_string, ts_date_to_locale_date_string,
+    ts_date_to_locale_time_string, ts_date_to_string,
+};
 
 // ── ARC: retain / release ─────────────────────────────────────────────────────
 
@@ -363,6 +376,7 @@ pub unsafe extern "C" fn ts_release_val(val: TsVal) {
             11 => Some(set::ts_set_destructor as unsafe extern "C" fn(*mut u8)),
             12 => Some(weak::ts_weakmap_destructor as unsafe extern "C" fn(*mut u8)),
             13 => Some(weak::ts_weakset_destructor as unsafe extern "C" fn(*mut u8)),
+            14 => Some(date::ts_date_destructor as unsafe extern "C" fn(*mut u8)),
             _ => None,
         };
 

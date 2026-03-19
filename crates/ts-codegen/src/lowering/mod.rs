@@ -283,6 +283,7 @@ pub fn lower_program<'c>(
         class_name_aliases: HashMap::new(),
         cell_vars: std::collections::HashSet::new(),
         cell_captures: std::collections::HashSet::new(),
+        pending_label: None,
     };
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
@@ -448,6 +449,9 @@ struct Lowerer<'c, 'm> {
     cell_vars: std::collections::HashSet<String>,
     /// Variables captured from an outer scope that are cells (set when entering a closure body).
     cell_captures: std::collections::HashSet<String>,
+    /// When a `LabeledStatement` wraps a loop/switch, this holds the label name so the
+    /// loop-lowering code can attach it to the `inner_loops` entry it creates.
+    pending_label: Option<String>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
@@ -941,6 +945,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_method_call6",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_method_call7",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_method_call8",    &[i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_from",        &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_map",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_filter",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_for_each",    &[i64_type, i64_type], &[i64_type]);
@@ -1113,6 +1118,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_container_values",           &[i64_type], &[i64_type]);
         add_func("ts_container_entries",          &[i64_type], &[i64_type]);
         add_func("ts_container_for_each",         &[i64_type, i64_type], &[i64_type]);
+
+        // Date
+        add_func("ts_date_new",                   &[], &[i64_type]);
+        add_func("ts_date_from_val",              &[i64_type], &[i64_type]);
+        add_func("ts_date_now",                   &[], &[i64_type]);
+        add_func("ts_date_get_time",              &[i64_type], &[i64_type]);
+        add_func("ts_date_get_full_year",         &[i64_type], &[i64_type]);
+        add_func("ts_date_get_month",             &[i64_type], &[i64_type]);
+        add_func("ts_date_get_date",              &[i64_type], &[i64_type]);
+        add_func("ts_date_get_day",               &[i64_type], &[i64_type]);
+        add_func("ts_date_get_hours",             &[i64_type], &[i64_type]);
+        add_func("ts_date_get_minutes",           &[i64_type], &[i64_type]);
+        add_func("ts_date_get_seconds",           &[i64_type], &[i64_type]);
+        add_func("ts_date_get_milliseconds",      &[i64_type], &[i64_type]);
+        add_func("ts_date_to_iso_string",         &[i64_type], &[i64_type]);
+        add_func("ts_date_to_locale_date_string", &[i64_type], &[i64_type]);
+        add_func("ts_date_to_locale_time_string", &[i64_type], &[i64_type]);
+        add_func("ts_date_to_string",             &[i64_type], &[i64_type]);
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -1136,7 +1159,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 Statement::FunctionDeclaration(func) => {
                     let Some(id) = &func.id else { continue };
                     let name = id.name.to_string();
-                    let has_rest = func.params.rest.is_some();
+                    let explicit_rest = func.params.rest.is_some();
+                    let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
+                        crate::lowering::expressions::body_uses_arguments(&b.statements)
+                    });
+                    let has_rest = explicit_rest || implicit_rest;
                     let has_this_param = func.this_param.is_some();
                     let n = func.params.items.len()
                         + if has_rest { 1 } else { 0 }
@@ -1152,7 +1179,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
-                            let has_rest = func.params.rest.is_some();
+                            let explicit_rest = func.params.rest.is_some();
+                            let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
+                                crate::lowering::expressions::body_uses_arguments(&b.statements)
+                            });
+                            let has_rest = explicit_rest || implicit_rest;
                             let has_this_param = func.this_param.is_some();
                             let n = func.params.items.len()
                                 + if has_rest { 1 } else { 0 }
@@ -1174,7 +1205,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
-                            let has_rest = func.params.rest.is_some();
+                            let explicit_rest = func.params.rest.is_some();
+                            let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
+                                crate::lowering::expressions::body_uses_arguments(&b.statements)
+                            });
+                            let has_rest = explicit_rest || implicit_rest;
                             let has_this_param = func.this_param.is_some();
                             let n = func.params.items.len()
                                 + if has_rest { 1 } else { 0 }
@@ -1388,7 +1423,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // All functions return i64 (NaN-boxed TsVal) so they can return any value including heap objects.
         let return_type = i64_type;
 
-        let has_rest = func.params.rest.is_some();
+        let explicit_rest = func.params.rest.is_some();
+        let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
+            crate::lowering::expressions::body_uses_arguments(&b.statements)
+        });
+        let has_rest = explicit_rest || implicit_rest;
         let has_this_param = func.this_param.is_some();
         // Use i64 for all params to support NaN-boxed values (including `undefined` for defaults).
         // If has_this_param, MLIR param 0 is `this`; regular params start at index `this_offset`.
@@ -1429,10 +1468,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 scope.insert(rname.clone(), rest_val);
                 param_names.insert(rname);
             }
+        } else if implicit_rest {
+            // Implicit rest: body uses `arguments` but no explicit rest param declared.
+            // The last MLIR param is the bundled-args TsArray; bind it as `arguments`.
+            let rest_arg_idx = func.params.items.len() + this_offset;
+            let rest_val: Value<'_, '_> = entry.argument(rest_arg_idx)?.into();
+            scope.insert("arguments".to_string(), rest_val);
+            param_names.insert("arguments".to_string());
         }
         let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
 
         let mut current_block = entry;
+
 
         // Inject module-level global variables into scope via ts_get_module_global.
         // This allows module-level functions to access module-level non-function consts

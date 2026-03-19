@@ -496,6 +496,95 @@ pub unsafe extern "C" fn ts_arr_flat(arr: TsVal, depth: i32) -> TsVal {
     result
 }
 
+/// `Array.from(iterable, mapFn?)` — creates a new array from an array-like or iterable.
+/// Handles TsArray (clone), TsString (array of char strings), and array-like objects with `.length`.
+/// `map_fn` should be UNDEFINED when not provided.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_from(iterable: TsVal, map_fn: TsVal) -> TsVal {
+    use super::string_val::ts_str_char_at;
+    use super::{ts_val_get_key, heap_tag};
+    let has_map = !map_fn.is_undefined();
+
+    // Case 1: TsArray — iterate elements.
+    if iterable.is_ptr() && heap_tag(iterable) == 1 {
+        let arr_ptr = iterable.as_ptr() as *const TsArray;
+        let len = (*arr_ptr).elements.len();
+        let result = ts_arr_new(len as i32);
+        for i in 0..len {
+            let elem = { let r = &*arr_ptr; r.elements[i] };
+            ts_retain_val(elem);
+            let index = TsVal::from_i32(i as i32);
+            let out = if has_map {
+                ts_retain_val(iterable);
+                let v = dispatch_callback(map_fn, &[elem, index, iterable]);
+                ts_release_val(iterable);
+                ts_release_val(elem);
+                v
+            } else {
+                elem
+            };
+            ts_arr_set(result, i as i32, out);
+            ts_release_val(out);
+        }
+        return result;
+    }
+
+    // Case 2: TsString — iterate Unicode chars.
+    if iterable.is_ptr() && heap_tag(iterable) == 2 {
+        let s_ptr = iterable.as_ptr() as *const TsString;
+        let len = (*s_ptr).inner.chars().count() as i32;
+        let result = ts_arr_new(len);
+        for i in 0..len {
+            let idx_val = TsVal::from_i32(i);
+            let ch = ts_str_char_at(iterable, idx_val);
+            ts_release_val(idx_val);
+            let index = TsVal::from_i32(i);
+            let out = if has_map {
+                ts_retain_val(iterable);
+                let v = dispatch_callback(map_fn, &[ch, index, iterable]);
+                ts_release_val(iterable);
+                ts_release_val(ch);
+                v
+            } else {
+                ch
+            };
+            ts_arr_set(result, i, out);
+            ts_release_val(out);
+        }
+        return result;
+    }
+
+    // Case 3: Array-like object with .length property.
+    if iterable.is_ptr() && heap_tag(iterable) == 0 {
+        let length_key = b"length\0".as_ptr() as *const i8;
+        let len_val = super::object::ts_obj_get(iterable, length_key);
+        let len = if len_val.is_int32() { len_val.as_i32() } else { 0 };
+        ts_release_val(len_val);
+        let result = ts_arr_new(len);
+        for i in 0..len {
+            let key = TsVal::from_i32(i);
+            let elem = ts_val_get_key(iterable, key);
+            ts_release_val(key);
+            let index = TsVal::from_i32(i);
+            let out = if has_map {
+                ts_retain_val(iterable);
+                let v = dispatch_callback(map_fn, &[elem, index, iterable]);
+                ts_release_val(iterable);
+                ts_release_val(elem);
+                v
+            } else {
+                elem
+            };
+            ts_arr_set(result, i, out);
+            ts_release_val(out);
+        }
+        return result;
+    }
+
+    // Fallback: return empty array.
+    ts_arr_new(0)
+}
+
 /// `arr.concat(other)` — returns a new array with elements of `arr` followed by elements of `other`.
 /// `other` can be an array (spreads its elements) or any other value (appended as-is).
 #[no_mangle]
