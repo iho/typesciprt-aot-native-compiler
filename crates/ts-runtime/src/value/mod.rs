@@ -231,6 +231,7 @@ pub mod symbol;
 pub mod set;
 pub mod weak;
 pub mod container;
+pub mod reflect;
 
 // ── Re-exports from submodules ────────────────────────────────────────────────
 
@@ -245,6 +246,7 @@ pub use object::{
     ts_val_has_key, ts_obj_set_val_key, ts_val_get_key,
     ts_obj_rest, ts_obj_keys, ts_obj_values, ts_obj_entries, ts_obj_merge,
     ts_obj_assign, ts_obj_create, ts_obj_from_entries,
+    ts_obj_get_own_property_names, ts_obj_get_prototype_of,
 };
 pub use array::{
     ts_arr_new, ts_arr_get, ts_arr_set, ts_arr_len,
@@ -315,6 +317,12 @@ pub use set::{
 pub use weak::{
     ts_weakmap_new, ts_weakmap_set, ts_weakmap_get, ts_weakmap_has, ts_weakmap_delete,
     ts_weakset_new, ts_weakset_add, ts_weakset_has, ts_weakset_delete,
+};
+pub use reflect::{
+    ts_reflect_define_metadata, ts_reflect_get_metadata, ts_reflect_get_own_metadata,
+    ts_reflect_has_metadata, ts_reflect_has_own_metadata,
+    ts_reflect_get_metadata_keys, ts_reflect_get_own_metadata_keys,
+    ts_reflect_delete_metadata,
 };
 pub use container::{
     ts_container_get, ts_container_set, ts_container_add,

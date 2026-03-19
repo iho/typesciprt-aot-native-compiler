@@ -384,7 +384,57 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
                 &[this_i64, key_ptr, fn_val], &[], self.loc,
             ));
-            // ts_obj_set retains fn_val; release our ref
+            // ts_obj_set retains fn_val (refcount now ≥ 2).
+            // Apply method decorators before releasing our reference to fn_val.
+            if !method.decorators.is_empty() {
+                // Build descriptor = { value: fn_val }
+                let descriptor: Value<'_, '_> = current.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_new"),
+                    &[], &[i64_type], self.loc,
+                )).result(0)?.into();
+                let value_key = self.get_string_ptr("value", current)?;
+                current.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                    &[descriptor, value_key, fn_val], &[], self.loc,
+                ));
+                // Create a TsString for the method name.
+                let name_c = self.get_string_ptr(&method_name, current)?;
+                let name_str: Value<'_, '_> = current.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_string_new"),
+                    &[name_c], &[i64_type], self.loc,
+                )).result(0)?.into();
+                // Apply decorators in reverse order (bottom decorator runs first).
+                for dec in method.decorators.iter().rev() {
+                    let (dec_opt, nb) = self.lower_expression(&dec.expression, current, &region, &mut scope)?;
+                    current = nb;
+                    if let Some(dec_fn) = dec_opt {
+                        let dec_fn_i64 = self.ensure_i64(dec_fn, current)?;
+                        // Call decorator(this, "methodName", descriptor)
+                        let res: Value<'_, '_> = current.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_call3"),
+                            &[dec_fn_i64, this_i64, name_str, descriptor],
+                            &[i64_type], self.loc,
+                        )).result(0)?.into();
+                        current.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[dec_fn_i64], &[], self.loc,
+                        ));
+                        current.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[res], &[], self.loc,
+                        ));
+                    }
+                }
+                current.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[descriptor], &[], self.loc,
+                ));
+                current.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[name_str], &[], self.loc,
+                ));
+            }
+            // Release our original reference to fn_val (this still retains it).
             current.append_operation(func::call(
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
                 &[fn_val], &[], self.loc,

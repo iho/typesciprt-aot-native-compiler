@@ -1123,7 +1123,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Evaluate all arguments
                 let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
                 let mut need_args = true;
-                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" || ns == "JSON" || ns == "Promise" {
+                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" || ns == "JSON" || ns == "Promise" || ns == "Reflect" {
                     for arg in &call.arguments {
                         if let Some(expr) = arg.as_expression() {
                             let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
@@ -1164,12 +1164,63 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         ("Math", "atan2") => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_atan2"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
                         ("Math", "hypot") => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_hypot"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
                         // ── Object ────────────────────────────────────────────
-                        ("Object", "keys")         => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_keys"),         &[o], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Object", "values")       => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_values"),       &[o], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Object", "entries")      => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_entries"),      &[o], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Object", "assign")       => { let t = *arg_vals.first().unwrap_or(&undef_i64); let s = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_assign"),       &[t, s], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Object", "create")       => { let p = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_create"),       &[p], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Object", "fromEntries")  => { let a = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_from_entries"), &[a], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "keys")                 => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_keys"),         &[o], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "values")               => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_values"),       &[o], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "entries")              => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_entries"),      &[o], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "assign")               => { let t = *arg_vals.first().unwrap_or(&undef_i64); let s = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_assign"),       &[t, s], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "create")               => { let p = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_create"),       &[p], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "fromEntries")          => { let a = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_from_entries"), &[a], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "getOwnPropertyNames")  => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get_own_property_names"), &[o], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Object", "getPrototypeOf")       => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get_prototype_of"), &[o], &[i64t], self.loc)).result(0)?.into()) }
+                        // ── Reflect ───────────────────────────────────────────
+                        ("Reflect", "defineMetadata") => {
+                            let k  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let v  = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let t  = *arg_vals.get(2).unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(3).unwrap_or(&undef_i64);
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_define_metadata"), &[k, v, t, pk], &[], self.loc));
+                            Some(undef_i64)
+                        }
+                        ("Reflect", "getMetadata") => {
+                            let k  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let t  = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(2).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_get_metadata"), &[k, t, pk], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "getOwnMetadata") => {
+                            let k  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let t  = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(2).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_get_own_metadata"), &[k, t, pk], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "hasMetadata") => {
+                            let k  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let t  = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(2).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_has_metadata"), &[k, t, pk], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "hasOwnMetadata") => {
+                            let k  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let t  = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(2).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_has_own_metadata"), &[k, t, pk], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "getMetadataKeys") => {
+                            let t  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_get_metadata_keys"), &[t, pk], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "getOwnMetadataKeys") => {
+                            let t  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_get_own_metadata_keys"), &[t, pk], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "deleteMetadata") => {
+                            let k  = *arg_vals.first().unwrap_or(&undef_i64);
+                            let t  = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let pk = *arg_vals.get(2).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_delete_metadata"), &[k, t, pk], &[i64t], self.loc)).result(0)?.into())
+                        }
                         // ── Array ─────────────────────────────────────────────
                         // ── String ────────────────────────────────────────────
                         ("String", "fromCharCode") => {
@@ -1952,6 +2003,40 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 return Ok((result_val, block));
             }
         }
+        // Computed member callee: obj[key]() — evaluate obj and key, get fn, then method-call.
+        if let Expression::ComputedMemberExpression(member) = &call.callee {
+            let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+            block = nb;
+            if let Some(obj_val) = obj_opt {
+                let i64t = self.i64_type();
+                let obj_i64 = self.ensure_i64(obj_val, block)?;
+                let (key_opt, nb) = self.lower_expression(&member.expression, block, region, scope)?;
+                block = nb;
+                if let Some(key_val) = key_opt {
+                    let key_i64 = self.ensure_i64(key_val, block)?;
+                    let fn_val: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_get_key"),
+                        &[obj_i64, key_i64], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[key_i64], &[], self.loc,
+                    ));
+                    let result = self.lower_method_call(fn_val, obj_i64, &call.arguments, block, region, scope)?;
+                    let (result_val, nb) = result;
+                    block = nb;
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[fn_val], &[], self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[obj_i64], &[], self.loc,
+                    ));
+                    return Ok((result_val, block));
+                }
+            }
+        }
         let (fn_opt, nb) = self.lower_expression(&call.callee, block, region, scope)?;
         block = nb;
         if let Some(fn_val) = fn_opt {
@@ -2727,6 +2812,49 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         let ctor_name = format!("__class_{}_constructor", class_name);
+        // If the class constructor is not statically known but the identifier is in scope
+        // (e.g. `new Provider()` where Provider is a loop variable holding a TsFunction),
+        // emit a dynamic call via ts_func_callN.
+        if !self.funcs.contains_key(&ctor_name) {
+            if let Some(&fn_val) = scope.get(&class_name) {
+                let i64_type = self.i64_type();
+                let mut args: Vec<Value<'c, 'b>> = Vec::new();
+                for arg in &new_expr.arguments {
+                    let expr = arg.as_expression()
+                        .ok_or_else(|| anyhow::anyhow!("spread in dynamic new expression"))?;
+                    let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    let v = v_opt.ok_or_else(|| anyhow::anyhow!("new arg produced no value"))?;
+                    args.push(self.ensure_i64(v, block)?);
+                }
+                let fn_val_i64 = self.ensure_i64(fn_val, block)?;
+                let call_func = match args.len() {
+                    0 => "ts_func_call0",
+                    1 => "ts_func_call1",
+                    2 => "ts_func_call2",
+                    3 => "ts_func_call3",
+                    _ => bail!("dynamic new: too many constructor args (max 3 supported)"),
+                };
+                let mut call_args = vec![fn_val_i64];
+                call_args.extend_from_slice(&args);
+                let result: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, call_func),
+                    &call_args, &[i64_type], self.loc,
+                )).result(0)?.into();
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[fn_val_i64], &[], self.loc,
+                ));
+                for a in &args {
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[*a], &[], self.loc,
+                    ));
+                }
+                return Ok((Some(result), block));
+            }
+            bail!("new {}: unknown class (constructor not found)", class_name);
+        }
         let Some(sig) = self.funcs.get(&ctor_name).cloned() else {
             bail!("new {}: unknown class (constructor not found)", class_name);
         };
@@ -3321,8 +3449,40 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     let v_i64 = self.ensure_i64(v, block)?;
                     // ts_arr_set retains internally; no explicit retain needed here
                     v_i64
+                } else if self.funcs.contains_key(var_name) {
+                    // Module-level function not yet in scope: create a TsFunction wrapper.
+                    let sig = self.funcs[var_name].clone();
+                    let this_offset = if sig.has_this_param { 1 } else { 0 };
+                    let arity = (sig.param_types.len() - this_offset) as i64;
+                    let ptr_type = melior::dialect::llvm::r#type::pointer(self.ctx, 0);
+                    let func_type_val = melior::ir::r#type::FunctionType::new(
+                        self.ctx, &sig.param_types, &[i64_type],
+                    ).into();
+                    let fn_ref: Value<'c, 'b> = block.append_operation(
+                        melior::ir::operation::OperationBuilder::new("func.constant", self.loc)
+                            .add_attributes(&[(
+                                melior::ir::Identifier::new(self.ctx, "value"),
+                                FlatSymbolRefAttribute::new(self.ctx, var_name).into(),
+                            )])
+                            .add_results(&[func_type_val])
+                            .build()?,
+                    ).result(0)?.into();
+                    let fn_ptr_val: Value<'c, 'b> = block.append_operation(
+                        melior::ir::operation::OperationBuilder::new("builtin.unrealized_conversion_cast", self.loc)
+                            .add_operands(&[fn_ref])
+                            .add_results(&[ptr_type])
+                            .build()?,
+                    ).result(0)?.into();
+                    let arity_val2: Value<'c, 'b> = block.append_operation(arith::constant(
+                        self.ctx, IntegerAttribute::new(i32_type, arity).into(), self.loc,
+                    )).result(0)?.into();
+                    let ctor = if sig.has_this_param { "ts_func_new_this" } else { "ts_func_new" };
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, ctor),
+                        &[fn_ptr_val, arity_val2], &[i64_type], self.loc,
+                    )).result(0)?.into()
                 } else {
-                    // Not found in scope: use undefined
+                    // Not found in scope or funcs: use undefined
                     block.append_operation(arith::constant(
                         self.ctx,
                         IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
@@ -3781,6 +3941,30 @@ fn collect_fv_expr(
             }
             for stmt in &arrow.body.statements {
                 collect_free_vars_stmt(stmt, params, &inner_locals, outer_keys, out);
+            }
+        }
+        Expression::FunctionExpression(func_expr) => {
+            let mut inner_locals = locals.clone();
+            if let Some(id) = &func_expr.id {
+                inner_locals.insert(id.name.to_string());
+            }
+            for p in &func_expr.params.items {
+                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &p.pattern {
+                    inner_locals.insert(id.name.to_string());
+                }
+            }
+            if let Some(rest) = &func_expr.params.rest {
+                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &rest.rest.argument {
+                    inner_locals.insert(id.name.to_string());
+                }
+            }
+            if let Some(body) = func_expr.body.as_deref() {
+                for stmt in &body.statements {
+                    collect_locals_stmt(stmt, &mut inner_locals);
+                }
+                for stmt in &body.statements {
+                    collect_free_vars_stmt(stmt, params, &inner_locals, outer_keys, out);
+                }
             }
         }
         // TypeScript wrappers: look through to the inner expression

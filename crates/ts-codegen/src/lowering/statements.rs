@@ -94,6 +94,53 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok(())
     }
 
+    // ── Class constructor TsFunction helper ──────────────────────────────
+
+    /// Emit code that creates the constructor TsFunction for a named class in `block`.
+    /// Returns `(new_block, ctor_ts_val)` where `ctor_ts_val` is an owned i64 reference.
+    pub(super) fn emit_class_constructor_val<'b>(
+        &mut self,
+        class_name: &str,
+        block: BlockRef<'c, 'b>,
+    ) -> Result<(BlockRef<'c, 'b>, Value<'c, 'b>)> {
+        let ctor_fn_name = format!("__class_{}_constructor", class_name);
+        let sig = self.funcs.get(&ctor_fn_name).cloned();
+        let n_params = sig.map_or(0, |s| s.param_types.len());
+        let i64_type = self.i64_type();
+        let i32_type = self.i32_type();
+        let ptr_type = melior::dialect::llvm::r#type::pointer(self.ctx, 0);
+
+        let param_types: Vec<melior::ir::Type<'c>> = vec![i64_type; n_params];
+        let func_type_val = melior::ir::r#type::FunctionType::new(
+            self.ctx,
+            &param_types,
+            &[i64_type],
+        ).into();
+        let fn_ref: Value<'c, 'b> = block.append_operation(
+            melior::ir::operation::OperationBuilder::new("func.constant", self.loc)
+                .add_attributes(&[(
+                    melior::ir::Identifier::new(self.ctx, "value"),
+                    FlatSymbolRefAttribute::new(self.ctx, &ctor_fn_name).into(),
+                )])
+                .add_results(&[func_type_val])
+                .build()?,
+        ).result(0)?.into();
+        let fn_ptr: Value<'c, 'b> = block.append_operation(
+            melior::ir::operation::OperationBuilder::new("builtin.unrealized_conversion_cast", self.loc)
+                .add_operands(&[fn_ref])
+                .add_results(&[ptr_type])
+                .build()?,
+        ).result(0)?.into();
+        let arity_val: Value<'c, 'b> = block.append_operation(arith::constant(
+            self.ctx, IntegerAttribute::new(i32_type, n_params as i64).into(), self.loc,
+        )).result(0)?.into();
+        let ctor_val: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_new_this"),
+            &[fn_ptr, arity_val], &[i64_type], self.loc,
+        )).result(0)?.into();
+        Ok((block, ctor_val))
+    }
+
     // ── Module-level const arrow hoisting ────────────────────────────────
 
     /// Lower module-level `const name = (params) => body` declarations as top-level MLIR functions.
@@ -247,8 +294,68 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Statement::ForInStatement(for_in) => {
                 self.lower_for_in_statement(for_in, block, region, scope, loops)
             }
-            Statement::ClassDeclaration(_) => {
-                Ok((None, block)) // Already lowered in the dedicated pass.
+            Statement::ClassDeclaration(class) => {
+                // If the class has class-level decorators, create the constructor TsFunction
+                // in this scope and apply each decorator in reverse order.
+                // Classes without decorators are fully handled by the dedicated hoisting pass.
+                if class.decorators.is_empty() {
+                    return Ok((None, block));
+                }
+                let class_name = match &class.id {
+                    Some(id) => id.name.to_string(),
+                    None => return Ok((None, block)),
+                };
+                let (block, ctor_val) = self.emit_class_constructor_val(&class_name, block)?;
+                // Apply class decorators in reverse order (bottom-to-top).
+                let mut cur_val = ctor_val;
+                let mut cur_block = block;
+                for dec in class.decorators.iter().rev() {
+                    let (dec_opt, nb) = self.lower_expression(&dec.expression, cur_block, region, scope)?;
+                    cur_block = nb;
+                    if let Some(dec_fn) = dec_opt {
+                        let dec_fn_i64 = self.ensure_i64(dec_fn, cur_block)?;
+                        let cur_i64 = self.ensure_i64(cur_val, cur_block)?;
+                        let new_val: Value<'c, '_> = cur_block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_call1"),
+                            &[dec_fn_i64, cur_i64], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        cur_block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[dec_fn_i64], &[], self.loc,
+                        ));
+                        // If the decorator returns undefined, keep the original class.
+                        // Otherwise replace it (standard class decorator semantics).
+                        let i64t = self.i64_type();
+                        let undef_c: Value<'c, '_> = cur_block.append_operation(arith::constant(
+                            self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                        )).result(0)?.into();
+                        let is_undef: Value<'c, '_> = cur_block.append_operation(arith::cmpi(
+                            self.ctx, arith::CmpiPredicate::Eq, new_val, undef_c, self.loc,
+                        )).result(0)?.into();
+                        // kept = is_undef ? cur_i64 : new_val
+                        let kept: Value<'c, '_> = cur_block.append_operation(
+                            melior::dialect::arith::select(is_undef, cur_i64, new_val, self.loc),
+                        ).result(0)?.into();
+                        // The value we're not keeping needs to be released.
+                        // We retain `kept` and release whichever of {cur_i64, new_val} we didn't pick.
+                        // Use: release(is_undef ? new_val : cur_i64)
+                        let discarded: Value<'c, '_> = cur_block.append_operation(
+                            melior::dialect::arith::select(is_undef, new_val, cur_i64, self.loc),
+                        ).result(0)?.into();
+                        cur_block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                            &[kept], &[], self.loc,
+                        ));
+                        cur_block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[discarded], &[], self.loc,
+                        ));
+                        cur_val = kept;
+                    }
+                }
+                // Store the (possibly replaced) class constructor in scope.
+                scope.insert(class_name, cur_val);
+                Ok((None, cur_block))
             }
             Statement::TSInterfaceDeclaration(_)
             | Statement::TSTypeAliasDeclaration(_)

@@ -384,6 +384,28 @@ pub unsafe extern "C" fn ts_obj_create(_proto: TsVal) -> TsVal {
     ts_obj_new()
 }
 
+/// `Object.getOwnPropertyNames(obj)` — returns an array of ALL own property names
+/// (enumerable and non-enumerable), which for TsObject equals `Object.keys`.
+/// For NestJS route scanning: class instances store their methods as object properties,
+/// so this returns method names along with other instance property names.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_get_own_property_names(obj: TsVal) -> TsVal {
+    // For a plain TsObject, return all non-internal keys (same as ts_obj_keys).
+    // For everything else, return an empty array.
+    ts_obj_keys(obj)
+}
+
+/// `Object.getPrototypeOf(obj)` — in our flat object model every instance stores its
+/// methods directly (there is no separate prototype object).  We return the object itself
+/// so that NestJS's prototype-chain walk (`Object.getOwnPropertyNames(prototype)`) sees
+/// the instance's methods.  The walk terminates because the object is added to a `visited`
+/// Set before `getPrototypeOf` is called again.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_get_prototype_of(obj: TsVal) -> TsVal {
+    ts_retain_val(obj);
+    obj
+}
+
 /// `Object.fromEntries(iterable)` — build object from `[[key, val], ...]` array.
 #[no_mangle]
 pub unsafe extern "C" fn ts_obj_from_entries(arr: TsVal) -> TsVal {

@@ -1087,6 +1087,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_weakset_has",                &[i64_type, i64_type], &[i64_type]);
         add_func("ts_weakset_delete",             &[i64_type, i64_type], &[i64_type]);
 
+        // Reflect metadata API
+        add_func("ts_reflect_define_metadata",    &[i64_type, i64_type, i64_type, i64_type], &[]);
+        add_func("ts_reflect_get_metadata",       &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_reflect_get_own_metadata",   &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_reflect_has_metadata",       &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_reflect_has_own_metadata",   &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_reflect_get_metadata_keys",  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_reflect_get_own_metadata_keys", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_reflect_delete_metadata",    &[i64_type, i64_type, i64_type], &[i64_type]);
+
+        // Object introspection
+        add_func("ts_obj_get_own_property_names", &[i64_type], &[i64_type]);
+        add_func("ts_obj_get_prototype_of",       &[i64_type], &[i64_type]);
+
         // Polymorphic container dispatch
         add_func("ts_container_get",              &[i64_type, i64_type], &[i64_type]);
         add_func("ts_container_set",              &[i64_type, i64_type, i64_type], &[i64_type]);
@@ -1419,6 +1433,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
 
         let mut current_block = entry;
+
+        // Inject module-level global variables into scope via ts_get_module_global.
+        // This allows module-level functions to access module-level non-function consts
+        // and enables inner closures to capture them correctly.
+        for global_name in self.module_global_names.clone() {
+            if !scope.contains_key(&global_name) {
+                let key_ptr = self.get_string_ptr(&global_name, entry)?;
+                let val: Value<'_, '_> = entry.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                    &[key_ptr], &[i64_type], self.loc,
+                )).result(0)?.into();
+                scope.insert(global_name, val);
+            }
+        }
 
         // Emit default parameter checks: if param === undefined, use initializer.
         for (i, param) in func.params.items.iter().enumerate() {
