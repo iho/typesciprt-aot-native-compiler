@@ -198,7 +198,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         match stmt {
             Statement::ExpressionStatement(es) => {
@@ -264,7 +264,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
             Statement::BreakStatement(_) => {
                 if let Some((_, exit_block, scope_keys)) = loops.last() {
-                    let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+                    // Coerce each scope value to the expected phi arg type of exit_block.
+                    // Switch exit blocks force i64; loop exit blocks may use other types.
+                    let mut vals: Vec<Value<'c, 'b>> = Vec::new();
+                    for (i, k) in scope_keys.iter().enumerate() {
+                        let v = scope[k];
+                        let coerced = if let Ok(arg) = exit_block.argument(i) {
+                            self.coerce_val_to_type(v, arg.r#type(), block)?
+                        } else { v };
+                        vals.push(coerced);
+                    }
                     self.terminate_with_br(block, exit_block, &vals);
                     let dead = region.append_block(Block::new(&[]));
                     Ok((None, dead))
@@ -273,14 +282,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
             Statement::ContinueStatement(_) => {
-                if let Some((header_block, _, scope_keys)) = loops.last() {
+                // Skip switch entries (None continue target) to find the enclosing loop.
+                let loop_entry = loops.iter().rev()
+                    .find_map(|(cont_opt, _, keys)| cont_opt.map(|h| (h, keys)));
+                if let Some((header_block, scope_keys)) = loop_entry {
                     let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
-                    self.terminate_with_br(block, header_block, &vals);
+                    self.terminate_with_br(block, &header_block, &vals);
                     let dead = region.append_block(Block::new(&[]));
                     Ok((None, dead))
                 } else {
                     bail!("continue statement outside of loop");
                 }
+            }
+            Statement::SwitchStatement(sw) => {
+                self.lower_switch_statement(sw, block, region, scope, loops)
             }
             Statement::ThrowStatement(throw) => {
                 self.lower_throw_statement(throw, block, region, scope)
@@ -762,7 +777,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         mut block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let (cond_opt, nb) = self.lower_expression(&if_stmt.test, block, region, scope)?;
         block = nb;
@@ -835,7 +850,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
         // Normalize all scope values to i64 to avoid type mismatches in phi nodes.
@@ -879,7 +894,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Lower the loop body.
         let mut body_scope = header_scope.clone();
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((header_block, exit_block, scope_keys.clone()));
+        inner_loops.push((Some(header_block), exit_block, scope_keys.clone()));
         let (_, body_end) =
             self.lower_statement(&while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
         let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
@@ -898,6 +913,252 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok((None, exit_block))
     }
 
+    // ── Switch statement ──────────────────────────────────────────────────
+    //
+    // Compiled as a linear chain of equality checks followed by case bodies
+    // that fall through to the next case or jump to the exit block on break.
+    //
+    // Control flow for `switch (disc) { case A: sA; break; case B: sB; default: sD; }`:
+    //
+    //   entry → check_A → [match] → body_A → [break] → exit
+    //                   → check_B → [match] → body_B → (fall) → body_default → exit
+    //                             → body_default → exit
+    //
+    pub(super) fn lower_switch_statement<'b>(
+        &mut self,
+        sw: &oxc_ast::ast::SwitchStatement<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let i64t = self.i64_type();
+
+        // Evaluate discriminant once.
+        let (disc_opt, nb) = self.lower_expression(&sw.discriminant, block, region, scope)?;
+        block = nb;
+        let disc = match disc_opt {
+            Some(v) => self.ensure_i64(v, block)?,
+            None => bail!("switch discriminant produced no value"),
+        };
+
+        // Normalize scope to i64 for phi nodes.
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
+        let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+            scope_keys.iter().map(|_| (i64t, self.loc)).collect();
+        let exit_block = region.append_block(Block::new(&phi_types));
+
+        // Separate `default` case from labeled cases.
+        let default_case = sw.cases.iter().find(|c| c.test.is_none());
+        let labeled_cases: Vec<_> = sw.cases.iter().filter(|c| c.test.is_some()).collect();
+
+        // Create one "check" block (entry of each labeled case's comparison) — no phi args.
+        // One "body" block (phi args = all scope vars) per case.
+        // Body blocks take phi args so that fallthrough from the previous case can pass
+        // updated scope values via SSA, avoiding dominance violations.
+        // default_body also takes phi args when it exists.
+        let mut check_blocks: Vec<BlockRef<'c, 'b>> = Vec::new();
+        let mut body_blocks: Vec<BlockRef<'c, 'b>> = Vec::new();
+        for _ in &labeled_cases {
+            check_blocks.push(region.append_block(Block::new(&[])));
+            body_blocks.push(region.append_block(Block::new(&phi_types)));
+        }
+        let default_body = if default_case.is_some() {
+            region.append_block(Block::new(&phi_types))
+        } else {
+            // If there's no default, failing all checks goes to exit with current values.
+            exit_block
+        };
+
+        // Jump from the pre-switch block into the first check (or default_body if no cases).
+        if check_blocks.is_empty() {
+            let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+            block.append_operation(cf::br(&default_body, &vals, self.loc));
+        } else {
+            block.append_operation(cf::br(&check_blocks[0], &[], self.loc));
+        }
+
+        // Push a switch entry so `break` inside any case jumps to exit_block.
+        // Use `None` for continue so that `continue` inside a switch propagates to
+        // the enclosing loop (handled by ContinueStatement searching backwards).
+        let mut inner_loops = loops.to_vec();
+        inner_loops.push((None, exit_block, scope_keys.clone()));
+
+        // Build each labeled case's check + body.
+        for (idx, case) in labeled_cases.iter().enumerate() {
+            let check = check_blocks[idx];
+            let body  = body_blocks[idx];
+            let next  = if idx + 1 < check_blocks.len() {
+                check_blocks[idx + 1]
+            } else {
+                default_body
+            };
+
+            // ── Check block: compare discriminant with case value ──
+            // Retain disc for the comparison (it will outlive the check block).
+            check.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                &[disc], &[], self.loc,
+            ));
+            let test_expr = case.test.as_ref().unwrap();
+            let mut check_scope = scope.clone();
+            let (test_opt, check_end) = self.lower_expression(test_expr, check, region, &mut check_scope)?;
+            let test_val = test_opt.ok_or_else(|| anyhow::anyhow!("switch case test produced no value"))?;
+            let test_i64 = self.ensure_i64(test_val, check_end)?;
+            let eq_i32: Value<'c, 'b> = check_end.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_strict_eq"),
+                &[disc, test_i64], &[self.i32_type()], self.loc,
+            )).result(0)?.into();
+            check_end.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[disc], &[], self.loc,
+            ));
+            check_end.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[test_i64], &[], self.loc,
+            ));
+            let c0 = check_end.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
+            )).result(0)?.into();
+            let eq_i1: Value<'c, 'b> = check_end.append_operation(arith::cmpi(
+                self.ctx, arith::CmpiPredicate::Ne, eq_i32, c0, self.loc,
+            )).result(0)?.into();
+            // True branch: jump to body with current scope vals (body block has phi args).
+            // False branch: jump to next check (no phi args) or default_body/exit_block (phi args).
+            let body_args: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+            let next_args: Vec<Value<'c, 'b>> = if next.argument_count() > 0 {
+                scope_keys.iter().map(|k| scope[k]).collect()
+            } else {
+                vec![]
+            };
+            check_end.append_operation(cf::cond_br(
+                self.ctx, eq_i1, &body, &next, &body_args, &next_args, self.loc,
+            ));
+
+            // ── Body block: case consequent ──
+            // Initialize case_scope from the body block's phi args so that both the
+            // "direct match" path (from check block) and the "fallthrough" path (from
+            // the previous case body) use the same properly merged scope values.
+            let mut case_scope = scope.clone();
+            for (i, k) in scope_keys.iter().enumerate() {
+                case_scope.insert(k.clone(), body.argument(i)?.into());
+            }
+            let mut cur_body = body;
+            // `exited` is true when break/return/throw caused a non-local jump, meaning
+            // subsequent statements (including our fallthrough) would be dead code.
+            let mut exited = false;
+            for stmt in &case.consequent {
+                let prev = cur_body;
+                let (_, nb) = self.lower_statement(stmt, cur_body, region, &mut case_scope, &inner_loops)?;
+                cur_body = nb;
+                // Detect unconditional exit (break/return/throw): the previous block got a
+                // non-branching (unconditional) terminator, meaning control never falls through.
+                // `cf.br` is unconditional; `cf.cond_br` (from if/else) is not.
+                if let Some(term) = prev.terminator() {
+                    let ident = term.name();
+                    let sref = ident.as_string_ref();
+                    let is_unconditional = sref.as_str() == Ok("cf.br") || sref.as_str() == Ok("func.return");
+                    if is_unconditional {
+                        exited = true;
+                        break;
+                    }
+                }
+                if cur_body.terminator().is_some() {
+                    exited = true;
+                    break;
+                }
+            }
+            // Emit fallthrough only if we're not in dead code.
+            if !exited && cur_body.terminator().is_none() {
+                let fall_target = if idx + 1 < body_blocks.len() {
+                    body_blocks[idx + 1]
+                } else {
+                    default_body
+                };
+                // All fallthrough targets (body blocks and exit_block) take phi args.
+                // Coerce case_scope values to i64 and pass them.
+                let mut fall_vals: Vec<Value<'c, 'b>> = Vec::new();
+                for k in &scope_keys {
+                    let v = *case_scope.get(k).unwrap_or(&scope[k]);
+                    fall_vals.push(self.coerce_val_to_type(v, i64t, cur_body)?);
+                }
+                cur_body.append_operation(cf::br(&fall_target, &fall_vals, self.loc));
+            }
+            // Dead blocks (created by break/return inside the case) have no terminator.
+            // Use llvm.unreachable so we don't add fake predecessors to exit_block,
+            // which would create phantom CFG paths and break SSA dominance.
+            if cur_body.terminator().is_none() {
+                cur_body.append_operation(melior::dialect::llvm::unreachable(self.loc));
+            }
+        }
+
+        // ── Default case body ──
+        if let Some(def_case) = default_case {
+            // Initialize def_scope from the default_body's phi args (same as for labeled cases).
+            let mut def_scope = scope.clone();
+            for (i, k) in scope_keys.iter().enumerate() {
+                def_scope.insert(k.clone(), default_body.argument(i)?.into());
+            }
+            let mut cur = default_body;
+            let mut exited_default = false;
+            for stmt in &def_case.consequent {
+                let prev = cur;
+                let (_, nb) = self.lower_statement(stmt, cur, region, &mut def_scope, &inner_loops)?;
+                cur = nb;
+                if let Some(term) = prev.terminator() {
+                    let ident = term.name();
+                    let sref = ident.as_string_ref();
+                    let is_unconditional = sref.as_str() == Ok("cf.br") || sref.as_str() == Ok("func.return");
+                    if is_unconditional {
+                        exited_default = true;
+                        break;
+                    }
+                }
+                if cur.terminator().is_some() {
+                    exited_default = true;
+                    break;
+                }
+            }
+            if !exited_default && cur.terminator().is_none() {
+                let mut vals: Vec<Value<'c, 'b>> = Vec::new();
+                for k in &scope_keys {
+                    let v = *def_scope.get(k).unwrap_or(&scope[k]);
+                    vals.push(self.coerce_val_to_type(v, i64t, cur)?);
+                }
+                cur.append_operation(cf::br(&exit_block, &vals, self.loc));
+            }
+            // Same dead-block fix for default case.
+            if cur.terminator().is_none() {
+                cur.append_operation(melior::dialect::llvm::unreachable(self.loc));
+            }
+        } else if check_blocks.is_empty() {
+            // No cases at all: the initial br to default_body == exit_block already emitted above.
+            // But exit_block needs phi args — fix: emit them with a br from block (already done above).
+        }
+
+        // If there are no labeled cases and no default, exit_block was branched to directly.
+        // Otherwise update scope from exit_block phi args.
+        if !phi_types.is_empty() {
+            for (i, k) in scope_keys.iter().enumerate() {
+                scope.insert(k.clone(), exit_block.argument(i)?.into());
+            }
+        }
+
+        // Release discriminant after all cases are done.
+        // (Each check block retained and released disc itself; here we release the
+        // original caller-retained reference.)
+        exit_block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[disc], &[], self.loc,
+        ));
+
+        Ok((None, exit_block))
+    }
+
     // ── For loop (desugared: init + while) ───────────────────────────────
 
     pub(super) fn lower_for_statement<'b>(
@@ -906,7 +1167,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Lower init (may introduce new variables into scope).
         let mut current = block;
@@ -978,7 +1239,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut body_scope = header_scope.clone();
         let mut inner_loops = loops.to_vec();
         // continue jumps to the update_block, while break jumps to the exit_block.
-        inner_loops.push((update_block, exit_block, scope_keys.clone()));
+        inner_loops.push((Some(update_block), exit_block, scope_keys.clone()));
         
         let (_, body_end) =
             self.lower_statement(&for_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
@@ -1073,7 +1334,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let i32_type = self.i32_type();
         let i64_type = self.i64_type();
@@ -1253,7 +1514,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         mut block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Determine the loop variable binding.
         // `loop_var` is the name used to hold the raw element in body_scope (always internal or user).
@@ -1391,7 +1652,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((update_block, exit_block, scope_keys.clone()));
+        inner_loops.push((Some(update_block), exit_block, scope_keys.clone()));
         let (_, body_end) = self.lower_statement(&for_of.body, body_block, region, &mut body_scope, &inner_loops)?;
 
         // Release destructured sub-variables before leaving the body.
@@ -1477,7 +1738,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         mut block: BlockRef<'c, 'b>,
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-        loops: &[(BlockRef<'c, 'b>, BlockRef<'c, 'b>, Vec<String>)],
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>)],
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         // Evaluate the object.
         let (obj_opt, nb) = self.lower_expression(&for_in.right, block, region, scope)?;
@@ -1588,7 +1849,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         body_scope.insert(loop_var.clone(), key_val);
 
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((update_block, exit_block, scope_keys.clone()));
+        inner_loops.push((Some(update_block), exit_block, scope_keys.clone()));
         let (_, body_end) = self.lower_statement(&for_in.body, body_block, region, &mut body_scope, &inner_loops)?;
 
         if let Some(&loop_val) = body_scope.get(&loop_var) {

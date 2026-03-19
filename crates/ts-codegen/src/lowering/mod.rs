@@ -26,7 +26,7 @@ use melior::ir::{
     Attribute, Block, BlockLike, BlockRef, Identifier, Location, Module, Region,
     RegionLike, Type, Value, ValueLike,
 };
-use melior::ir::operation::OperationBuilder;
+use melior::ir::operation::{OperationBuilder, OperationLike};
 use melior::Context;
 use oxc_ast::ast::{
     ArrowFunctionExpression, ArrayPattern, AssignmentTarget, BinaryExpression, BindingPattern,

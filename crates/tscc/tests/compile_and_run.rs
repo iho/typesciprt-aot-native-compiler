@@ -619,3 +619,16 @@ fn set_add_single_arg() {
         3, // set has 3 unique elements (10, 20, 30); duplicate 20 is ignored
     );
 }
+
+/// Switch statement: basic, default, fallthrough, and string cases.
+/// Expected exit code = 31 (20 + 5 + 1 + 2 + 3).
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn switch_statement() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/switch_stmt.ts"),
+        &root.join("target/test-switch"),
+        31,
+    );
+}
