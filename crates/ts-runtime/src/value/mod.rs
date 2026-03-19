@@ -252,42 +252,49 @@ pub use object::{
     ts_val_has_key, ts_obj_set_val_key, ts_val_get_key,
     ts_obj_rest, ts_obj_keys, ts_obj_values, ts_obj_entries, ts_obj_merge,
     ts_obj_assign, ts_obj_create, ts_obj_from_entries,
-    ts_obj_get_own_property_names, ts_obj_get_prototype_of,
+    ts_obj_get_own_property_names, ts_obj_get_prototype_of, ts_obj_define_property,
+    ts_obj_define_getter, ts_obj_define_setter,
+    ts_structured_clone,
 };
 pub use array::{
-    ts_arr_new, ts_arr_get, ts_arr_set, ts_arr_len,
+    ts_arr_new, ts_arr_get, ts_arr_set, ts_arr_len, ts_iterable_len, ts_iterable_get,
     ts_arr_reverse, ts_arr_fill, ts_arr_splice, ts_arr_slice_range,
     ts_arr_includes, ts_arr_last_index_of, ts_arr_copy_within,
     ts_arr_push, ts_arr_pop, ts_arr_unshift, ts_arr_shift, ts_arr_push_all, ts_arr_join,
     ts_arr_index_of, ts_arr_rest,
-    ts_arr_map, ts_arr_filter, ts_arr_for_each, ts_arr_reduce,
-    ts_arr_find, ts_arr_find_index, ts_arr_some, ts_arr_every,
+    ts_arr_map, ts_arr_filter, ts_arr_for_each, ts_arr_reduce, ts_arr_reduce_right,
+    ts_arr_find, ts_arr_find_index, ts_arr_find_last, ts_arr_find_last_index, ts_arr_some, ts_arr_every,
     ts_arr_sort, ts_arr_flat_map, ts_arr_flat, ts_arr_concat,
+    ts_arr_to_sorted, ts_arr_to_reversed, ts_arr_with,
+    ts_arr_keys, ts_arr_values, ts_arr_entries,
 };
 pub use string_val::{
     ts_string_new, ts_string_concat, ts_str_trim_start, ts_str_trim_end,
     ts_val_to_string, ts_val_length,
     ts_str_index_of, ts_str_index_of_from, ts_str_last_index_of, ts_str_includes, ts_val_index_of, ts_val_includes,
-    ts_str_slice, ts_str_to_upper, ts_str_to_lower, ts_str_trim,
+    ts_str_slice, ts_str_substring, ts_str_to_upper, ts_str_to_lower, ts_str_trim,
     ts_str_split, ts_str_replace, ts_str_replace_all,
     ts_str_starts_with, ts_str_ends_with,
     ts_str_pad_start, ts_str_pad_end,
     ts_str_char_at, ts_str_char_code_at, ts_str_repeat, ts_str_from_char_code,
-    ts_str_at,
+    ts_str_at, ts_val_at,
+    ts_str_locale_compare,
 };
 pub use map::{
     ts_map_new, ts_map_set, ts_map_get, ts_map_has, ts_map_delete,
     ts_map_clear, ts_map_size, ts_map_keys, ts_map_values,
     ts_map_for_each, ts_map_entries,
+    ts_map_from_arr,
 };
 pub use regexp::{
     ts_regexp_new, ts_regexp_from_val, ts_regexp_test, ts_regexp_exec,
-    ts_regexp_source, ts_str_match, ts_str_replace_regex,
+    ts_regexp_source, ts_str_match, ts_str_replace_regex, ts_str_match_all, ts_str_search,
 };
 pub use promise::{
     ts_promise_resolve, ts_promise_await, ts_promise_destructor,
-    ts_promise_race, ts_promise_all, ts_promise_reject,
+    ts_promise_race, ts_promise_race_all, ts_promise_all, ts_promise_all_settled, ts_promise_any, ts_promise_reject,
     ts_sleep,
+    ts_set_timeout, ts_set_interval, ts_clear_timeout, ts_clear_interval, ts_queue_microtask,
     ts_async_spawn0, ts_async_spawn1, ts_async_spawn2, ts_async_spawn3, ts_async_spawn4,
 };
 pub use operators::{
@@ -296,23 +303,29 @@ pub use operators::{
     ts_lt, ts_le, ts_gt, ts_ge,
     ts_math_abs, ts_math_floor, ts_math_ceil, ts_math_round, ts_math_sqrt,
     ts_math_trunc, ts_math_log, ts_math_log2, ts_math_log10,
-    ts_math_sin, ts_math_cos, ts_math_tan,
+    ts_math_sin, ts_math_cos, ts_math_tan, ts_math_sign,
+    ts_math_asin, ts_math_acos, ts_math_atan, ts_math_sinh, ts_math_cosh, ts_math_tanh,
+    ts_math_exp, ts_math_expm1, ts_math_log1p, ts_math_cbrt,
+    ts_math_clz32, ts_math_fround, ts_math_imul, ts_math_random,
     ts_math_min, ts_math_max, ts_math_pow, ts_math_atan2, ts_math_hypot,
     ts_parse_int, ts_parse_float,
     ts_is_nan_val, ts_is_finite_val,
     ts_typeof, ts_val_strict_eq, ts_is_nullish, ts_is_truthy, ts_val_not, ts_is_undefined,
     ts_is_array, ts_func_spread_call, ts_method_spread_call,
     ts_coerce_number, ts_coerce_string, ts_coerce_bool,
+    ts_num_to_fixed, ts_num_to_precision, ts_num_to_exponential,
 };
 pub use json::{ts_json_stringify, ts_json_parse};
 pub use uri::{
     ts_encode_uri_component, ts_decode_uri_component, ts_encode_uri, ts_decode_uri,
 };
-pub use globals::{ts_set_module_global, ts_get_module_global};
+pub use globals::{ts_set_module_global, ts_get_module_global, ts_process_exit, ts_process_argv, ts_process_env};
 pub use http::{
     ts_headers_new, ts_headers_append, ts_headers_get_set_cookie,
+    ts_headers_get, ts_headers_has, ts_headers_set, ts_headers_delete,
     ts_response_new, ts_response_clone,
-    ts_request_new, ts_serve, ts_serve_worker,
+    ts_response_status, ts_response_ok, ts_response_headers,
+    ts_request_new, ts_fetch, ts_serve, ts_serve_worker,
     ts_add_event_listener, ts_remove_event_listener,
     ts_val_text, ts_val_json,
 };

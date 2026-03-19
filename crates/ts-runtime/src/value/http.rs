@@ -5,7 +5,8 @@ use super::array::{ts_arr_new, ts_arr_push};
 use super::object::{ts_obj_new, ts_obj_get, ts_obj_set};
 use super::map::{ts_map_set, map_key_eq};
 use super::uri::{rust_str_to_val, str_val_to_rust};
-use super::promise::{ts_promise_resolve, ts_promise_await, get_runtime};
+use super::promise::{ts_promise_resolve, ts_promise_await, get_runtime, make_promise_pair, alloc_promise, resolve_arc};
+use super::TsPromise;
 use super::func::dispatch_callback;
 use super::string_val::{ts_string_new, ts_val_to_string};
 use super::json::ts_json_parse;
@@ -76,6 +77,81 @@ pub unsafe extern "C" fn ts_headers_append(headers_val: TsVal, name: TsVal, valu
     map.entries.push((name, value));
     ts_retain_val(headers_val);
     headers_val
+}
+
+/// `headers.get(name)` — return first matching header value or null.
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_get(headers_val: TsVal, name: TsVal) -> TsVal {
+    if !headers_val.is_ptr() || heap_tag(headers_val) != 7 { return NULL; }
+    let map = &*(headers_val.as_ptr() as *const TsMap);
+    for (k, v) in &map.entries {
+        if map_key_eq(*k, name) {
+            ts_retain_val(*v);
+            return *v;
+        }
+    }
+    NULL
+}
+
+/// `headers.has(name)` — return true if header exists.
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_has(headers_val: TsVal, name: TsVal) -> TsVal {
+    if !headers_val.is_ptr() || heap_tag(headers_val) != 7 {
+        return TsVal::from_bool(false);
+    }
+    let map = &*(headers_val.as_ptr() as *const TsMap);
+    for (k, _) in &map.entries {
+        if map_key_eq(*k, name) {
+            return TsVal::from_bool(true);
+        }
+    }
+    TsVal::from_bool(false)
+}
+
+/// `headers.set(name, value)` — set or replace a header value.
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_set(headers_val: TsVal, name: TsVal, value: TsVal) -> TsVal {
+    if !headers_val.is_ptr() || heap_tag(headers_val) != 7 {
+        ts_retain_val(headers_val);
+        return headers_val;
+    }
+    let map = &mut *(headers_val.as_ptr() as *mut TsMap);
+    // Replace existing entry if found.
+    for (k, v) in map.entries.iter_mut() {
+        if map_key_eq(*k, name) {
+            ts_release_val(*v);
+            ts_retain_val(value);
+            *v = value;
+            ts_retain_val(headers_val);
+            return headers_val;
+        }
+    }
+    // Otherwise append.
+    ts_retain_val(name);
+    ts_retain_val(value);
+    map.entries.push((name, value));
+    ts_retain_val(headers_val);
+    headers_val
+}
+
+/// `headers.delete(name)` — remove a header.
+#[no_mangle]
+pub unsafe extern "C" fn ts_headers_delete(headers_val: TsVal, name: TsVal) -> TsVal {
+    if !headers_val.is_ptr() || heap_tag(headers_val) != 7 {
+        return TsVal::from_bool(false);
+    }
+    let map = &mut *(headers_val.as_ptr() as *mut TsMap);
+    let before = map.entries.len();
+    map.entries.retain(|(k, v)| {
+        if map_key_eq(*k, name) {
+            ts_release_val(*k);
+            ts_release_val(*v);
+            false
+        } else {
+            true
+        }
+    });
+    TsVal::from_bool(map.entries.len() < before)
 }
 
 /// `headers.getSetCookie()` — return TsArray of all "set-cookie" header values.
@@ -171,6 +247,52 @@ pub unsafe extern "C" fn ts_response_new(body: TsVal, init: TsVal) -> TsVal {
 
     std::ptr::write(ptr, TsResponse { status, body, headers: headers_val });
     TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// `response.status` — return HTTP status code as integer.
+/// For TsObject (e.g. Request-like) falls back to the "status" property.
+#[no_mangle]
+pub unsafe extern "C" fn ts_response_status(resp_val: TsVal) -> TsVal {
+    if !resp_val.is_ptr() { return TsVal::from_i32(0); }
+    match heap_tag(resp_val) {
+        8 => {
+            let resp = &*(resp_val.as_ptr() as *const TsResponse);
+            TsVal::from_i32(resp.status as i32)
+        }
+        0 => ts_obj_get(resp_val, b"status\0".as_ptr() as *const i8),
+        _ => TsVal::from_i32(0),
+    }
+}
+
+/// `response.ok` — return true if status is 200-299.
+/// For TsObject falls back to reading the "ok" property.
+#[no_mangle]
+pub unsafe extern "C" fn ts_response_ok(resp_val: TsVal) -> TsVal {
+    if !resp_val.is_ptr() { return TsVal::from_bool(false); }
+    match heap_tag(resp_val) {
+        8 => {
+            let resp = &*(resp_val.as_ptr() as *const TsResponse);
+            TsVal::from_bool(resp.status >= 200 && resp.status < 300)
+        }
+        0 => ts_obj_get(resp_val, b"ok\0".as_ptr() as *const i8),
+        _ => TsVal::from_bool(false),
+    }
+}
+
+/// `response.headers` — return the Headers object (retained).
+/// For TsObject (e.g. Request) falls back to the "headers" property.
+#[no_mangle]
+pub unsafe extern "C" fn ts_response_headers(resp_val: TsVal) -> TsVal {
+    if !resp_val.is_ptr() { return NULL; }
+    match heap_tag(resp_val) {
+        8 => {
+            let resp = &*(resp_val.as_ptr() as *const TsResponse);
+            ts_retain_val(resp.headers);
+            resp.headers
+        }
+        0 => ts_obj_get(resp_val, b"headers\0".as_ptr() as *const i8),
+        _ => NULL,
+    }
 }
 
 /// `response.clone()` — clone a Response.
@@ -484,6 +606,167 @@ pub unsafe extern "C" fn ts_val_json(val: TsVal) -> TsVal {
     let p = ts_promise_resolve(parsed);
     ts_release_val(parsed);
     p
+}
+
+// ── Global fetch() ───────────────────────────────────────────────────────────
+
+/// `fetch(url, init?)` — perform an HTTP request and return Promise<Response>.
+/// `url` may be a string or a Request object.
+/// `init` may be an object with `method`, `headers`, `body` fields.
+#[no_mangle]
+pub unsafe extern "C" fn ts_fetch(url: TsVal, init: TsVal) -> TsVal {
+    // Extract URL string.
+    let url_str = if url.is_ptr() {
+        match heap_tag(url) {
+            2 => {
+                let ts_str = &*(url.as_ptr() as *const TsString);
+                ts_str.inner.clone()
+            }
+            0 => {
+                // Request object: read .url property
+                let url_prop = ts_obj_get(url, b"url\0".as_ptr() as *const i8);
+                let s = ts_val_to_rust_string(url_prop);
+                ts_release_val(url_prop);
+                s
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    if url_str.is_empty() {
+        let err = rust_str_to_val("fetch: invalid URL".to_string());
+        let p = ts_promise_resolve(err);
+        ts_release_val(err);
+        return p;
+    }
+
+    // Extract method, headers, body from init or from the Request object.
+    let mut method = String::from("GET");
+    let mut req_headers: Vec<(String, String)> = Vec::new();
+    let mut body_str: Option<String> = None;
+
+    // If url is a Request object (tag=0), extract its fields first.
+    if url.is_ptr() && heap_tag(url) == 0 {
+        let method_val = ts_obj_get(url, b"method\0".as_ptr() as *const i8);
+        if !method_val.is_undefined() { method = ts_val_to_rust_string(method_val); }
+        ts_release_val(method_val);
+        let headers_val = ts_obj_get(url, b"headers\0".as_ptr() as *const i8);
+        if headers_val.is_ptr() && heap_tag(headers_val) == 7 {
+            let map = &*(headers_val.as_ptr() as *const TsMap);
+            for (k, v) in &map.entries {
+                if let (Some(ks), Some(vs)) = (str_val_to_rust(*k), str_val_to_rust(*v)) {
+                    req_headers.push((ks, vs));
+                }
+            }
+        }
+        ts_release_val(headers_val);
+        let body_val = ts_obj_get(url, b"body\0".as_ptr() as *const i8);
+        if !body_val.is_undefined() && !body_val.is_null() {
+            body_str = Some(ts_val_to_rust_string(body_val));
+        }
+        ts_release_val(body_val);
+    }
+
+    // Apply init overrides.
+    if init.is_ptr() && heap_tag(init) == 0 {
+        let method_val = ts_obj_get(init, b"method\0".as_ptr() as *const i8);
+        if !method_val.is_undefined() { method = ts_val_to_rust_string(method_val); }
+        ts_release_val(method_val);
+        let headers_val = ts_obj_get(init, b"headers\0".as_ptr() as *const i8);
+        if headers_val.is_ptr() {
+            match heap_tag(headers_val) {
+                7 => {
+                    let map = &*(headers_val.as_ptr() as *const TsMap);
+                    for (k, v) in &map.entries {
+                        if let (Some(ks), Some(vs)) = (str_val_to_rust(*k), str_val_to_rust(*v)) {
+                            req_headers.push((ks, vs));
+                        }
+                    }
+                }
+                0 => {
+                    let obj = &*(headers_val.as_ptr() as *const TsObject);
+                    for (k, v) in &obj.properties {
+                        if k.starts_with("__") { continue; }
+                        if let Some(vs) = str_val_to_rust(*v) {
+                            req_headers.push((k.clone(), vs));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ts_release_val(headers_val);
+        let body_val = ts_obj_get(init, b"body\0".as_ptr() as *const i8);
+        if !body_val.is_undefined() && !body_val.is_null() {
+            body_str = Some(ts_val_to_rust_string(body_val));
+        }
+        ts_release_val(body_val);
+    }
+
+    // Perform the request asynchronously using reqwest via the Tokio runtime.
+    let (resolved, notify) = make_promise_pair();
+    let r2 = resolved.clone();
+    let n2 = notify.clone();
+
+    get_runtime().spawn(async move {
+        let client = reqwest::Client::new();
+        let req_method = reqwest::Method::from_bytes(method.as_bytes())
+            .unwrap_or(reqwest::Method::GET);
+        let mut builder = client.request(req_method, &url_str);
+        for (k, v) in &req_headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        if let Some(body) = body_str {
+            builder = builder.body(body);
+        }
+        let result = builder.send().await;
+        unsafe {
+            let ts_resp = match result {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let headers: Vec<(String, String)> = resp.headers().iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect();
+                    let body_bytes = resp.bytes().await.unwrap_or_default();
+                    let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+                    let body_val = rust_str_to_val(body_str);
+
+                    // Build headers object.
+                    let ts_hdrs = ts_headers_new(UNDEFINED);
+                    for (k, v) in &headers {
+                        let kv = rust_str_to_val(k.clone());
+                        let vv = rust_str_to_val(v.clone());
+                        ts_map_set(ts_hdrs, kv, vv);
+                        ts_release_val(kv);
+                        ts_release_val(vv);
+                    }
+
+                    // Build init object for ts_response_new.
+                    let init_obj = ts_obj_new();
+                    let status_val = TsVal::from_i32(status as i32);
+                    ts_obj_set(init_obj, b"status\0".as_ptr() as *const i8, status_val);
+                    ts_obj_set(init_obj, b"headers\0".as_ptr() as *const i8, ts_hdrs);
+                    ts_release_val(ts_hdrs);
+
+                    let resp_val = ts_response_new(body_val, init_obj);
+                    ts_release_val(body_val);
+                    ts_release_val(init_obj);
+                    resp_val
+                }
+                Err(e) => {
+                    let err_str = format!("fetch error: {}", e);
+                    rust_str_to_val(err_str)
+                }
+            };
+            ts_retain_val(ts_resp);
+            resolve_arc(&r2, &n2, ts_resp);
+            ts_release_val(ts_resp);
+        }
+    });
+
+    alloc_promise(TsPromise { resolved, notify })
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────

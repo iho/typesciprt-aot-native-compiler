@@ -188,3 +188,23 @@ pub unsafe extern "C" fn ts_map_entries(map_val: TsVal) -> TsVal {
     }
     result
 }
+
+/// `new Map(iterable)` — create a Map pre-populated from an iterable of [k,v] pairs.
+/// `iterable` is a TsArray of TsArray pairs.
+#[no_mangle]
+pub unsafe extern "C" fn ts_map_from_arr(pairs: TsVal) -> TsVal {
+    use super::TsArray;
+    let map = ts_map_new();
+    if !pairs.is_ptr() || heap_tag(pairs) != 1 { return map; }
+    let arr = &*(pairs.as_ptr() as *const TsArray);
+    for &pair in &arr.elements {
+        if pair.is_ptr() && heap_tag(pair) == 1 {
+            let pair_arr = &*(pair.as_ptr() as *const TsArray);
+            let k = if pair_arr.elements.len() > 0 { pair_arr.elements[0] } else { UNDEFINED };
+            let v = if pair_arr.elements.len() > 1 { pair_arr.elements[1] } else { UNDEFINED };
+            let ret = ts_map_set(map, k, v);
+            ts_release_val(ret); // map_set returns retained map; release extra ref
+        }
+    }
+    map
+}

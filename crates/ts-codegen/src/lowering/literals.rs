@@ -353,10 +353,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
             if let Some(key_str) = p.key.static_name() {
                 // Static key: { foo: val } or { "foo": val } or { 0: val }
-                let key_ptr = self.get_string_ptr(&key_str, block)?;
+                // Handle getter/setter: { get foo() { ... } } / { set foo(v) { ... } }
+                use oxc_ast::ast::PropertyKind;
+                let (runtime_fn, key_ptr) = match p.kind {
+                    PropertyKind::Get => {
+                        ("ts_obj_define_getter", self.get_string_ptr(&key_str, block)?)
+                    }
+                    PropertyKind::Set => {
+                        ("ts_obj_define_setter", self.get_string_ptr(&key_str, block)?)
+                    }
+                    PropertyKind::Init => {
+                        ("ts_obj_set", self.get_string_ptr(&key_str, block)?)
+                    }
+                };
                 block.append_operation(func::call(
                     self.ctx,
-                    FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                    FlatSymbolRefAttribute::new(self.ctx, runtime_fn),
                     &[obj_val, key_ptr, val_i64],
                     &[],
                     self.loc,

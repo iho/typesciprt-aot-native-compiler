@@ -55,21 +55,66 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.lower_expression(&ts_nn.expression, block, region, scope)
             }
             Expression::StaticMemberExpression(member) => {
+                // process.argv → ts_process_argv(); process.env → ts_process_env()
+                if let Expression::Identifier(obj_id) = &member.object {
+                    if obj_id.name == "process" {
+                        let rt_name = match member.property.name.as_str() {
+                            "argv" => Some("ts_process_argv"),
+                            "env"  => Some("ts_process_env"),
+                            _ => None,
+                        };
+                        if let Some(rt) = rt_name {
+                            let val: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, rt),
+                                &[], &[self.i64_type()], self.loc,
+                            )).result(0)?.into();
+                            return Ok((Some(val), block));
+                        }
+                    }
+                }
+
                 // Math constants: Math.PI, Math.E, Math.LN2, …
                 if let Expression::Identifier(obj_id) = &member.object {
                     if obj_id.name == "Math" {
                         let prop = member.property.name.as_str();
                         let f = match prop {
-                            "PI"     => Some(std::f64::consts::PI),
-                            "E"      => Some(std::f64::consts::E),
-                            "LN2"    => Some(std::f64::consts::LN_2),
-                            "LN10"   => Some(std::f64::consts::LN_10),
-                            "LOG2E"  => Some(std::f64::consts::LOG2_E),
-                            "LOG10E" => Some(std::f64::consts::LOG10_E),
-                            "SQRT2"  => Some(std::f64::consts::SQRT_2),
+                            "PI"      => Some(std::f64::consts::PI),
+                            "E"       => Some(std::f64::consts::E),
+                            "LN2"     => Some(std::f64::consts::LN_2),
+                            "LN10"    => Some(std::f64::consts::LN_10),
+                            "LOG2E"   => Some(std::f64::consts::LOG2_E),
+                            "LOG10E"  => Some(std::f64::consts::LOG10_E),
+                            "SQRT2"   => Some(std::f64::consts::SQRT_2),
+                            "SQRT1_2" => Some(std::f64::consts::FRAC_1_SQRT_2),
                             _ => None,
                         };
                         if let Some(v) = f {
+                            let lit: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(self.i64_type(), v.to_bits() as i64).into(),
+                                self.loc,
+                            )).result(0)?.into();
+                            return Ok((Some(lit), block));
+                        }
+                    }
+                }
+
+                // Number constants: Number.MAX_VALUE, Number.MIN_VALUE, etc.
+                if let Expression::Identifier(obj_id) = &member.object {
+                    if obj_id.name == "Number" {
+                        let prop = member.property.name.as_str();
+                        let fval = match prop {
+                            "MAX_VALUE"         => Some(f64::MAX),
+                            "MIN_VALUE"         => Some(f64::MIN_POSITIVE),
+                            "EPSILON"           => Some(f64::EPSILON),
+                            "MAX_SAFE_INTEGER"  => Some(9007199254740991.0_f64),
+                            "MIN_SAFE_INTEGER"  => Some(-9007199254740991.0_f64),
+                            "POSITIVE_INFINITY" => Some(f64::INFINITY),
+                            "NEGATIVE_INFINITY" => Some(f64::NEG_INFINITY),
+                            "NaN"               => Some(f64::NAN),
+                            _ => None,
+                        };
+                        if let Some(v) = fval {
                             let lit: Value<'c, 'b> = block.append_operation(arith::constant(
                                 self.ctx,
                                 IntegerAttribute::new(self.i64_type(), v.to_bits() as i64).into(),
@@ -160,6 +205,35 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
 
                 let obj_i64 = self.ensure_i64(obj, block)?;
+
+                // Response property dispatch: .status, .ok, .headers
+                match member.property.name.as_str() {
+                    "status" => {
+                        let val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_response_status"),
+                            &[obj_i64], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                        return Ok((Some(val), block));
+                    }
+                    "ok" => {
+                        let val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_response_ok"),
+                            &[obj_i64], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                        return Ok((Some(val), block));
+                    }
+                    "headers" => {
+                        let val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_response_headers"),
+                            &[obj_i64], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                        return Ok((Some(val), block));
+                    }
+                    _ => {}
+                }
 
                 // Getter dispatch
                 if let Some(getter_name) = getter_mangled {
@@ -440,6 +514,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Expression::TemplateLiteral(tmpl) => {
                 self.lower_template_literal(tmpl, block, region, scope)
             }
+            Expression::TaggedTemplateExpression(tagged) => {
+                self.lower_tagged_template(tagged, block, region, scope)
+            }
             Expression::ArrowFunctionExpression(arrow) => {
                 self.lower_arrow_expr(arrow, block, region, scope)
             }
@@ -696,6 +773,35 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
+        // Built-in: process.exit(code?)
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            if matches!(&member.object, Expression::Identifier(id) if id.name == "process")
+                && member.property.name.as_str() == "exit"
+            {
+                let i64t = self.i64_type();
+                let code_val = if let Some(arg) = call.arguments.first() {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        let vi64 = v.map(|v| self.ensure_i64(v, block)).transpose()?
+                            .unwrap_or_else(|| block.append_operation(arith::constant(
+                                self.ctx, IntegerAttribute::new(i64t, 0x7FFE_0000_0000_0000u64 as i64).into(), self.loc,
+                            )).result(0).unwrap().into());
+                        self.ensure_i32(vi64, block)?
+                    } else {
+                        self.lower_numeric_literal(0, block)?
+                    }
+                } else {
+                    self.lower_numeric_literal(0, block)?
+                };
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_process_exit"),
+                    &[code_val], &[], self.loc,
+                ));
+                return Ok((None, block));
+            }
+        }
+
         // Built-in: addEventListener(event, handler) — registers a global fetch handler
         if let Expression::Identifier(callee_id) = &call.callee {
             if callee_id.name == "addEventListener" {
@@ -800,6 +906,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
+        // Built-in: fetch(url, init?) → ts_fetch(url: i64, init: i64) → Promise<Response>
+        if let Expression::Identifier(callee_id) = &call.callee {
+            if callee_id.name == "fetch" && !self.funcs.contains_key("fetch") {
+                let i64t = self.i64_type();
+                let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                let url_val = if let Some(arg) = call.arguments.first() {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                let init_val = if let Some(arg) = call.arguments.get(1) {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                let promise: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_fetch"),
+                    &[url_val, init_val], &[i64t], self.loc,
+                )).result(0)?.into();
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[url_val], &[], self.loc));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[init_val], &[], self.loc));
+                return Ok((Some(promise), block));
+            }
+        }
+
         // Built-in: sleep(ms) → ts_sleep(ms: i32) → i64 (Promise)
         if let Expression::Identifier(callee_id) = &call.callee {
             if callee_id.name == "sleep" {
@@ -819,6 +956,94 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     )).result(0)?.into();
                     return Ok((Some(promise), block));
                 }
+            }
+        }
+
+        // Built-in: setTimeout(callback, ms) / setInterval(callback, ms) / clearTimeout(id) / clearInterval(id)
+        if let Expression::Identifier(callee_id) = &call.callee {
+            let callee_name = callee_id.name.as_str();
+            if matches!(callee_name, "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval") {
+                if !self.funcs.contains_key(callee_name) {
+                    let i64t = self.i64_type();
+                    let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                        self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                    )).result(0)?.into();
+                    let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
+                    for arg in &call.arguments {
+                        if let Some(expr) = arg.as_expression() {
+                            let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                            block = nb;
+                            let v = v_opt.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64);
+                            arg_vals.push(v);
+                        }
+                    }
+                    let rt_name = match callee_name {
+                        "setTimeout"   => "ts_set_timeout",
+                        "setInterval"  => "ts_set_interval",
+                        "clearTimeout" => "ts_clear_timeout",
+                        _              => "ts_clear_interval",
+                    };
+                    // Pad to expected arity: set* takes 2 args, clear* takes 1.
+                    let arity = if callee_name.starts_with("set") { 2 } else { 1 };
+                    while arg_vals.len() < arity { arg_vals.push(undef_i64); }
+                    let result: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, rt_name),
+                        &arg_vals[..arity], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    for av in &arg_vals {
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[*av], &[], self.loc,
+                        ));
+                    }
+                    return Ok((Some(result), block));
+                }
+            }
+        }
+
+        // Built-in: structuredClone(val) — deep clone
+        if let Expression::Identifier(callee_id) = &call.callee {
+            if callee_id.name == "structuredClone" && !self.funcs.contains_key("structuredClone") {
+                let i64t = self.i64_type();
+                let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                let arg_val = if let Some(arg) = call.arguments.first() {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                let result: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_structured_clone"),
+                    &[arg_val], &[i64t], self.loc,
+                )).result(0)?.into();
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[arg_val], &[], self.loc));
+                return Ok((Some(result), block));
+            }
+        }
+
+        // Built-in: queueMicrotask(callback)
+        if let Expression::Identifier(callee_id) = &call.callee {
+            if callee_id.name == "queueMicrotask" && !self.funcs.contains_key("queueMicrotask") {
+                let i64t = self.i64_type();
+                let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                let cb_val = if let Some(arg) = call.arguments.first() {
+                    if let Some(expr) = arg.as_expression() {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                    } else { undef_i64 }
+                } else { undef_i64 };
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_queue_microtask"),
+                    &[cb_val], &[i64t], self.loc,
+                ));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[cb_val], &[], self.loc));
+                return Ok((None, block));
             }
         }
 
@@ -1216,23 +1441,38 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
                     let result_opt: Option<Value<'c, 'b>> = match (ns, method.as_str()) {
                         // ── Math ──────────────────────────────────────────────
-                        ("Math", "abs")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_abs"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "floor") => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_floor"), &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "ceil")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_ceil"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "round") => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_round"), &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "sqrt")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_sqrt"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "trunc") => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_trunc"), &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "log")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_log"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "log2")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_log2"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "log10") => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_log10"), &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "sin")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_sin"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "cos")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_cos"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "tan")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_tan"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
-                        ("Math", "min")   => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_min"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Math", "max")   => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_max"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Math", "pow")   => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_pow"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Math", "atan2") => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_atan2"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
-                        ("Math", "hypot") => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_hypot"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Math", "abs")    => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_abs"),    &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "floor")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_floor"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "ceil")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_ceil"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "round")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_round"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "sqrt")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_sqrt"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "trunc")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_trunc"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "log")    => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_log"),    &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "log2")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_log2"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "log10")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_log10"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "sin")    => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_sin"),    &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "cos")    => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_cos"),    &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "tan")    => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_tan"),    &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "sign")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_sign"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "asin")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_asin"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "acos")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_acos"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "atan")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_atan"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "sinh")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_sinh"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "cosh")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_cosh"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "tanh")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_tanh"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "exp")    => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_exp"),    &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "expm1")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_expm1"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "log1p")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_log1p"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "cbrt")   => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_cbrt"),   &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "clz32")  => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_clz32"),  &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "fround") => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_fround"), &[*arg_vals.first().unwrap_or(&undef_i64)], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "random") => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_random"), &[], &[i64t], self.loc)).result(0)?.into()),
+                        ("Math", "imul")   => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_imul"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Math", "min")    => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_min"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Math", "max")    => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_max"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Math", "pow")    => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_pow"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Math", "atan2")  => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_atan2"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
+                        ("Math", "hypot")  => { let a = *arg_vals.first().unwrap_or(&undef_i64); let b = *arg_vals.get(1).unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_math_hypot"), &[a, b], &[i64t], self.loc)).result(0)?.into()) }
                         // ── Object ────────────────────────────────────────────
                         ("Object", "keys")                 => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_keys"),         &[o], &[i64t], self.loc)).result(0)?.into()) }
                         ("Object", "values")               => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_values"),       &[o], &[i64t], self.loc)).result(0)?.into()) }
@@ -1242,6 +1482,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         ("Object", "fromEntries")          => { let a = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_from_entries"), &[a], &[i64t], self.loc)).result(0)?.into()) }
                         ("Object", "getOwnPropertyNames")  => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get_own_property_names"), &[o], &[i64t], self.loc)).result(0)?.into()) }
                         ("Object", "getPrototypeOf")       => { let o = *arg_vals.first().unwrap_or(&undef_i64); Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get_prototype_of"), &[o], &[i64t], self.loc)).result(0)?.into()) }
+                        // Object.freeze/seal/defineProperty — return the object as-is (no immutability enforcement)
+                        ("Object", "freeze") | ("Object", "seal") => {
+                            let o = *arg_vals.first().unwrap_or(&undef_i64);
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[o], &[], self.loc));
+                            Some(o)
+                        }
+                        ("Object", "isFrozen") | ("Object", "isSealed") => {
+                            Some(block.append_operation(arith::constant(self.ctx,
+                                IntegerAttribute::new(i64t, (0x7FFA_0000_0000_0001u64) as i64).into(), self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Object", "is") => {
+                            let a = *arg_vals.first().unwrap_or(&undef_i64);
+                            let b = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let cmp: Value<'c, 'b> = block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_strict_eq"), &[a, b], &[self.i32_type()], self.loc)).result(0)?.into();
+                            Some(self.ensure_i64(cmp, block)?)
+                        }
+                        ("Object", "hasOwn") => {
+                            let o = *arg_vals.first().unwrap_or(&undef_i64);
+                            let k = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_has_key"), &[o, k], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Object", "defineProperty") => {
+                            // Object.defineProperty(obj, key, descriptor) — extract .value and set it
+                            let o = *arg_vals.first().unwrap_or(&undef_i64);
+                            let k = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            let desc = *arg_vals.get(2).unwrap_or(&undef_i64);
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_define_property"), &[o, k, desc], &[], self.loc));
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[o], &[], self.loc));
+                            Some(o)
+                        }
                         // ── Reflect ───────────────────────────────────────────
                         ("Reflect", "defineMetadata") => {
                             let k  = *arg_vals.first().unwrap_or(&undef_i64);
@@ -1320,6 +1591,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             let i1_val = self.ensure_i1(flag, block)?;
                             Some(self.ensure_i64(i1_val, block)?)
                         }
+                        ("Array", "of") => {
+                            // Array.of(a, b, c) → create a TsArray with exactly those elements
+                            let n = arg_vals.len() as i32;
+                            let n_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx, IntegerAttribute::new(self.i32_type(), n as i64).into(), self.loc,
+                            )).result(0)?.into();
+                            let arr: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                                &[n_val], &[i64t], self.loc,
+                            )).result(0)?.into();
+                            for (idx, &av) in arg_vals.iter().enumerate() {
+                                let idx_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                                    self.ctx, IntegerAttribute::new(self.i32_type(), idx as i64).into(), self.loc,
+                                )).result(0)?.into();
+                                block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                                    &[arr, idx_val, av], &[], self.loc,
+                                ));
+                            }
+                            Some(arr)
+                        }
                         // ── JSON ──────────────────────────────────────────────
                         ("JSON", "stringify") => {
                             let v = *arg_vals.first().unwrap_or(&undef_i64);
@@ -1354,6 +1646,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             let v = *arg_vals.first().unwrap_or(&undef_i64);
                             Some(block.append_operation(func::call(
                                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_promise_all"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Promise", "allSettled") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_promise_all_settled"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Promise", "any") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_promise_any"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Promise", "race") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_promise_race_all"),
                                 &[v], &[i64t], self.loc,
                             )).result(0)?.into())
                         }
@@ -1420,12 +1733,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
                     if result_opt.is_some() || matches!((ns, method.as_str()),
                         ("Math", "abs"|"floor"|"ceil"|"round"|"sqrt"|"trunc"|"log"|"log2"|"log10"|
-                                 "sin"|"cos"|"tan"|"min"|"max"|"pow"|"atan2"|"hypot") |
+                                 "sin"|"cos"|"tan"|"sign"|"asin"|"acos"|"atan"|"sinh"|"cosh"|"tanh"|
+                                 "exp"|"expm1"|"log1p"|"cbrt"|"clz32"|"fround"|"random"|"imul"|
+                                 "min"|"max"|"pow"|"atan2"|"hypot") |
                         ("Object", "keys"|"values"|"entries"|"assign"|"create"|"fromEntries") |
-                        ("Array", "isArray") |
+                        ("Array", "isArray"|"of"|"from") |
                         ("String", "fromCharCode") |
                         ("JSON", "stringify"|"parse") |
-                        ("Promise", "resolve"|"reject"|"all") |
+                        ("Promise", "resolve"|"reject"|"all"|"allSettled"|"any"|"race") |
                         ("Date", "now") |
                         ("Number", "isInteger"|"isFinite"|"isNaN"|"isSafeInteger"|"parseInt"|"parseFloat")
                     ) {
@@ -1536,17 +1851,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // "match" is a string builtin only with 1 arg (String.prototype.match(re));
                 // with 2+ args it's a user method (e.g. router.match(method, path)).
                 (method_name == "match" && n_call_args == 1) ||
+                (method_name == "matchAll" && n_call_args == 1) ||
                 matches!(method_name.as_str(),
                 "push" | "pop" | "unshift" | "shift" | "indexOf" | "lastIndexOf" | "includes" | "join" |
-                "slice" | "concat" | "toUpperCase" | "toLowerCase" | "trim" | "split" |
+                "slice" | "substring" | "concat" | "toUpperCase" | "toLowerCase" | "trim" | "split" |
                 // Array HOFs
-                "map" | "filter" | "forEach" | "reduce" | "find" |
-                "findIndex" | "some" | "every" | "sort" | "flatMap" | "flat" |
+                "map" | "filter" | "forEach" | "reduce" | "reduceRight" | "find" |
+                "findIndex" | "findLast" | "findLastIndex" | "some" | "every" | "sort" | "flatMap" | "flat" |
+                "toSorted" | "toReversed" | "with" |
+                "search" |
                 // Array mutating methods
                 "reverse" | "fill" | "splice" | "copyWithin" | "lastIndexOf" |
                 // String methods
                 "replace" | "replaceAll" | "startsWith" | "endsWith" |
-                "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" | "at" |
+                "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" | "at" | "localeCompare" |
+                "toFixed" | "toPrecision" | "toExponential" |
+                "hasOwnProperty" |
                 // Container methods (Map, Set, WeakMap, WeakSet) — "add" handled above
                 "set" | "get" | "has" | "delete" | "clear" | "keys" | "values" | "entries" |
                 // RegExp methods
@@ -1726,6 +2046,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[obj_i64, start, end], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
+                    "substring" => {
+                        let start = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        let end   = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_str_substring"),
+                            &[obj_i64, start, end], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
                     "toUpperCase" => {
                         Some(block.append_operation(func::call(
                             self.ctx,
@@ -1786,6 +2115,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[obj_i64, cb, init], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
+                    "reduceRight" => {
+                        let cb   = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        let init = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_reduce_right"),
+                            &[obj_i64, cb, init], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
                     "find" => {
                         let cb = arg_vals.first().copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
@@ -1797,6 +2134,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         let cb = arg_vals.first().copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_find_index"),
+                            &[obj_i64, cb], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "findLast" => {
+                        let cb = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_find_last"),
+                            &[obj_i64, cb], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "findLastIndex" => {
+                        let cb = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_find_last_index"),
                             &[obj_i64, cb], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
@@ -1819,6 +2170,41 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_sort"),
                             &[obj_i64, cb], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "toSorted" => {
+                        let cb = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_to_sorted"),
+                            &[obj_i64, cb], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "toReversed" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_to_reversed"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "with" => {
+                        let idx = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        let val = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_with"),
+                            &[obj_i64, idx, val], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "search" => {
+                        let re = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_search"),
+                            &[obj_i64, re], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "hasOwnProperty" => {
+                        let key = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_has_key"),
+                            &[obj_i64, key], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "flatMap" => {
@@ -1961,8 +2347,36 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     "at" => {
                         let idx = arg_vals.first().copied().unwrap_or(undefined_i64);
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_at"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_at"),
                             &[obj_i64, idx], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "localeCompare" => {
+                        let other = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_locale_compare"),
+                            &[obj_i64, other], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "toFixed" => {
+                        let digits = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_num_to_fixed"),
+                            &[obj_i64, digits], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "toPrecision" => {
+                        let prec = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_num_to_precision"),
+                            &[obj_i64, prec], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "toExponential" => {
+                        let digits = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_num_to_exponential"),
+                            &[obj_i64, digits], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     // ── Container methods (Map / Set / WeakMap / WeakSet) ─────
@@ -2050,6 +2464,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[obj_i64, re], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
+                    "matchAll" => {
+                        let re = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_match_all"),
+                            &[obj_i64, re], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
                     // ── Headers methods ─────────────────────────────────────
                     "append" => {
                         let name  = arg_vals.first().copied().unwrap_or(undefined_i64);
@@ -2063,6 +2484,35 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_headers_get_set_cookie"),
                             &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "get" => {
+                        let name = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_headers_get"),
+                            &[obj_i64, name], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "has" => {
+                        let name = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_headers_has"),
+                            &[obj_i64, name], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "set" => {
+                        let name  = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        let value = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_headers_set"),
+                            &[obj_i64, name, value], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "delete" => {
+                        let name = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_headers_delete"),
+                            &[obj_i64, name], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     // ── Response methods ─────────────────────────────────────
@@ -2098,10 +2548,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
-                    // ── URLSearchParams methods ───────────────────────────────
+                    // ── URLSearchParams / generic toString ───────────────────
                     "toString" => {
+                        // URLSearchParams.toString() → ts_urlsearchparams_to_string;
+                        // generic val.toString() → ts_val_to_string (handles number, bool, etc.)
                         Some(block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_urlsearchparams_to_string"),
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_to_string"),
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
@@ -2901,23 +3353,29 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         if class_name == "Map" {
             let i64t = self.i64_type();
-            let map_val: Value<'c, 'b> = block.append_operation(func::call(
-                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_new"),
-                &[], &[i64t], self.loc,
-            )).result(0)?.into();
-            // If initial iterable arg provided (e.g. new Map([[k,v]])), populate it
+            // If initial iterable arg provided (e.g. new Map([[k,v]])), use ts_map_from_arr
             if !new_expr.arguments.is_empty() {
                 if let Some(expr) = new_expr.arguments[0].as_expression() {
                     let (arr_opt, nb) = self.lower_expression(expr, block, region, scope)?;
                     block = nb;
                     if let Some(arr) = arr_opt {
                         let arr_i64 = self.ensure_i64(arr, block)?;
-                        // Iterate pairs: call ts_map_from_arr if available, or do inline loop
-                        // TODO: implement ts_map_from_arr for efficient batch population
-                        let _ = arr_i64;
+                        let map_val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_from_arr"),
+                            &[arr_i64], &[i64t], self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[arr_i64], &[], self.loc,
+                        ));
+                        return Ok((Some(map_val), block));
                     }
                 }
             }
+            let map_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_map_new"),
+                &[], &[i64t], self.loc,
+            )).result(0)?.into();
             return Ok((Some(map_val), block));
         }
 
@@ -3214,6 +3672,100 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok((Some(acc), block))
     }
 
+    // ── Tagged template literals ───────────────────────────────────────────
+    // tag`strings ${expr}` → tag([strings], expr)
+    // The tag function receives: an array of string parts, then each interpolated value.
+    // The strings array has a `.raw` property equal to the cooked strings (simplified).
+
+    pub(super) fn lower_tagged_template<'b>(
+        &mut self,
+        tagged: &oxc_ast::ast::TaggedTemplateExpression<'_>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let i64t = self.i64_type();
+        let undefined_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+            self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+        )).result(0)?.into();
+
+        // Build the strings array from quasi cooked values.
+        let strings_arr: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+            &[undefined_i64], &[i64t], self.loc,
+        )).result(0)?.into();
+        for quasi in &tagged.quasi.quasis {
+            let cooked = quasi.value.cooked.as_deref().unwrap_or("");
+            let s = self.lower_string_literal(cooked, block)?;
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                &[strings_arr, s], &[], self.loc,
+            ));
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[s], &[], self.loc,
+            ));
+        }
+
+        // Evaluate each interpolated expression.
+        let mut expr_vals: Vec<Value<'c, 'b>> = Vec::new();
+        for expr in &tagged.quasi.expressions {
+            let (val_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+            block = nb;
+            let val = val_opt.unwrap_or(undefined_i64);
+            expr_vals.push(self.ensure_i64(val, block)?);
+        }
+
+        // Evaluate the tag expression.
+        let (tag_opt, nb) = self.lower_expression(&tagged.tag, block, region, scope)?;
+        block = nb;
+        let tag_fn = tag_opt.unwrap_or(undefined_i64);
+        let tag_i64 = self.ensure_i64(tag_fn, block)?;
+
+        // Build args: [strings_arr, expr0, expr1, ...]
+        let mut all_args: Vec<Value<'c, 'b>> = vec![strings_arr];
+        all_args.extend_from_slice(&expr_vals);
+
+        // Call via ts_func_call_n or ts_func_spread_call.
+        // Build a TsArray of all args and use dispatch_callback for simplicity.
+        let args_arr: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+            &[undefined_i64], &[i64t], self.loc,
+        )).result(0)?.into();
+        for &av in &all_args {
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                &[args_arr, av], &[], self.loc,
+            ));
+        }
+        let result: Value<'c, 'b> = block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_func_spread_call"),
+            &[tag_i64, args_arr], &[i64t], self.loc,
+        )).result(0)?.into();
+
+        // Release all temporaries.
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[strings_arr], &[], self.loc,
+        ));
+        for &av in &expr_vals {
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[av], &[], self.loc,
+            ));
+        }
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[tag_i64], &[], self.loc,
+        ));
+        block.append_operation(func::call(
+            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[args_arr], &[], self.loc,
+        ));
+
+        Ok((Some(result), block))
+    }
+
     // ── Arrow function expressions ─────────────────────────────────────────
 
     pub(super) fn lower_arrow_expr<'b>(
@@ -3277,7 +3829,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
             "JSON", "Math", "Object", "Array", "Promise", "Error",
             "TypeError", "RangeError", "SyntaxError", "ReferenceError",
-            "console", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+            "console", "process", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
             "fetch", "URL", "URLSearchParams", "Headers", "Request", "Response",
             "Symbol", "Map", "Set", "WeakMap", "WeakRef", "Reflect", "Proxy",
             "serve", "sleep", "select", "addEventListener", "removeEventListener",
@@ -3346,7 +3898,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 BindingPattern::ArrayPattern(arr_pat) => {
                     // Parameter is destructured: e.g. ([key, value]) or ([[, route]]) => {...}
                     let arg_i64 = self.ensure_i64(arg_val, arrow_entry)?;
-                    self.destructure_array_pattern_into_scope(arr_pat, arg_i64, arrow_entry, &mut arrow_scope)?;
+                    self.destructure_array_pattern_into_scope(arr_pat, arg_i64, arrow_entry, &arrow_region, &mut arrow_scope)?;
                 }
                 BindingPattern::ObjectPattern(obj_pat) => {
                     // Parameter is destructured: e.g. ({key, value}) => {...}
@@ -3764,13 +4316,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     }
 
     /// Recursively destructure an ArrayPattern into scope. Handles nested patterns.
+    /// Returns the (possibly updated) current block, since default-value handling may create new blocks.
     pub(super) fn destructure_array_pattern_into_scope<'b>(
         &mut self,
         arr_pat: &oxc_ast::ast::ArrayPattern<'_>,
         arr_val: Value<'c, 'b>,
-        block: BlockRef<'c, 'b>,
+        mut block: BlockRef<'c, 'b>,
+        region: &Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
-    ) -> Result<()> {
+    ) -> Result<BlockRef<'c, 'b>> {
         let i64t = self.i64_type();
         let i32t = self.i32_type();
         for (elem_idx, elem) in arr_pat.elements.iter().enumerate() {
@@ -3787,7 +4341,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     scope.insert(id.name.to_string(), elem_val);
                 }
                 BindingPattern::ArrayPattern(inner) => {
-                    self.destructure_array_pattern_into_scope(inner, elem_val, block, scope)?;
+                    block = self.destructure_array_pattern_into_scope(inner, elem_val, block, region, scope)?;
                 }
                 BindingPattern::ObjectPattern(obj_pat) => {
                     for prop in &obj_pat.properties {
@@ -3806,12 +4360,29 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
                 BindingPattern::AssignmentPattern(ap) => {
                     if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                        scope.insert(id.name.to_string(), elem_val); // TODO: apply default
+                        // Apply default: if elem is undefined, evaluate the default expression.
+                        let is_undef: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                            &[elem_val], &[i32t], self.loc,
+                        )).result(0)?.into();
+                        let is_undef_i1 = self.ensure_i1(is_undef, block)?;
+                        let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
+                        let default_block = region.append_block(Block::new(&[]));
+                        block.append_operation(cf::cond_br(
+                            self.ctx, is_undef_i1, &default_block, &merge_block, &[], &[elem_val], self.loc,
+                        ));
+                        let mut def_scope = scope.clone();
+                        let (def_opt, post_def) = self.lower_expression(&ap.right, default_block, region, &mut def_scope)?;
+                        let def_val = def_opt.ok_or_else(|| anyhow::anyhow!("destructuring default: no value"))?;
+                        let def_i64 = self.ensure_i64(def_val, post_def)?;
+                        post_def.append_operation(cf::br(&merge_block, &[def_i64], self.loc));
+                        block = merge_block;
+                        scope.insert(id.name.to_string(), merge_block.argument(0)?.into());
                     }
                 }
             }
         }
-        Ok(())
+        Ok(block)
     }
 
     /// Call a built-in function by its canonical JS name (e.g. "decodeURIComponent").
@@ -4135,6 +4706,10 @@ fn collect_fv_expr(
         }
         Expression::TemplateLiteral(tmpl) => {
             for e in &tmpl.expressions { collect_fv_expr(e, params, locals, outer_keys, out); }
+        }
+        Expression::TaggedTemplateExpression(tagged) => {
+            collect_fv_expr(&tagged.tag, params, locals, outer_keys, out);
+            for e in &tagged.quasi.expressions { collect_fv_expr(e, params, locals, outer_keys, out); }
         }
         Expression::ArrayExpression(arr) => {
             for elem in &arr.elements {
@@ -4525,6 +5100,15 @@ fn fvmic_expr(expr: &oxc_ast::ast::Expression<'_>, outer_vars: &NameSet, result:
                 if let Some(e) = elem.as_expression() { fvmic_expr(e, outer_vars, result); }
             }
         }
+        Expression::ObjectExpression(obj) => {
+            use oxc_ast::ast::ObjectPropertyKind;
+            for prop in &obj.properties {
+                match prop {
+                    ObjectPropertyKind::ObjectProperty(p) => fvmic_expr(&p.value, outer_vars, result),
+                    ObjectPropertyKind::SpreadProperty(s) => fvmic_expr(&s.argument, outer_vars, result),
+                }
+            }
+        }
         Expression::ParenthesizedExpression(pe) => { fvmic_expr(&pe.expression, outer_vars, result); }
         Expression::StaticMemberExpression(m) => { fvmic_expr(&m.object, outer_vars, result); }
         Expression::ComputedMemberExpression(m) => {
@@ -4533,6 +5117,10 @@ fn fvmic_expr(expr: &oxc_ast::ast::Expression<'_>, outer_vars: &NameSet, result:
         }
         Expression::SequenceExpression(s) => {
             for e in &s.expressions { fvmic_expr(e, outer_vars, result); }
+        }
+        Expression::TaggedTemplateExpression(tagged) => {
+            fvmic_expr(&tagged.tag, outer_vars, result);
+            for e in &tagged.quasi.expressions { fvmic_expr(e, outer_vars, result); }
         }
         _ => {}
     }
@@ -4626,6 +5214,9 @@ fn expr_uses_arguments(expr: &oxc_ast::ast::Expression<'_>) -> bool {
         Expression::UnaryExpression(u) => expr_uses_arguments(&u.argument),
         Expression::UpdateExpression(_) => false,
         Expression::TemplateLiteral(t) => t.expressions.iter().any(expr_uses_arguments),
+        Expression::TaggedTemplateExpression(t) => {
+            expr_uses_arguments(&t.tag) || t.quasi.expressions.iter().any(expr_uses_arguments)
+        }
         _ => false,
     }
 }

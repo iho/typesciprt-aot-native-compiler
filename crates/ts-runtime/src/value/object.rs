@@ -71,6 +71,12 @@ pub unsafe extern "C" fn ts_obj_get(obj_val: TsVal, key_ptr: *const i8) -> TsVal
     // Only tag=0 (TsObject) has a properties HashMap. All other heap types return UNDEFINED.
     if tag != 0 { return UNDEFINED; }
     let obj = ptr as *mut TsObject;
+    // Check for getter: __getter_<key>
+    let getter_key = format!("__getter_{}", key);
+    if let Some(&getter_fn) = (&*obj).properties.get(&getter_key) {
+        // Call getter with obj as `this`
+        return super::func::ts_method_call0(getter_fn, obj_val);
+    }
     if let Some(&val) = (&*obj).properties.get(&key) {
         ts_retain_val(val);
         return val;
@@ -84,15 +90,48 @@ pub unsafe extern "C" fn ts_obj_set(obj_val: TsVal, key_ptr: *const i8, val: TsV
     if !ptr.is_null() && !key_ptr.is_null() {
         let obj = ptr as *mut TsObject;
         let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy().into_owned();
-
+        // Check for setter: __setter_<key>
+        let setter_key = format!("__setter_{}", key);
+        if let Some(&setter_fn) = (&*obj).properties.get(&setter_key) {
+            let result = super::func::ts_method_call1(setter_fn, obj_val, val);
+            ts_release_val(result);
+            return;
+        }
         // ARC: retain new value
         ts_retain_val(val);
-
         let old_val = (&mut *obj).properties.insert(key, val);
         if let Some(v) = old_val {
             ts_release_val(v);
         }
     }
+}
+
+/// `Object.defineGetter(obj, key, fn)` — store getter function as `__getter_<key>`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_define_getter(obj_val: TsVal, key_ptr: *const i8, getter_fn: TsVal) {
+    let ptr = obj_val.as_ptr();
+    if ptr.is_null() || key_ptr.is_null() { return; }
+    if heap_tag(obj_val) != 0 { return; }
+    let obj = ptr as *mut TsObject;
+    let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy();
+    let getter_key = format!("__getter_{}", key);
+    ts_retain_val(getter_fn);
+    let old = (&mut *obj).properties.insert(getter_key, getter_fn);
+    if let Some(v) = old { ts_release_val(v); }
+}
+
+/// `Object.defineSetter(obj, key, fn)` — store setter function as `__setter_<key>`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_define_setter(obj_val: TsVal, key_ptr: *const i8, setter_fn: TsVal) {
+    let ptr = obj_val.as_ptr();
+    if ptr.is_null() || key_ptr.is_null() { return; }
+    if heap_tag(obj_val) != 0 { return; }
+    let obj = ptr as *mut TsObject;
+    let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy();
+    let setter_key = format!("__setter_{}", key);
+    ts_retain_val(setter_fn);
+    let old = (&mut *obj).properties.insert(setter_key, setter_fn);
+    if let Some(v) = old { ts_release_val(v); }
 }
 
 #[no_mangle]
@@ -427,3 +466,64 @@ pub unsafe extern "C" fn ts_obj_from_entries(arr: TsVal) -> TsVal {
 }
 
 
+
+/// `Object.defineProperty(obj, key, descriptor)` — extracts the `value` field
+/// from the descriptor and calls `ts_obj_set_val_key`. Returns obj.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_define_property(obj: TsVal, key: TsVal, descriptor: TsVal) {
+    if !obj.is_ptr() || heap_tag(obj) != 0 { return; }
+    if !descriptor.is_ptr() || heap_tag(descriptor) != 0 { return; }
+    let desc_obj = &*(descriptor.as_ptr() as *const TsObject);
+    if let Some(&val) = desc_obj.properties.get("value") {
+        ts_obj_set_val_key(obj, key, val);
+    } else if let Some(&getter) = desc_obj.properties.get("get") {
+        // For getter descriptors, set the key to undefined (simple fallback).
+        ts_obj_set_val_key(obj, key, super::UNDEFINED);
+        let _ = getter; // suppress unused
+    }
+}
+
+/// `structuredClone(val)` — performs a deep clone of val.
+/// Arrays and objects are deep-copied; primitives and strings are returned as-is (retained).
+#[no_mangle]
+pub unsafe extern "C" fn ts_structured_clone(val: TsVal) -> TsVal {
+    if !val.is_ptr() {
+        return val; // primitives are value types, no clone needed
+    }
+    match heap_tag(val) {
+        2 => {
+            // String — immutable, just retain and return
+            ts_retain_val(val);
+            val
+        }
+        1 => {
+            // Array — deep clone each element
+            let src = &*(val.as_ptr() as *const TsArray);
+            let clone_arr = ts_arr_new(src.elements.len() as i32);
+            for (i, &elem) in src.elements.iter().enumerate() {
+                let cloned_elem = ts_structured_clone(elem);
+                super::array::ts_arr_set(clone_arr, i as i32, cloned_elem);
+                ts_release_val(cloned_elem);
+            }
+            clone_arr
+        }
+        0 => {
+            // Object — deep clone each property
+            let src = &*(val.as_ptr() as *const TsObject);
+            let clone_obj = ts_obj_new();
+            for (key, &prop_val) in &src.properties {
+                let mut key_bytes = key.as_bytes().to_vec();
+                key_bytes.push(0u8);
+                let cloned_prop = ts_structured_clone(prop_val);
+                ts_obj_set(clone_obj, key_bytes.as_ptr() as *const i8, cloned_prop);
+                ts_release_val(cloned_prop);
+            }
+            clone_obj
+        }
+        _ => {
+            // Other heap types (Map, RegExp, etc.) — just retain and share
+            ts_retain_val(val);
+            val
+        }
+    }
+}

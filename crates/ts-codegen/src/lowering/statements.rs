@@ -231,6 +231,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Statement::WhileStatement(w) => {
                 self.lower_while_statement(w, block, region, scope, loops)
             }
+            Statement::DoWhileStatement(dw) => {
+                self.lower_do_while_statement(dw, block, region, scope, loops)
+            }
             Statement::ForStatement(f) => {
                 self.lower_for_statement(f, block, region, scope, loops)
             }
@@ -703,8 +706,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             extracted_count = i as i64 + 1;
                             continue;
                         }; // skip holes
-                        let var_name = match pat {
-                            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                        let (var_name, default_init) = match pat {
+                            BindingPattern::BindingIdentifier(id) => (id.name.to_string(), None),
+                            BindingPattern::AssignmentPattern(ap) => {
+                                if let BindingPattern::BindingIdentifier(id) = &ap.left {
+                                    (id.name.to_string(), Some(&ap.right))
+                                } else {
+                                    tracing::debug!("skipping nested array destructuring in default");
+                                    extracted_count = i as i64 + 1;
+                                    continue;
+                                }
+                            }
                             _ => {
                                 tracing::debug!("skipping nested array destructuring");
                                 extracted_count = i as i64 + 1;
@@ -719,7 +731,31 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             &[self.i64_type()],
                             self.loc,
                         )).result(0)?.into();
-                        scope.insert(var_name, elem_val);
+                        // Apply default if present.
+                        let final_val = if let Some(default_expr) = default_init {
+                            let i64t = self.i64_type();
+                            let i32t = self.i32_type();
+                            let is_undef: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                                &[elem_val], &[i32t], self.loc,
+                            )).result(0)?.into();
+                            let is_undef_i1 = self.ensure_i1(is_undef, block)?;
+                            let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
+                            let default_block = region.append_block(Block::new(&[]));
+                            block.append_operation(cf::cond_br(
+                                self.ctx, is_undef_i1, &default_block, &merge_block, &[], &[elem_val], self.loc,
+                            ));
+                            let mut def_scope = scope.clone();
+                            let (def_opt, post_def) = self.lower_expression(default_expr, default_block, region, &mut def_scope)?;
+                            let def_val = def_opt.ok_or_else(|| anyhow::anyhow!("array destructuring default: no value"))?;
+                            let def_i64 = self.ensure_i64(def_val, post_def)?;
+                            post_def.append_operation(cf::br(&merge_block, &[def_i64], self.loc));
+                            block = merge_block;
+                            merge_block.argument(0)?.into()
+                        } else {
+                            elem_val
+                        };
+                        scope.insert(var_name, final_val);
                         extracted_count = i as i64 + 1;
                     }
 
@@ -966,6 +1002,86 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }).collect()
         } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
         self.terminate_with_br(body_end, &header_block, &body_vals);
+
+        // After the loop, scope uses exit-block arguments.
+        for (i, k) in scope_keys.iter().enumerate() {
+            scope.insert(k.clone(), exit_block.argument(i)?.into());
+        }
+
+        Ok((None, exit_block))
+    }
+
+    // ── Do-while loop  (body first, condition at end) ─────────────────────
+
+    pub(super) fn lower_do_while_statement<'b>(
+        &mut self,
+        do_while_stmt: &oxc_ast::ast::DoWhileStatement<'_>,
+        block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+        loops: &[(Option<BlockRef<'c, 'b>>, BlockRef<'c, 'b>, Vec<String>, Option<String>)],
+    ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
+        let i64t = self.i64_type();
+        // Normalize all scope values to i64 for phi nodes.
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], block)?;
+            scope.insert(k.clone(), v64);
+        }
+        let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+            scope_keys.iter().map(|_| (i64t, self.loc)).collect();
+
+        // body_block receives all scope vars as phi args (loop-carried values).
+        let body_block   = region.append_block(Block::new(&phi_types));
+        // cond_block also receives all scope vars as phi args (after body executes).
+        let cond_block   = region.append_block(Block::new(&phi_types));
+        let exit_block   = region.append_block(Block::new(&phi_types));
+
+        // Jump into the body immediately (do-while always executes body first).
+        let init_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+        block.append_operation(cf::br(&body_block, &init_vals, self.loc));
+
+        // Build scope for the body (use body_block arguments).
+        let mut body_scope = scope.clone();
+        for (i, k) in scope_keys.iter().enumerate() {
+            body_scope.insert(k.clone(), body_block.argument(i)?.into());
+        }
+
+        // Lower the loop body. `continue` targets cond_block so condition is re-evaluated.
+        let mut inner_loops = loops.to_vec();
+        inner_loops.push((Some(cond_block), exit_block, scope_keys.clone(), self.pending_label.take()));
+        let (_, body_end) =
+            self.lower_statement(&do_while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
+
+        // After body, jump to cond_block.
+        let body_end_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
+            scope_keys.iter().map(|k| {
+                let v = *body_scope.get(k).unwrap_or(&body_scope[k]);
+                self.ensure_i64(v, body_end).unwrap_or(v)
+            }).collect()
+        } else { scope_keys.iter().map(|k| body_scope[k]).collect() };
+        self.terminate_with_br(body_end, &cond_block, &body_end_vals);
+
+        // Build scope for cond_block (use cond_block arguments).
+        let mut cond_scope = scope.clone();
+        for (i, k) in scope_keys.iter().enumerate() {
+            cond_scope.insert(k.clone(), cond_block.argument(i)?.into());
+        }
+
+        // Evaluate the condition inside cond_block.
+        let mut cond_cur = cond_block;
+        let (cond_opt, cond_end) = self.lower_expression(&do_while_stmt.test, cond_cur, region, &mut cond_scope)?;
+        cond_cur = cond_end;
+        let cond_val = cond_opt.ok_or_else(|| anyhow::anyhow!("do-while condition must produce a value"))?;
+        let cond_i1 = self.ensure_i1(cond_val, cond_cur)?;
+
+        // Branch: true → back to body, false → exit.
+        let cond_vals: Vec<Value<'c, 'b>> = (0..scope_keys.len())
+            .map(|i| cond_block.argument(i).map(Into::into))
+            .collect::<Result<_, _>>()?;
+        cond_cur.append_operation(cf::cond_br(
+            self.ctx, cond_i1, &body_block, &exit_block, &cond_vals, &cond_vals, self.loc,
+        ));
 
         // After the loop, scope uses exit-block arguments.
         for (i, k) in scope_keys.iter().enumerate() {
@@ -1616,10 +1732,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let iter_val = iter_opt.ok_or_else(|| anyhow::anyhow!("for...of: iterable produced no value"))?;
         let iter_i64 = self.ensure_i64(iter_val, block)?;
 
-        // Get array length (returns TsVal; unbox to i32).
+        // Get iterable length — works for arrays and strings (returns TsVal; unbox to i32).
         let len_tsval: Value<'c, 'b> = block.append_operation(func::call(
             self.ctx,
-            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_len"),
+            FlatSymbolRefAttribute::new(self.ctx, "ts_iterable_len"),
             &[iter_i64],
             &[self.i64_type()],
             self.loc,
@@ -1686,7 +1802,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let elem: Value<'c, 'b> = body_block.append_operation(func::call(
             self.ctx,
-            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+            FlatSymbolRefAttribute::new(self.ctx, "ts_iterable_get"),
             &[iter_body, idx_body],
             &[self.i64_type()],
             self.loc,

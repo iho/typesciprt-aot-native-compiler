@@ -194,3 +194,62 @@ pub unsafe extern "C" fn ts_regexp_source(re_val: TsVal) -> TsVal {
     let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
     rust_str_to_val(re_obj.source.clone())
 }
+
+/// `str.matchAll(re)` — return array of all capture-group arrays (like global exec).
+/// Each element is an array: [fullMatch, group1, group2, ...].
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_match_all(str_val: TsVal, re_val: TsVal) -> TsVal {
+    use super::array::{ts_arr_push, ts_arr_set};
+    let s = if let Some(s) = str_val_to_rust(str_val) { s } else { return ts_arr_new(0); };
+    // Accept regexp or string
+    let (source, flags) = if re_val.is_ptr() && heap_tag(re_val) == 6 {
+        let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
+        (re_obj.source.clone(), re_obj.flags.clone())
+    } else if let Some(s) = str_val_to_rust(re_val) {
+        (s, String::new())
+    } else {
+        return ts_arr_new(0);
+    };
+    let pattern = js_flags_to_regex_prefix(&source, &flags);
+    let re = match Regex::new(&pattern) {
+        Ok(r) => r,
+        Err(_) => return ts_arr_new(0),
+    };
+    let result = ts_arr_new(0);
+    for caps in re.captures_iter(&s) {
+        let match_arr = ts_arr_new(caps.len() as i32);
+        for (i, cap) in caps.iter().enumerate() {
+            let val = match cap {
+                Some(m) => rust_str_to_val(m.as_str().to_string()),
+                None => super::UNDEFINED,
+            };
+            ts_arr_set(match_arr, i as i32, val);
+            if !val.is_undefined() { super::ts_release_val(val); }
+        }
+        ts_arr_push(result, match_arr);
+        super::ts_release_val(match_arr);
+    }
+    result
+}
+
+/// `str.search(re)` — returns index of first match or -1.
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_search(str_val: TsVal, re_val: TsVal) -> TsVal {
+    let s = if let Some(s) = str_val_to_rust(str_val) { s } else { return TsVal::from_i32(-1); };
+    let (source, flags) = if re_val.is_ptr() && heap_tag(re_val) == 6 {
+        let re_obj = &*(re_val.as_ptr() as *const TsRegExp);
+        (re_obj.source.clone(), re_obj.flags.clone())
+    } else if let Some(s) = str_val_to_rust(re_val) {
+        (s, String::new())
+    } else {
+        return TsVal::from_i32(-1);
+    };
+    let pattern = js_flags_to_regex_prefix(&source, &flags);
+    match Regex::new(&pattern) {
+        Ok(re) => match re.find(&s) {
+            Some(m) => TsVal::from_i32(m.start() as i32),
+            None => TsVal::from_i32(-1),
+        },
+        Err(_) => TsVal::from_i32(-1),
+    }
+}

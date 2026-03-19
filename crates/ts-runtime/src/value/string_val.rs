@@ -75,6 +75,7 @@ pub unsafe extern "C" fn ts_val_to_string(val: TsVal) -> TsVal {
                 return ts_string_new(s.as_ptr() as *const i8);
             }
             4 => return ts_string_new(b"function() { [native code] }\0".as_ptr() as *const i8),
+            9 => return super::url::ts_urlsearchparams_to_string(val),
             _ => {}
         }
     }
@@ -207,6 +208,25 @@ pub unsafe extern "C" fn ts_str_slice(s_val: TsVal, start_val: TsVal, end_val: T
             return ts_string_new(b"\0".as_ptr() as *const i8);
         }
         let sub: String = chars[start..end.min(chars.len())].iter().collect();
+        let mut bytes = sub.into_bytes();
+        bytes.push(0u8);
+        return ts_string_new(bytes.as_ptr() as *const i8);
+    }
+    ts_string_new(b"\0".as_ptr() as *const i8)
+}
+
+/// `s.substring(start, end?)` — like slice but no negative indices; swaps if start > end.
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_substring(s_val: TsVal, start_val: TsVal, end_val: TsVal) -> TsVal {
+    if s_val.is_ptr() && heap_tag(s_val) == 2 {
+        let s = &*(s_val.as_ptr() as *const TsString);
+        let chars: Vec<char> = s.inner.chars().collect();
+        let len = chars.len() as i32;
+        let clamp = |v: i32| v.max(0).min(len) as usize;
+        let start = if start_val.is_int32() { clamp(start_val.as_i32()) } else { 0 };
+        let end   = if end_val.is_int32()   { clamp(end_val.as_i32())   } else { chars.len() };
+        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+        let sub: String = chars[lo..hi].iter().collect();
         let mut bytes = sub.into_bytes();
         bytes.push(0u8);
         return ts_string_new(bytes.as_ptr() as *const i8);
@@ -489,4 +509,45 @@ pub unsafe extern "C" fn ts_str_at(s_val: TsVal, idx_val: TsVal) -> TsVal {
         }
     }
     UNDEFINED
+}
+
+/// `.at(index)` — works on strings (tag=2) and arrays (tag=1), supports negative indices.
+#[no_mangle]
+pub unsafe extern "C" fn ts_val_at(val: TsVal, idx_val: TsVal) -> TsVal {
+    use super::{UNDEFINED, TsArray};
+    if !val.is_ptr() { return UNDEFINED; }
+    let idx = if idx_val.is_int32() { idx_val.as_i32() } else { return UNDEFINED; };
+    match super::heap_tag(val) {
+        2 => ts_str_at(val, idx_val),
+        1 => {
+            let arr = &*(val.as_ptr() as *const TsArray);
+            let len = arr.elements.len() as i32;
+            let actual = if idx < 0 { len + idx } else { idx };
+            if actual >= 0 && actual < len {
+                let v = arr.elements[actual as usize];
+                super::ts_retain_val(v);
+                v
+            } else {
+                UNDEFINED
+            }
+        }
+        _ => UNDEFINED,
+    }
+}
+
+/// `str.localeCompare(other)` — lexicographic comparison, returns -1, 0, or 1.
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_locale_compare(s_val: TsVal, other_val: TsVal) -> TsVal {
+    use super::{TsString, heap_tag};
+    let s = if s_val.is_ptr() && heap_tag(s_val) == 2 {
+        (&*(s_val.as_ptr() as *const TsString)).inner.clone()
+    } else { String::new() };
+    let other = if other_val.is_ptr() && heap_tag(other_val) == 2 {
+        (&*(other_val.as_ptr() as *const TsString)).inner.clone()
+    } else { String::new() };
+    match s.cmp(&other) {
+        std::cmp::Ordering::Less    => TsVal::from_i32(-1),
+        std::cmp::Ordering::Equal   => TsVal::from_i32(0),
+        std::cmp::Ordering::Greater => TsVal::from_i32(1),
+    }
 }

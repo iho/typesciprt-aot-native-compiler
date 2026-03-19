@@ -834,6 +834,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_arr_get", &[i64_type, i32_type], &[i64_type]);
         add_func("ts_arr_set", &[i64_type, i32_type, i64_type], &[]);
         add_func("ts_arr_len", &[i64_type], &[i64_type]);
+        add_func("ts_iterable_len", &[i64_type], &[i64_type]);
+        add_func("ts_iterable_get", &[i64_type, i32_type], &[i64_type]);
 
         add_func("ts_string_new", &[ptr_type], &[i64_type]);
         add_func("ts_string_concat", &[i64_type, i64_type], &[i64_type]);
@@ -855,7 +857,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_catch_exception",  &[], &[i64_type]);
 
         add_func("ts_sleep",           &[i32_type], &[i64_type]);
-        add_func("ts_promise_race",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_promise_race",     &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_promise_race_all", &[i64_type], &[i64_type]);
+        add_func("ts_set_timeout",     &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_set_interval",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_clear_timeout",   &[i64_type], &[i64_type]);
+        add_func("ts_clear_interval",  &[i64_type], &[i64_type]);
 
         add_func("ts_async_spawn0",    &[ptr_type], &[i64_type]);
         add_func("ts_async_spawn1",    &[ptr_type, i32_type], &[i64_type]);
@@ -888,6 +895,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_str_last_index_of",  &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_includes",       &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_slice",       &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_substring",   &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_str_to_upper",    &[i64_type], &[i64_type]);
         add_func("ts_str_to_lower",    &[i64_type], &[i64_type]);
         add_func("ts_str_trim",        &[i64_type], &[i64_type]);
@@ -910,7 +918,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_math_max",   &[i64_type, i64_type], &[i64_type]);
         add_func("ts_math_pow",   &[i64_type, i64_type], &[i64_type]);
         add_func("ts_math_atan2", &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_math_hypot", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_math_hypot",  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_math_sign",   &[i64_type], &[i64_type]);
+        add_func("ts_math_asin",   &[i64_type], &[i64_type]);
+        add_func("ts_math_acos",   &[i64_type], &[i64_type]);
+        add_func("ts_math_atan",   &[i64_type], &[i64_type]);
+        add_func("ts_math_sinh",   &[i64_type], &[i64_type]);
+        add_func("ts_math_cosh",   &[i64_type], &[i64_type]);
+        add_func("ts_math_tanh",   &[i64_type], &[i64_type]);
+        add_func("ts_math_exp",    &[i64_type], &[i64_type]);
+        add_func("ts_math_expm1",  &[i64_type], &[i64_type]);
+        add_func("ts_math_log1p",  &[i64_type], &[i64_type]);
+        add_func("ts_math_cbrt",   &[i64_type], &[i64_type]);
+        add_func("ts_math_clz32",  &[i64_type], &[i64_type]);
+        add_func("ts_math_fround", &[i64_type], &[i64_type]);
+        add_func("ts_math_random", &[], &[i64_type]);
+        add_func("ts_math_imul",   &[i64_type, i64_type], &[i64_type]);
         add_func("ts_obj_values",  &[i64_type], &[i64_type]);
         add_func("ts_obj_entries", &[i64_type], &[i64_type]);
         add_func("ts_obj_merge",          &[i64_type, i64_type], &[]);
@@ -950,18 +973,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_arr_map",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_filter",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_for_each",    &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_arr_reduce",      &[i64_type, i64_type, i64_type], &[i64_type]);
-        add_func("ts_arr_find",        &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_arr_find_index",  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_reduce",       &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_reduce_right", &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_find",            &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_find_index",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_find_last",       &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_find_last_index", &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_some",        &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_every",       &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_arr_sort",        &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_arr_flat_map",    &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_arr_flat",        &[i64_type, i32_type], &[i64_type]);
-        add_func("ts_arr_concat",      &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_sort",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_flat_map",     &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_flat",         &[i64_type, i32_type], &[i64_type]);
+        add_func("ts_arr_concat",       &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_to_sorted",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_to_reversed",  &[i64_type], &[i64_type]);
+        add_func("ts_arr_with",         &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_search",       &[i64_type, i64_type], &[i64_type]);
 
         // v1.4: Map built-in
-        add_func("ts_map_new",      &[], &[i64_type]);
+        add_func("ts_map_new",          &[], &[i64_type]);
+        add_func("ts_map_from_arr",     &[i64_type], &[i64_type]);
         add_func("ts_map_set",      &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_map_get",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_map_has",      &[i64_type, i64_type], &[i64_type]);
@@ -984,6 +1015,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_str_repeat",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_from_char_code", &[i64_type], &[i64_type]);
         add_func("ts_str_at",             &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_val_at",             &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_locale_compare", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_num_to_fixed",       &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_num_to_precision",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_num_to_exponential", &[i64_type, i64_type], &[i64_type]);
 
         // v1.5: generic computed member get, destructuring rest, Map.entries
         add_func("ts_val_get_key", &[i64_type, i64_type], &[i64_type]);
@@ -1007,6 +1043,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_regexp_test",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_regexp_exec",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_match",           &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_str_match_all",       &[i64_type, i64_type], &[i64_type]);
         add_func("ts_str_replace_regex",   &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_regexp_source",       &[i64_type], &[i64_type]);
 
@@ -1024,17 +1061,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_headers_new",         &[i64_type], &[i64_type]);
         add_func("ts_headers_append",      &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_headers_get_set_cookie", &[i64_type], &[i64_type]);
+        add_func("ts_headers_get",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_headers_has",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_headers_set",         &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_headers_delete",      &[i64_type, i64_type], &[i64_type]);
         add_func("ts_response_new",        &[i64_type, i64_type], &[i64_type]);
         add_func("ts_response_clone",      &[i64_type], &[i64_type]);
+        add_func("ts_response_status",     &[i64_type], &[i64_type]);
+        add_func("ts_response_ok",         &[i64_type], &[i64_type]);
+        add_func("ts_response_headers",    &[i64_type], &[i64_type]);
         add_func("ts_request_new",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fetch",               &[i64_type, i64_type], &[i64_type]);
 
         // Module globals (cross-function shared state)
         add_func("ts_set_module_global",   &[ptr_type, i64_type], &[]);
         add_func("ts_get_module_global",   &[ptr_type], &[i64_type]);
+        add_func("ts_process_exit",        &[i32_type], &[]);
+        add_func("ts_process_argv",        &[], &[i64_type]);
+        add_func("ts_process_env",         &[], &[i64_type]);
 
         // Additional builtins
-        add_func("ts_promise_reject",      &[i64_type], &[i64_type]);
+        add_func("ts_promise_reject",       &[i64_type], &[i64_type]);
         add_func("ts_promise_all",         &[i64_type], &[i64_type]);
+        add_func("ts_promise_all_settled", &[i64_type], &[i64_type]);
+        add_func("ts_promise_any",         &[i64_type], &[i64_type]);
         add_func("ts_val_has_key",         &[i64_type, i64_type], &[i64_type]);
         add_func("ts_coerce_bool",         &[i64_type], &[i64_type]);
 
@@ -1106,6 +1156,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Object introspection
         add_func("ts_obj_get_own_property_names", &[i64_type], &[i64_type]);
         add_func("ts_obj_get_prototype_of",       &[i64_type], &[i64_type]);
+        add_func("ts_obj_define_property",        &[i64_type, i64_type, i64_type], &[]);
+        add_func("ts_obj_define_getter",          &[i64_type, ptr_type, i64_type], &[]);
+        add_func("ts_obj_define_setter",          &[i64_type, ptr_type, i64_type], &[]);
+        add_func("ts_structured_clone",           &[i64_type], &[i64_type]);
+        add_func("ts_queue_microtask",            &[i64_type], &[i64_type]);
 
         // Polymorphic container dispatch
         add_func("ts_container_get",              &[i64_type, i64_type], &[i64_type]);
@@ -1486,6 +1541,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             scope.insert("this".to_string(), this_val);
             param_names.insert("this".to_string());
         }
+        // current_block tracks the live basic block as parameter defaults may create new blocks.
+        let mut current_block = entry;
         for (i, param) in func.params.items.iter().enumerate() {
             let param_val: Value<'_, '_> = entry.argument(i + this_offset)?.into();
             match &param.pattern {
@@ -1496,44 +1553,65 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
                 BindingPattern::ObjectPattern(obj_pat) => {
                     // function foo({ x, y: z, a = 1 }: ...) — destructure the param
-                    let param_i64 = self.ensure_i64(param_val, entry)?;
+                    let param_i64 = self.ensure_i64(param_val, current_block)?;
                     for prop in &obj_pat.properties {
                         let key_str = match prop.key.static_name() {
                             Some(n) => n.into_owned(),
                             None => continue,
                         };
-                        let var_name: String = match &prop.value {
-                            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                        let (var_name, default_init): (String, Option<&_>) = match &prop.value {
+                            BindingPattern::BindingIdentifier(id) => (id.name.to_string(), None),
                             BindingPattern::AssignmentPattern(ap) => {
                                 if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                                    id.name.to_string()
+                                    (id.name.to_string(), Some(&ap.right))
                                 } else { continue }
                             }
                             _ => continue,
                         };
-                        let key_ptr = self.get_string_ptr(&key_str, entry)?;
-                        let field_val: Value<'_, '_> = entry.append_operation(func::call(
+                        let key_ptr = self.get_string_ptr(&key_str, current_block)?;
+                        let field_val: Value<'_, '_> = current_block.append_operation(func::call(
                             self.ctx,
                             FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
                             &[param_i64, key_ptr],
                             &[i64_type], self.loc,
                         )).result(0)?.into();
-                        scope.insert(var_name.clone(), field_val);
+                        let final_val = if let Some(default_expr) = default_init {
+                            let is_undef: Value<'_, '_> = current_block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                                &[field_val], &[i32_type], self.loc,
+                            )).result(0)?.into();
+                            let is_undef_i1 = self.ensure_i1(is_undef, current_block)?;
+                            let merge_blk = region.append_block(Block::new(&[(i64_type, self.loc)]));
+                            let def_blk = region.append_block(Block::new(&[]));
+                            current_block.append_operation(cf::cond_br(
+                                self.ctx, is_undef_i1, &def_blk, &merge_blk, &[], &[field_val], self.loc,
+                            ));
+                            let mut def_scope = scope.clone();
+                            let (dv_opt, post_def) = self.lower_expression(default_expr, def_blk, &region, &mut def_scope)?;
+                            let dv = dv_opt.ok_or_else(|| anyhow::anyhow!("obj param default: no value"))?;
+                            let dv_i64 = self.ensure_i64(dv, post_def)?;
+                            post_def.append_operation(cf::br(&merge_blk, &[dv_i64], self.loc));
+                            current_block = merge_blk;
+                            merge_blk.argument(0)?.into()
+                        } else {
+                            field_val
+                        };
+                        scope.insert(var_name.clone(), final_val);
                         param_names.insert(var_name);
                     }
                 }
                 BindingPattern::ArrayPattern(arr_pat) => {
                     // function foo([a, b]: ...) — destructure the array param
-                    let param_i64 = self.ensure_i64(param_val, entry)?;
+                    let param_i64 = self.ensure_i64(param_val, current_block)?;
                     for (idx, elem_opt) in arr_pat.elements.iter().enumerate() {
                         let Some(elem) = elem_opt else { continue };
                         if let BindingPattern::BindingIdentifier(id) = elem {
                             let ename = id.name.to_string();
-                            let idx_val: Value<'_, '_> = entry.append_operation(arith::constant(
+                            let idx_val: Value<'_, '_> = current_block.append_operation(arith::constant(
                                 self.ctx,
                                 IntegerAttribute::new(i32_type, idx as i64).into(), self.loc,
                             )).result(0)?.into();
-                            let elem_val: Value<'_, '_> = entry.append_operation(func::call(
+                            let elem_val: Value<'_, '_> = current_block.append_operation(func::call(
                                 self.ctx,
                                 FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
                                 &[param_i64, idx_val], &[i64_type], self.loc,
@@ -1564,8 +1642,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_names.insert("arguments".to_string());
         }
         let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
-
-        let mut current_block = entry;
 
 
         // Inject module-level global variables into scope via ts_get_module_global.

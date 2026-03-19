@@ -152,6 +152,43 @@ pub unsafe extern "C" fn ts_math_hypot(a: TsVal, b: TsVal) -> TsVal {
     f64_to_ts_num(ts_val_to_f64_raw(a).hypot(ts_val_to_f64_raw(b)))
 }
 
+#[no_mangle] pub unsafe extern "C" fn ts_math_sign(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).signum()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_asin(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).asin()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_acos(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).acos()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_atan(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).atan()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_sinh(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).sinh()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_cosh(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).cosh()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_tanh(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).tanh()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_exp(v: TsVal) -> TsVal    { f64_to_ts_num(ts_val_to_f64_raw(v).exp()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_expm1(v: TsVal) -> TsVal  { f64_to_ts_num(ts_val_to_f64_raw(v).exp_m1()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_log1p(v: TsVal) -> TsVal  { f64_to_ts_num(ts_val_to_f64_raw(v).ln_1p()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_cbrt(v: TsVal) -> TsVal   { f64_to_ts_num(ts_val_to_f64_raw(v).cbrt()) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_clz32(v: TsVal) -> TsVal  { TsVal::from_i32((ts_val_to_f64_raw(v) as u32).leading_zeros() as i32) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_fround(v: TsVal) -> TsVal { f64_to_ts_num((ts_val_to_f64_raw(v) as f32) as f64) }
+#[no_mangle] pub unsafe extern "C" fn ts_math_imul(a: TsVal, b: TsVal) -> TsVal {
+    TsVal::from_i32((ts_val_to_f64_raw(a) as i32).wrapping_mul(ts_val_to_f64_raw(b) as i32))
+}
+#[no_mangle]
+pub unsafe extern "C" fn ts_math_random() -> TsVal {
+    // Simple xorshift64 PRNG seeded from system time
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(0);
+    let mut s = SEED.load(Ordering::Relaxed);
+    if s == 0 {
+        s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 17))
+            .unwrap_or(12345678);
+        if s == 0 { s = 1; }
+    }
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    SEED.store(s, Ordering::Relaxed);
+    // Map to [0.0, 1.0)
+    let bits = 0x3FF0_0000_0000_0000u64 | (s >> 12);
+    let f = f64::from_bits(bits) - 1.0;
+    TsVal::from_f64(f)
+}
+
 // ── Type introspection ────────────────────────────────────────────────────────
 
 /// Returns a new string TsVal describing the JavaScript `typeof` the value.
@@ -494,4 +531,44 @@ pub unsafe extern "C" fn ts_method_spread_call(fn_val: TsVal, obj: TsVal, args_a
             r
         }
     }
+}
+
+// ── Number instance methods ───────────────────────────────────────────────────
+
+/// `num.toFixed(digits)` — format number with fixed decimal places.
+#[no_mangle]
+pub unsafe extern "C" fn ts_num_to_fixed(val: TsVal, digits_val: TsVal) -> TsVal {
+    let n = ts_val_to_f64_raw(val);
+    let digits = if digits_val.is_int32() { digits_val.as_i32().max(0).min(100) as usize } else { 0 };
+    let s = format!("{:.prec$}", n, prec = digits);
+    let mut bytes = s.into_bytes();
+    bytes.push(0u8);
+    super::string_val::ts_string_new(bytes.as_ptr() as *const i8)
+}
+
+/// `num.toPrecision(precision)` — format number with given significant digits.
+#[no_mangle]
+pub unsafe extern "C" fn ts_num_to_precision(val: TsVal, prec_val: TsVal) -> TsVal {
+    let n = ts_val_to_f64_raw(val);
+    let s = if prec_val.is_int32() {
+        let p = prec_val.as_i32().max(1).min(100) as usize;
+        format!("{:.prec$e}", n, prec = p - 1)
+            .replace("e", "e+").replace("e+-", "e-").replace("e+0", "")
+    } else {
+        format!("{}", n)
+    };
+    let mut bytes = s.into_bytes();
+    bytes.push(0u8);
+    super::string_val::ts_string_new(bytes.as_ptr() as *const i8)
+}
+
+/// `num.toExponential(digits)` — format number in exponential notation.
+#[no_mangle]
+pub unsafe extern "C" fn ts_num_to_exponential(val: TsVal, digits_val: TsVal) -> TsVal {
+    let n = ts_val_to_f64_raw(val);
+    let digits = if digits_val.is_int32() { digits_val.as_i32().max(0).min(100) as usize } else { 6 };
+    let s = format!("{:.prec$e}", n, prec = digits);
+    let mut bytes = s.into_bytes();
+    bytes.push(0u8);
+    super::string_val::ts_string_new(bytes.as_ptr() as *const i8)
 }

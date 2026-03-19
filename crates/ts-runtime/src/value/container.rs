@@ -29,7 +29,7 @@ use super::weak::{
     ts_weakmap_get, ts_weakmap_set, ts_weakmap_has, ts_weakmap_delete,
     ts_weakset_add, ts_weakset_has, ts_weakset_delete,
 };
-use super::array::ts_arr_for_each;
+use super::array::{ts_arr_for_each, ts_arr_keys, ts_arr_values, ts_arr_entries};
 
 /// Dynamic method lookup helper for user class instances (heap tag 0).
 /// Looks up `method_name` on the object and calls it with up to 3 args.
@@ -138,36 +138,39 @@ pub unsafe extern "C" fn ts_container_size(container: TsVal) -> TsVal {
     }
 }
 
-/// `container.keys()` — Map: key array; Set: value array (keys === values).
+/// `container.keys()` — Array: index array; Map: key array; Set: value array.
 #[no_mangle]
 pub unsafe extern "C" fn ts_container_keys(container: TsVal) -> TsVal {
     if !container.is_ptr() { return super::array::ts_arr_new(0); }
     match heap_tag(container) {
         0         => obj_dynamic_call(container, b"keys\0", UNDEFINED, UNDEFINED, UNDEFINED, 0),
+        1         => ts_arr_keys(container),
         5 | 7 | 9 => ts_map_keys(container),
         11        => ts_set_keys(container),
         _         => super::array::ts_arr_new(0),
     }
 }
 
-/// `container.values()` — Map: value array; Set: value array.
+/// `container.values()` — Array: copy of elements; Map: value array; Set: value array.
 #[no_mangle]
 pub unsafe extern "C" fn ts_container_values(container: TsVal) -> TsVal {
     if !container.is_ptr() { return super::array::ts_arr_new(0); }
     match heap_tag(container) {
         0         => obj_dynamic_call(container, b"values\0", UNDEFINED, UNDEFINED, UNDEFINED, 0),
+        1         => ts_arr_values(container),
         5 | 7 | 9 => ts_map_values(container),
         11        => ts_set_values(container),
         _         => super::array::ts_arr_new(0),
     }
 }
 
-/// `container.entries()` — Map: [[k,v]…]; Set: [[v,v]…].
+/// `container.entries()` — Array: [[i,v]…]; Map: [[k,v]…]; Set: [[v,v]…].
 #[no_mangle]
 pub unsafe extern "C" fn ts_container_entries(container: TsVal) -> TsVal {
     if !container.is_ptr() { return super::array::ts_arr_new(0); }
     match heap_tag(container) {
         0         => obj_dynamic_call(container, b"entries\0", UNDEFINED, UNDEFINED, UNDEFINED, 0),
+        1         => ts_arr_entries(container),
         5 | 7 | 9 => ts_map_entries(container),
         11        => ts_set_entries(container),
         _         => super::array::ts_arr_new(0),

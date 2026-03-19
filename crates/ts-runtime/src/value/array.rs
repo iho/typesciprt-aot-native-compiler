@@ -82,6 +82,44 @@ pub unsafe extern "C" fn ts_arr_len(arr_val: TsVal) -> TsVal {
     TsVal::from_i32(0)
 }
 
+/// Generic iterable length: works for arrays (tag=1) and strings (tag=2).
+/// Returns a NaN-boxed i32 (same as ts_arr_len).
+#[no_mangle]
+pub unsafe extern "C" fn ts_iterable_len(val: TsVal) -> TsVal {
+    if !val.is_ptr() { return TsVal::from_i32(0); }
+    match heap_tag(val) {
+        1 => {
+            let arr = &*(val.as_ptr() as *const TsArray);
+            TsVal::from_i32(arr.elements.len() as i32)
+        }
+        2 => {
+            let s = &*(val.as_ptr() as *const TsString);
+            TsVal::from_i32(s.inner.chars().count() as i32)
+        }
+        _ => TsVal::from_i32(0),
+    }
+}
+
+/// Generic iterable element fetch: arrays return element, strings return single-char string.
+#[no_mangle]
+pub unsafe extern "C" fn ts_iterable_get(val: TsVal, idx: i32) -> TsVal {
+    if !val.is_ptr() || idx < 0 { return UNDEFINED; }
+    match heap_tag(val) {
+        1 => ts_arr_get(val, idx),
+        2 => {
+            let s = &*(val.as_ptr() as *const TsString);
+            if let Some(c) = s.inner.chars().nth(idx as usize) {
+                let mut bytes = c.to_string().into_bytes();
+                bytes.push(0u8);
+                super::string_val::ts_string_new(bytes.as_ptr() as *const i8)
+            } else {
+                UNDEFINED
+            }
+        }
+        _ => UNDEFINED,
+    }
+}
+
 /// Append `val` to the end of `arr`. Returns the new length.
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_push(arr_val: TsVal, val: TsVal) -> TsVal {
@@ -309,6 +347,28 @@ pub unsafe extern "C" fn ts_arr_reduce(arr: TsVal, callback: TsVal, init: TsVal)
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn ts_arr_reduce_right(arr: TsVal, callback: TsVal, init: TsVal) -> TsVal {
+    ts_retain_val(init);
+    let mut acc = init;
+    if arr.is_ptr() && heap_tag(arr) == 1 {
+        let arr_ptr = arr.as_ptr() as *const TsArray;
+        let len = (*arr_ptr).elements.len();
+        for i in (0..len).rev() {
+            let elem = { let r = &*arr_ptr; r.elements[i] };
+            ts_retain_val(elem);
+            let index = TsVal::from_i32(i as i32);
+            ts_retain_val(arr);
+            let new_acc = dispatch_callback(callback, &[acc, elem, index, arr]);
+            ts_release_val(arr);
+            ts_release_val(elem);
+            ts_release_val(acc);
+            acc = new_acc;
+        }
+    }
+    acc
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn ts_arr_find(arr: TsVal, callback: TsVal) -> TsVal {
     if arr.is_ptr() && heap_tag(arr) == 1 {
         let arr_ptr = arr.as_ptr() as *const TsArray;
@@ -337,6 +397,52 @@ pub unsafe extern "C" fn ts_arr_find_index(arr: TsVal, callback: TsVal) -> TsVal
         let arr_ptr = arr.as_ptr() as *const TsArray;
         let len = (*arr_ptr).elements.len();
         for i in 0..len {
+            let elem = { let r = &*arr_ptr; r.elements[i] };
+            ts_retain_val(elem);
+            let index = TsVal::from_i32(i as i32);
+            ts_retain_val(arr);
+            let found = dispatch_callback(callback, &[elem, index, arr]);
+            ts_release_val(arr);
+            ts_release_val(elem);
+            let truthy = ts_val_is_truthy(found);
+            ts_release_val(found);
+            if truthy {
+                return TsVal::from_i32(i as i32);
+            }
+        }
+    }
+    TsVal::from_i32(-1)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_find_last(arr: TsVal, callback: TsVal) -> TsVal {
+    if arr.is_ptr() && heap_tag(arr) == 1 {
+        let arr_ptr = arr.as_ptr() as *const TsArray;
+        let len = (*arr_ptr).elements.len();
+        for i in (0..len).rev() {
+            let elem = { let r = &*arr_ptr; r.elements[i] };
+            ts_retain_val(elem);
+            let index = TsVal::from_i32(i as i32);
+            ts_retain_val(arr);
+            let found = dispatch_callback(callback, &[elem, index, arr]);
+            ts_release_val(arr);
+            let truthy = ts_val_is_truthy(found);
+            ts_release_val(found);
+            if truthy {
+                return elem; // already retained
+            }
+            ts_release_val(elem);
+        }
+    }
+    UNDEFINED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_find_last_index(arr: TsVal, callback: TsVal) -> TsVal {
+    if arr.is_ptr() && heap_tag(arr) == 1 {
+        let arr_ptr = arr.as_ptr() as *const TsArray;
+        let len = (*arr_ptr).elements.len();
+        for i in (0..len).rev() {
             let elem = { let r = &*arr_ptr; r.elements[i] };
             ts_retain_val(elem);
             let index = TsVal::from_i32(i as i32);
@@ -587,8 +693,13 @@ pub unsafe extern "C" fn ts_arr_from(iterable: TsVal, map_fn: TsVal) -> TsVal {
 
 /// `arr.concat(other)` — returns a new array with elements of `arr` followed by elements of `other`.
 /// `other` can be an array (spreads its elements) or any other value (appended as-is).
+/// Also handles String.prototype.concat: if `arr` is a TsString, delegates to ts_string_concat.
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_concat(arr: TsVal, other: TsVal) -> TsVal {
+    // String.prototype.concat: concatenate string representations
+    if arr.is_ptr() && heap_tag(arr) == 2 {
+        return super::string_val::ts_string_concat(arr, other);
+    }
     let result = ts_arr_new(0);
     // Copy elements from arr
     if arr.is_ptr() && heap_tag(arr) == 1 {
@@ -752,4 +863,93 @@ pub unsafe extern "C" fn ts_arr_copy_within(arr_val: TsVal, target_val: TsVal, s
     }
     ts_retain_val(arr_val);
     arr_val
+}
+
+/// `arr.toSorted(comparator?)` — returns a sorted copy without mutating original.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_to_sorted(arr_val: TsVal, comparator: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 { return ts_arr_new(0); }
+    let src = &*(arr_val.as_ptr() as *const TsArray);
+    let copy = ts_arr_new(src.elements.len() as i32);
+    for (i, &val) in src.elements.iter().enumerate() {
+        ts_arr_set(copy, i as i32, val);
+    }
+    ts_arr_sort(copy, comparator)
+}
+
+/// `arr.toReversed()` — returns a reversed copy without mutating original.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_to_reversed(arr_val: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 { return ts_arr_new(0); }
+    let src = &*(arr_val.as_ptr() as *const TsArray);
+    let copy = ts_arr_new(src.elements.len() as i32);
+    let len = src.elements.len();
+    for (i, &val) in src.elements.iter().enumerate() {
+        ts_arr_set(copy, (len - 1 - i) as i32, val);
+    }
+    copy
+}
+
+/// `arr.with(index, value)` — returns a copy with arr[index] replaced by value.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_with(arr_val: TsVal, idx_val: TsVal, value: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 { return ts_arr_new(0); }
+    let src = &*(arr_val.as_ptr() as *const TsArray);
+    let len = src.elements.len() as i32;
+    let idx = if idx_val.is_int32() {
+        let i = idx_val.as_i32();
+        if i < 0 { (len + i).max(0) as usize } else { i.min(len - 1).max(0) as usize }
+    } else { return ts_arr_new(0); };
+    let copy = ts_arr_new(len);
+    for (i, &val) in src.elements.iter().enumerate() {
+        if i == idx {
+            ts_arr_set(copy, i as i32, value);
+        } else {
+            ts_arr_set(copy, i as i32, val);
+        }
+    }
+    copy
+}
+
+/// `arr.keys()` — returns array of integer indices [0, 1, 2, ...].
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_keys(arr_val: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 { return ts_arr_new(0); }
+    let src = &*(arr_val.as_ptr() as *const TsArray);
+    let len = src.elements.len();
+    let result = ts_arr_new(len as i32);
+    for i in 0..len {
+        ts_arr_set(result, i as i32, TsVal::from_i32(i as i32));
+    }
+    result
+}
+
+/// `arr.values()` — returns a shallow copy of the array (array of its values).
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_values(arr_val: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 { return ts_arr_new(0); }
+    let src = &*(arr_val.as_ptr() as *const TsArray);
+    let len = src.elements.len();
+    let result = ts_arr_new(len as i32);
+    for (i, &val) in src.elements.iter().enumerate() {
+        ts_arr_set(result, i as i32, val);
+    }
+    result
+}
+
+/// `arr.entries()` — returns array of [index, value] pairs.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_entries(arr_val: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 { return ts_arr_new(0); }
+    let src = &*(arr_val.as_ptr() as *const TsArray);
+    let len = src.elements.len();
+    let result = ts_arr_new(len as i32);
+    for (i, &val) in src.elements.iter().enumerate() {
+        let pair = ts_arr_new(2);
+        ts_arr_set(pair, 0, TsVal::from_i32(i as i32));
+        ts_arr_set(pair, 1, val);
+        ts_arr_set(result, i as i32, pair);
+        ts_release_val(pair);
+    }
+    result
 }

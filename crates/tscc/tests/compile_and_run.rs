@@ -658,3 +658,67 @@ fn static_class_fields() {
         3,
     );
 }
+
+/// do...while loop: runs body once first, then checks condition.
+/// Expected exit code = 5 (loop runs until i >= 5).
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn do_while_loop() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/do_while.ts"),
+        &root.join("target/test-do-while"),
+        5,
+    );
+}
+
+/// for...of over a string should iterate each character.
+/// Expected exit code = 3 (string "abc" has 3 chars).
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn for_of_string() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/for_of_string.ts"),
+        &root.join("target/test-for-of-string"),
+        3,
+    );
+}
+
+/// process.exit(code) terminates with the given exit code.
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn process_exit() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/process_exit.ts"),
+        &root.join("target/test-process-exit"),
+        42,
+    );
+}
+
+/// Array destructuring with default values: const [a = 10, b = 20, c] = [1, undefined, 3]
+/// a=1, b=20 (default), c=3  → exit code = 24
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn array_destructure_defaults() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/array_destructure_defaults.ts"),
+        &root.join("target/test-array-destructure-defaults"),
+        24,
+    );
+}
+
+/// Object getter/setter in object literals: obj.value = 42 via setter, read back via getter.
+/// Expected exit code = 42.
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn object_getter_setter() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/object_getter_setter.ts"),
+        &root.join("target/test-object-getter-setter"),
+        42,
+    );
+}
