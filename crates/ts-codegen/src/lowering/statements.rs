@@ -529,6 +529,44 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 continue;
                             }
                         };
+                        // Handle nested object destructuring: { x: { y } }
+                        if let BindingPattern::ObjectPattern(nested_obj) = &prop.value {
+                            let key_ptr = self.get_string_ptr(&key_str, block)?;
+                            let nested_val: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                                &[obj_i64, key_ptr],
+                                &[self.i64_type()],
+                                self.loc,
+                            )).result(0)?.into();
+                            extracted_keys.push(key_str);
+                            for nested_prop in &nested_obj.properties {
+                                let nested_key = match nested_prop.key.static_name() {
+                                    Some(n) => n.into_owned(),
+                                    None => continue,
+                                };
+                                let nkey_ptr = self.get_string_ptr(&nested_key, block)?;
+                                let nfield: Value<'c, 'b> = block.append_operation(func::call(
+                                    self.ctx,
+                                    FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                                    &[nested_val, nkey_ptr],
+                                    &[self.i64_type()],
+                                    self.loc,
+                                )).result(0)?.into();
+                                let nvar = match &nested_prop.value {
+                                    BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                                    BindingPattern::AssignmentPattern(ap) => {
+                                        if let BindingPattern::BindingIdentifier(id) = &ap.left {
+                                            id.name.to_string()
+                                        } else { continue }
+                                    }
+                                    _ => continue,
+                                };
+                                scope.insert(nvar, nfield);
+                            }
+                            continue;
+                        }
+
                         // Determine binding name and optional default initializer.
                         let (var_name, default_init) = match &prop.value {
                             BindingPattern::BindingIdentifier(id) => (id.name.to_string(), None),

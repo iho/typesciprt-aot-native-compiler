@@ -325,6 +325,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             )).result(0)?.into();
                             return Ok((Some(fn_val), block));
                         }
+                        // Global constants available in TypeScript/JavaScript.
+                        let global_val: Option<Value<'c, 'b>> = match name.as_str() {
+                            "Infinity" => {
+                                Some(block.append_operation(arith::constant(
+                                    self.ctx,
+                                    IntegerAttribute::new(self.i64_type(), f64::INFINITY.to_bits() as i64).into(),
+                                    self.loc,
+                                )).result(0)?.into())
+                            }
+                            "NaN" => {
+                                // Use a NaN bit pattern that is NOT NaN-boxed (bit 51 = 0),
+                                // so it passes through as a plain IEEE-754 NaN double.
+                                // 0x7FF0_0000_0000_0001: exp=all-1, mantissa≠0 → NaN; bit51=0 → not nan-boxed.
+                                Some(block.append_operation(arith::constant(
+                                    self.ctx,
+                                    IntegerAttribute::new(self.i64_type(), 0x7FF0_0000_0000_0001u64 as i64).into(),
+                                    self.loc,
+                                )).result(0)?.into())
+                            }
+                            "undefined" => {
+                                Some(block.append_operation(arith::constant(
+                                    self.ctx,
+                                    IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                                    self.loc,
+                                )).result(0)?.into())
+                            }
+                            _ => None,
+                        };
+                        if let Some(v) = global_val {
+                            return Ok((Some(v), block));
+                        }
                         eprintln!("[debug] undefined var '{}', scope keys: {:?}", name, scope.keys().collect::<Vec<_>>());
                         bail!("undefined variable: {}", name)
                     }
@@ -1123,7 +1154,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Evaluate all arguments
                 let mut arg_vals: Vec<Value<'c, 'b>> = Vec::new();
                 let mut need_args = true;
-                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" || ns == "JSON" || ns == "Promise" || ns == "Reflect" || ns == "Date" {
+                if ns == "Math" || ns == "Object" || ns == "Array" || ns == "String" || ns == "JSON" || ns == "Promise" || ns == "Reflect" || ns == "Date" || ns == "Number" {
                     for arg in &call.arguments {
                         if let Some(expr) = arg.as_expression() {
                             let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
@@ -1294,6 +1325,50 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 &[], &[i64t], self.loc,
                             )).result(0)?.into())
                         }
+                        // ── Number static ─────────────────────────────────────
+                        ("Number", "isInteger") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_number_is_integer"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Number", "isFinite") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_number_is_finite"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Number", "isNaN") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_number_is_nan"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Number", "isSafeInteger") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_number_is_safe_integer"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Number", "parseInt") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            let radix = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_parse_int"),
+                                &[v, radix], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
+                        ("Number", "parseFloat") => {
+                            let v = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_parse_float"),
+                                &[v], &[i64t], self.loc,
+                            )).result(0)?.into())
+                        }
                         _ => None,
                     };
 
@@ -1312,7 +1387,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         ("String", "fromCharCode") |
                         ("JSON", "stringify"|"parse") |
                         ("Promise", "resolve"|"reject"|"all") |
-                        ("Date", "now")
+                        ("Date", "now") |
+                        ("Number", "isInteger"|"isFinite"|"isNaN"|"isSafeInteger"|"parseInt"|"parseFloat")
                     ) {
                         return Ok((result_opt, block));
                     }
@@ -1436,6 +1512,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 "test" | "exec" |
                 // Request/Response body
                 "text" | "json" |
+                // String trim variants
+                "trimStart" | "trimEnd" | "trimLeft" | "trimRight" |
                 // URLSearchParams
                 "toString" | "getAll" |
                 // Date instance methods
@@ -1924,6 +2002,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     "json" => {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_json"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    // ── String trim variants ──────────────────────────────────
+                    "trimStart" | "trimLeft" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_trim_start"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "trimEnd" | "trimRight" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_str_trim_end"),
                             &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }

@@ -312,6 +312,46 @@ pub unsafe extern "C" fn ts_is_finite_val(val: TsVal) -> TsVal {
     }
 }
 
+// ── Number static methods (no coercion — strict type checks) ─────────────────
+
+/// `Number.isInteger(val)` — true iff val is a finite integer (no coercion).
+#[no_mangle]
+pub unsafe extern "C" fn ts_number_is_integer(val: TsVal) -> TsVal {
+    if val.is_int32() { return TsVal::from_bool(true); }
+    if val.is_number() {
+        let f = val.as_f64();
+        return TsVal::from_bool(f.is_finite() && f.trunc() == f);
+    }
+    TsVal::from_bool(false)
+}
+
+/// `Number.isFinite(val)` — true iff val is a finite number (no coercion).
+#[no_mangle]
+pub unsafe extern "C" fn ts_number_is_finite(val: TsVal) -> TsVal {
+    if val.is_int32() { return TsVal::from_bool(true); }
+    if val.is_number() { return TsVal::from_bool(val.as_f64().is_finite()); }
+    TsVal::from_bool(false)
+}
+
+/// `Number.isNaN(val)` — true iff val is NaN (no coercion).
+#[no_mangle]
+pub unsafe extern "C" fn ts_number_is_nan(val: TsVal) -> TsVal {
+    if val.is_number() { return TsVal::from_bool(val.as_f64().is_nan()); }
+    TsVal::from_bool(false)
+}
+
+/// `Number.isSafeInteger(val)` — true iff val is integer in [-2^53+1, 2^53-1].
+#[no_mangle]
+pub unsafe extern "C" fn ts_number_is_safe_integer(val: TsVal) -> TsVal {
+    if val.is_int32() { return TsVal::from_bool(true); }
+    if val.is_number() {
+        let f = val.as_f64();
+        let max = 9007199254740991.0_f64; // 2^53 - 1
+        return TsVal::from_bool(f.is_finite() && f.trunc() == f && f.abs() <= max);
+    }
+    TsVal::from_bool(false)
+}
+
 // ── Coercion ──────────────────────────────────────────────────────────────────
 
 /// Number(val) — converts any TsVal to a numeric TsVal.

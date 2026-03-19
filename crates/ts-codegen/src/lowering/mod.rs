@@ -1119,6 +1119,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_container_entries",          &[i64_type], &[i64_type]);
         add_func("ts_container_for_each",         &[i64_type, i64_type], &[i64_type]);
 
+        // String trim variants
+        add_func("ts_str_trim_start",             &[i64_type], &[i64_type]);
+        add_func("ts_str_trim_end",               &[i64_type], &[i64_type]);
+
+        // Number static methods
+        add_func("ts_number_is_integer",          &[i64_type], &[i64_type]);
+        add_func("ts_number_is_finite",           &[i64_type], &[i64_type]);
+        add_func("ts_number_is_nan",              &[i64_type], &[i64_type]);
+        add_func("ts_number_is_safe_integer",     &[i64_type], &[i64_type]);
+
         // Date
         add_func("ts_date_new",                   &[], &[i64_type]);
         add_func("ts_date_from_val",              &[i64_type], &[i64_type]);
@@ -1453,10 +1463,63 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             param_names.insert("this".to_string());
         }
         for (i, param) in func.params.items.iter().enumerate() {
-            if let BindingPattern::BindingIdentifier(id) = &param.pattern {
-                let pname = id.name.to_string();
-                scope.insert(pname.clone(), entry.argument(i + this_offset)?.into());
-                param_names.insert(pname);
+            let param_val: Value<'_, '_> = entry.argument(i + this_offset)?.into();
+            match &param.pattern {
+                BindingPattern::BindingIdentifier(id) => {
+                    let pname = id.name.to_string();
+                    scope.insert(pname.clone(), param_val);
+                    param_names.insert(pname);
+                }
+                BindingPattern::ObjectPattern(obj_pat) => {
+                    // function foo({ x, y: z, a = 1 }: ...) — destructure the param
+                    let param_i64 = self.ensure_i64(param_val, entry)?;
+                    for prop in &obj_pat.properties {
+                        let key_str = match prop.key.static_name() {
+                            Some(n) => n.into_owned(),
+                            None => continue,
+                        };
+                        let var_name: String = match &prop.value {
+                            BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                            BindingPattern::AssignmentPattern(ap) => {
+                                if let BindingPattern::BindingIdentifier(id) = &ap.left {
+                                    id.name.to_string()
+                                } else { continue }
+                            }
+                            _ => continue,
+                        };
+                        let key_ptr = self.get_string_ptr(&key_str, entry)?;
+                        let field_val: Value<'_, '_> = entry.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                            &[param_i64, key_ptr],
+                            &[i64_type], self.loc,
+                        )).result(0)?.into();
+                        scope.insert(var_name.clone(), field_val);
+                        param_names.insert(var_name);
+                    }
+                }
+                BindingPattern::ArrayPattern(arr_pat) => {
+                    // function foo([a, b]: ...) — destructure the array param
+                    let param_i64 = self.ensure_i64(param_val, entry)?;
+                    for (idx, elem_opt) in arr_pat.elements.iter().enumerate() {
+                        let Some(elem) = elem_opt else { continue };
+                        if let BindingPattern::BindingIdentifier(id) = elem {
+                            let ename = id.name.to_string();
+                            let idx_val: Value<'_, '_> = entry.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(i32_type, idx as i64).into(), self.loc,
+                            )).result(0)?.into();
+                            let elem_val: Value<'_, '_> = entry.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                                &[param_i64, idx_val], &[i64_type], self.loc,
+                            )).result(0)?.into();
+                            scope.insert(ename.clone(), elem_val);
+                            param_names.insert(ename);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         // Bind the rest parameter (last MLIR param) as a TsArray in scope.

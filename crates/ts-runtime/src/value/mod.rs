@@ -263,7 +263,7 @@ pub use array::{
     ts_arr_sort, ts_arr_flat_map, ts_arr_flat, ts_arr_concat,
 };
 pub use string_val::{
-    ts_string_new, ts_string_concat,
+    ts_string_new, ts_string_concat, ts_str_trim_start, ts_str_trim_end,
     ts_val_to_string, ts_val_length,
     ts_str_index_of, ts_str_index_of_from, ts_str_last_index_of, ts_str_includes, ts_val_index_of, ts_val_includes,
     ts_str_slice, ts_str_to_upper, ts_str_to_lower, ts_str_trim,
@@ -289,6 +289,7 @@ pub use promise::{
     ts_async_spawn0, ts_async_spawn1, ts_async_spawn2, ts_async_spawn3, ts_async_spawn4,
 };
 pub use operators::{
+    ts_number_is_integer, ts_number_is_finite, ts_number_is_nan, ts_number_is_safe_integer,
     ts_add, ts_sub, ts_mul, ts_div, ts_mod,
     ts_lt, ts_le, ts_gt, ts_ge,
     ts_math_abs, ts_math_floor, ts_math_ceil, ts_math_round, ts_math_sqrt,

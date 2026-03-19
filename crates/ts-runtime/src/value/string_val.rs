@@ -250,6 +250,32 @@ pub unsafe extern "C" fn ts_str_trim(s_val: TsVal) -> TsVal {
     ts_string_new(b"\0".as_ptr() as *const i8)
 }
 
+/// Returns `s` with leading whitespace removed (`trimStart` / `trimLeft`).
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_trim_start(s_val: TsVal) -> TsVal {
+    if s_val.is_ptr() && heap_tag(s_val) == 2 {
+        let s = &*(s_val.as_ptr() as *const TsString);
+        let trimmed = s.inner.trim_start().to_string();
+        let mut bytes = trimmed.into_bytes();
+        bytes.push(0u8);
+        return ts_string_new(bytes.as_ptr() as *const i8);
+    }
+    ts_string_new(b"\0".as_ptr() as *const i8)
+}
+
+/// Returns `s` with trailing whitespace removed (`trimEnd` / `trimRight`).
+#[no_mangle]
+pub unsafe extern "C" fn ts_str_trim_end(s_val: TsVal) -> TsVal {
+    if s_val.is_ptr() && heap_tag(s_val) == 2 {
+        let s = &*(s_val.as_ptr() as *const TsString);
+        let trimmed = s.inner.trim_end().to_string();
+        let mut bytes = trimmed.into_bytes();
+        bytes.push(0u8);
+        return ts_string_new(bytes.as_ptr() as *const i8);
+    }
+    ts_string_new(b"\0".as_ptr() as *const i8)
+}
+
 /// Split `s` by `sep` and return a `TsArray` of string parts.
 #[no_mangle]
 pub unsafe extern "C" fn ts_str_split(s_val: TsVal, sep_val: TsVal) -> TsVal {
