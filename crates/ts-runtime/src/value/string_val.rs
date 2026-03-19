@@ -187,10 +187,13 @@ pub unsafe extern "C" fn ts_val_includes(obj: TsVal, search: TsVal) -> TsVal {
     }
 }
 
-/// Returns a substring from `start` to `end` (char indices; negative = from end).
-/// Pass `undefined` as `end` to slice to end of string.
+/// Returns a substring or subarray from `start` to `end`.
+/// Dispatches to array slice for arrays, string slice for strings.
 #[no_mangle]
 pub unsafe extern "C" fn ts_str_slice(s_val: TsVal, start_val: TsVal, end_val: TsVal) -> TsVal {
+    if s_val.is_ptr() && heap_tag(s_val) == 1 {
+        return super::array::ts_arr_slice_range(s_val, start_val, end_val);
+    }
     if s_val.is_ptr() && heap_tag(s_val) == 2 {
         let s = &*(s_val.as_ptr() as *const TsString);
         let chars: Vec<char> = s.inner.chars().collect();

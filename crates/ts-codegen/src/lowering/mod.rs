@@ -1123,6 +1123,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_str_trim_start",             &[i64_type], &[i64_type]);
         add_func("ts_str_trim_end",               &[i64_type], &[i64_type]);
 
+        // Array mutating methods
+        add_func("ts_arr_reverse",                &[i64_type], &[i64_type]);
+        add_func("ts_arr_fill",                   &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_splice",                 &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_copy_within",            &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_last_index_of",          &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_slice_range",            &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_includes",               &[i64_type, i64_type], &[i64_type]);
+
         // Number static methods
         add_func("ts_number_is_integer",          &[i64_type], &[i64_type]);
         add_func("ts_number_is_finite",           &[i64_type], &[i64_type]);

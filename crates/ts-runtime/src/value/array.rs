@@ -612,3 +612,144 @@ pub unsafe extern "C" fn ts_arr_concat(arr: TsVal, other: TsVal) -> TsVal {
     }
     result
 }
+
+/// `arr.reverse()` — reverse in place, returns the array.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_reverse(arr_val: TsVal) -> TsVal {
+    if arr_val.is_ptr() && heap_tag(arr_val) == 1 {
+        let arr = &mut *(arr_val.as_ptr() as *mut TsArray);
+        arr.elements.reverse();
+    }
+    ts_retain_val(arr_val);
+    arr_val
+}
+
+/// `arr.fill(value, start?, end?)` — fill arr[start..end] with value, returns arr.
+/// start and end are i64 TsVals; UNDEFINED means 0 / arr.length.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_fill(arr_val: TsVal, value: TsVal, start_val: TsVal, end_val: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 {
+        ts_retain_val(arr_val);
+        return arr_val;
+    }
+    let arr = &mut *(arr_val.as_ptr() as *mut TsArray);
+    let len = arr.elements.len() as i64;
+    let start = if start_val.is_int32() { start_val.as_i32() as i64 } else if start_val.is_undefined() { 0 } else { 0 };
+    let end   = if end_val.is_int32()   { end_val.as_i32()   as i64 } else if end_val.is_undefined()   { len } else { len };
+    let start = start.clamp(0, len) as usize;
+    let end   = end.clamp(0, len) as usize;
+    ts_retain_val(value);
+    for i in start..end {
+        let old = arr.elements[i];
+        arr.elements[i] = value;
+        ts_retain_val(value);
+        ts_release_val(old);
+    }
+    ts_release_val(value); // one extra retain from above
+    ts_retain_val(arr_val);
+    arr_val
+}
+
+/// `arr.splice(start, deleteCount?)` — remove deleteCount elements starting at start.
+/// Returns a TsArray of removed elements. Modifies arr in place.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_splice(arr_val: TsVal, start_val: TsVal, delete_count_val: TsVal) -> TsVal {
+    let removed = ts_arr_new(0);
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 {
+        return removed;
+    }
+    let arr = &mut *(arr_val.as_ptr() as *mut TsArray);
+    let len = arr.elements.len() as i64;
+    let start = if start_val.is_int32() { start_val.as_i32() as i64 } else { 0 };
+    let start = start.clamp(0, len) as usize;
+    let delete_count = if delete_count_val.is_int32() {
+        (delete_count_val.as_i32() as i64).clamp(0, len - start as i64) as usize
+    } else if delete_count_val.is_undefined() {
+        len as usize - start
+    } else {
+        0
+    };
+    let drained: Vec<TsVal> = arr.elements.drain(start..start + delete_count).collect();
+    for val in drained {
+        ts_arr_push(removed, val);
+        ts_release_val(val); // ts_arr_push retains; release our local ownership
+    }
+    removed
+}
+
+/// `arr.slice(start?, end?)` — returns a shallow copy of arr[start..end].
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_slice_range(arr_val: TsVal, start_val: TsVal, end_val: TsVal) -> TsVal {
+    let result = ts_arr_new(0);
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 {
+        return result;
+    }
+    let arr = &*(arr_val.as_ptr() as *const TsArray);
+    let len = arr.elements.len() as i64;
+    let start = if start_val.is_int32() { start_val.as_i32() as i64 } else if start_val.is_undefined() { 0 } else { 0 };
+    let end   = if end_val.is_int32()   { end_val.as_i32()   as i64 } else if end_val.is_undefined()   { len } else { len };
+    let start = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
+    let end   = if end < 0   { (len + end).max(0)   } else { end.min(len)   } as usize;
+    for i in start..end {
+        ts_arr_push(result, arr.elements[i]);
+    }
+    result
+}
+
+/// `arr.includes(val)` — returns true if val is in the array (strict equality).
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_includes(arr_val: TsVal, val: TsVal) -> TsVal {
+    use super::operators::ts_val_strict_eq;
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 {
+        return TsVal::from_bool(false);
+    }
+    let arr = &*(arr_val.as_ptr() as *const TsArray);
+    TsVal::from_bool(arr.elements.iter().any(|&e| ts_val_strict_eq(e, val) != 0))
+}
+
+/// `arr.lastIndexOf(val)` — returns the last index of val (-1 if not found).
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_last_index_of(arr_val: TsVal, val: TsVal) -> TsVal {
+    use super::operators::ts_val_strict_eq;
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 {
+        return TsVal::from_i32(-1);
+    }
+    let arr = &*(arr_val.as_ptr() as *const TsArray);
+    for i in (0..arr.elements.len()).rev() {
+        if ts_val_strict_eq(arr.elements[i], val) != 0 {
+            return TsVal::from_i32(i as i32);
+        }
+    }
+    TsVal::from_i32(-1)
+}
+
+/// `arr.copyWithin(target, start?, end?)` — copies elements within the array.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_copy_within(arr_val: TsVal, target_val: TsVal, start_val: TsVal, end_val: TsVal) -> TsVal {
+    if !arr_val.is_ptr() || heap_tag(arr_val) != 1 {
+        ts_retain_val(arr_val);
+        return arr_val;
+    }
+    let arr = &mut *(arr_val.as_ptr() as *mut TsArray);
+    let len = arr.elements.len() as i64;
+    let mut target = if target_val.is_int32() { target_val.as_i32() as i64 } else { 0 };
+    let mut start  = if start_val.is_int32()  { start_val.as_i32()  as i64 } else { 0 };
+    let mut end    = if end_val.is_int32()    { end_val.as_i32()    as i64 } else { len };
+    if target < 0 { target = (len + target).max(0); }
+    if start < 0  { start  = (len + start).max(0);  }
+    if end < 0    { end    = (len + end).max(0);    }
+    let target = target.min(len) as usize;
+    let start = start.min(len) as usize;
+    let end = end.min(len) as usize;
+    let count = (end - start).min(len as usize - target);
+    // Copy
+    let snapshot: Vec<TsVal> = arr.elements[start..start + count].to_vec();
+    for (i, &val) in snapshot.iter().enumerate() {
+        let old = arr.elements[target + i];
+        arr.elements[target + i] = val;
+        ts_retain_val(val);
+        ts_release_val(old);
+    }
+    ts_retain_val(arr_val);
+    arr_val
+}

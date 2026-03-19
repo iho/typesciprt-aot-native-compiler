@@ -1503,6 +1503,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Array HOFs
                 "map" | "filter" | "forEach" | "reduce" | "find" |
                 "findIndex" | "some" | "every" | "sort" | "flatMap" | "flat" |
+                // Array mutating methods
+                "reverse" | "fill" | "splice" | "copyWithin" | "lastIndexOf" |
                 // String methods
                 "replace" | "replaceAll" | "startsWith" | "endsWith" |
                 "padStart" | "padEnd" | "charAt" | "charCodeAt" | "repeat" | "at" |
@@ -1792,6 +1794,45 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         Some(block.append_operation(func::call(
                             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_concat"),
                             &[obj_i64, other], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "reverse" => {
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_reverse"),
+                            &[obj_i64], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "fill" => {
+                        let value      = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        let start      = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        let end        = arg_vals.get(2).copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_fill"),
+                            &[obj_i64, value, start, end], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "splice" => {
+                        let start        = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        let delete_count = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_splice"),
+                            &[obj_i64, start, delete_count], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "copyWithin" => {
+                        let target = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        let start  = arg_vals.get(1).copied().unwrap_or(undefined_i64);
+                        let end    = arg_vals.get(2).copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_copy_within"),
+                            &[obj_i64, target, start, end], &[i64t], self.loc,
+                        )).result(0)?.into())
+                    }
+                    "lastIndexOf" => {
+                        let val = arg_vals.first().copied().unwrap_or(undefined_i64);
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_last_index_of"),
+                            &[obj_i64, val], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "flat" => {

@@ -256,6 +256,8 @@ pub use object::{
 };
 pub use array::{
     ts_arr_new, ts_arr_get, ts_arr_set, ts_arr_len,
+    ts_arr_reverse, ts_arr_fill, ts_arr_splice, ts_arr_slice_range,
+    ts_arr_includes, ts_arr_last_index_of, ts_arr_copy_within,
     ts_arr_push, ts_arr_pop, ts_arr_unshift, ts_arr_shift, ts_arr_push_all, ts_arr_join,
     ts_arr_index_of, ts_arr_rest,
     ts_arr_map, ts_arr_filter, ts_arr_for_each, ts_arr_reduce,
