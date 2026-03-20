@@ -578,6 +578,33 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ));
         }
 
+        // Emit `this.field = param` for constructor parameters with accessibility modifiers
+        // (TypeScript shorthand: `constructor(private w: number, ...)` → `this.w = w`).
+        // These assignments happen after super() but before the rest of the constructor body.
+        if let Some(ctor) = constructor {
+            for (i, param) in ctor.value.params.items.iter().enumerate() {
+                if param.accessibility.is_none() { continue; }
+                if let BindingPattern::BindingIdentifier(id) = &param.pattern {
+                    let field_name = id.name.to_string();
+                    let param_val: Value<'_, '_> = entry.argument(i)?.into();
+                    let this_i64 = self.ensure_i64(scope["this"], current)?;
+                    let key_ptr = self.get_string_ptr(&field_name, current)?;
+                    current.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                        &[param_val], &[], self.loc,
+                    ));
+                    current.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                        &[this_i64, key_ptr, param_val], &[], self.loc,
+                    ));
+                    current.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[param_val], &[], self.loc,
+                    ));
+                }
+            }
+        }
+
         // Lower constructor body (skip the super() call we already processed).
         let saved_fn_return_type_cls = self.fn_return_type;
         self.fn_return_type = i64_type;

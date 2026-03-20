@@ -620,10 +620,30 @@ DUMP_MLIR=1 cargo run -p tscc -- input.ts   # dump to /tmp/debug.mlir
 
 ---
 
+## Benchmarks
+
+Compared against Node.js v22 on Apple M-series — Vendure-like REST API (`examples/vendure_bench.ts`), 50 concurrent connections, 10s runs with [`wrk`](https://github.com/wg/wrk):
+
+| Endpoint              | AOT (tscc) req/s | Node.js req/s | Ratio          |
+|-----------------------|-----------------|---------------|----------------|
+| `GET /health`         | 82,902          | 45,353        | **1.83× AOT**  |
+| `GET /api/products`   | 66,129          | 38,576        | **1.71× AOT**  |
+| `GET /api/products/1` | 79,014          | 42,801        | **1.85× AOT**  |
+| `GET /api/orders`     | 70,862          | 45,845        | **1.55× AOT**  |
+
+AOT native compilation is consistently 1.5–1.85× faster than Node.js across all endpoints.
+
+Run benchmarks yourself:
+```bash
+./benchmarks/bench.sh
+```
+
+---
+
 ## Testing
 
 ```bash
-# Run all 69 integration tests (requires LLVM)
+# Run all 75 integration tests (requires LLVM)
 cargo test -p tscc -- --include-ignored --test-threads=1
 
 # Run a single test

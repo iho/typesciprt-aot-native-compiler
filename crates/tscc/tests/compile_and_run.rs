@@ -804,6 +804,20 @@ fn generator_delegate() {
     );
 }
 
+/// Class getter/setter + private constructor parameter shorthand + virtual dispatch.
+/// Circle getter/setter: area1=79, area2=314. Rectangle (private w,h) virtual area() via describe().
+/// 79 + 314 + 1 = 394 → exit code 138 (= 394 mod 256).
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn class_getter_setter() {
+    let root = repo_root();
+    compile_and_check(
+        &root.join("examples/class_getter_setter.ts"),
+        &root.join("target/test-class-getter-setter"),
+        138,
+    );
+}
+
 /// Array and object destructuring assignment: swap + obj assign → exit 42
 #[test]
 #[ignore = "requires LLVM; run with --include-ignored"]

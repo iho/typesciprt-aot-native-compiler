@@ -242,7 +242,14 @@ fn resolve_npm_package(spec: &str, from_dir: &std::path::Path) -> Option<std::pa
 fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     // Bare specifiers (npm package names): look for shims, then node_modules.
     if !src.starts_with("./") && !src.starts_with("../") {
-        if src.starts_with("node:") { return None; }
+        if src.starts_with("node:") {
+            // Strip the "node:" prefix and look for a shim file
+            let bare = &src["node:".len()..];
+            if let Some(shim) = find_npm_shim(bare, base_dir) {
+                return Some(shim);
+            }
+            return None;
+        }
         // 1. Shim files take priority (allows overriding any package)
         if let Some(shim) = find_npm_shim(src, base_dir) {
             return Some(shim);
@@ -338,6 +345,23 @@ fn process_import_recursive<'c, 'm>(
     let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     for sub_path in collect_local_imports(&imported, base_dir) {
         process_import_recursive(lowerer, &sub_path, visited)?;
+    }
+
+    // Register import aliases for this file: `import { X as Y }` adds "Y" → "X".
+    for stmt in &imported.body {
+        if let Statement::ImportDeclaration(import) = stmt {
+            if let Some(specs) = &import.specifiers {
+                for spec in specs {
+                    if let ImportDeclarationSpecifier::ImportSpecifier(s) = spec {
+                        let alias = s.local.name.to_string();
+                        let original = s.imported.name().to_string();
+                        if alias != original {
+                            lowerer.module_global_aliases.insert(alias, original);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Register signatures and lower declarations for this file.
@@ -442,6 +466,7 @@ pub fn lower_program<'c>(
         super_ctor: None,
         builtin_aliases: HashMap::new(),
         module_global_names: std::collections::HashSet::new(),
+        module_global_aliases: HashMap::new(),
         builtin_wrappers_emitted: std::collections::HashSet::new(),
         lowered_classes: std::collections::HashSet::new(),
         emitted_functions: std::collections::HashSet::new(),
@@ -471,7 +496,7 @@ pub fn lower_program<'c>(
             // Skip `import type { ... }` — these are type-only and have no runtime effect.
             if import.import_kind == ImportOrExportKind::Type { continue; }
             let src = import.source.value.as_str();
-            if src.starts_with("./") || src.starts_with("../") {
+            let resolved_path = if src.starts_with("./") || src.starts_with("../") {
                 // Resolve .ts extension
                 let mut path = base_dir.join(src);
                 if path.extension().is_none() {
@@ -481,6 +506,12 @@ pub fn lower_program<'c>(
                     let ts_path = path.with_extension("ts");
                     if ts_path.exists() { path = ts_path; }
                 }
+                Some(path)
+            } else {
+                // Bare specifier or node: prefix — try shim resolution
+                resolve_local_import(src, base_dir)
+            };
+            if let Some(path) = resolved_path {
                 // Collect imported names
                 let names: Vec<String> = if let Some(specs) = &import.specifiers {
                     specs.iter().filter_map(|spec| {
@@ -499,7 +530,7 @@ pub fn lower_program<'c>(
                 };
                 local_imports.push((path, names));
             }
-            // External imports (node:, npm packages) are silently skipped.
+            // Unresolved external imports (npm packages without shims) are silently skipped.
         }
     }
 
@@ -507,6 +538,23 @@ pub fn lower_program<'c>(
     let mut visited: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     for (import_path, _names) in &local_imports {
         process_import_recursive(&mut lowerer, import_path, &mut visited)?;
+    }
+
+    // Register import aliases for the main program.
+    for stmt in &program.body {
+        if let Statement::ImportDeclaration(import) = stmt {
+            if let Some(specs) = &import.specifiers {
+                for spec in specs {
+                    if let ImportDeclarationSpecifier::ImportSpecifier(s) = spec {
+                        let alias = s.local.name.to_string();
+                        let original = s.imported.name().to_string();
+                        if alias != original {
+                            lowerer.module_global_aliases.insert(alias, original);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Pass 1 – collect function signatures and class definitions.
@@ -594,6 +642,10 @@ struct Lowerer<'c, 'm> {
     /// These are initialized in `main` via `ts_set_module_global` and retrieved
     /// via `ts_get_module_global` at the start of every module-level function.
     module_global_names: std::collections::HashSet<String>,
+    /// Maps import alias → original export name for cross-module aliased imports.
+    /// E.g. `import { MODULE_METADATA as metadataConstants }` adds "metadataConstants" → "MODULE_METADATA".
+    /// Used during Identifier resolution so aliased imports resolve to the correct module global.
+    module_global_aliases: HashMap<String, String>,
     /// Tracks which built-in wrapper MLIR functions have already been emitted.
     builtin_wrappers_emitted: std::collections::HashSet<String>,
     /// Tracks which classes have already been lowered (to prevent re-emission from duplicate imports).
@@ -981,7 +1033,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, "private").into(),
         )];
 
-        let add_func = |name: &str, params: &[Type<'c>], results: &[Type<'c>]| {
+        let mut declared_names: Vec<String> = Vec::new();
+        let mut add_func = |name: &str, params: &[Type<'c>], results: &[Type<'c>]| {
             let op = func::func(
                 self.ctx,
                 StringAttribute::new(self.ctx, name),
@@ -991,6 +1044,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.loc,
             );
             self.module.body().append_operation(op);
+            declared_names.push(name.to_string());
         };
 
         add_func("__ts_console_log_i32", &[i32_type], &[]);
@@ -1394,6 +1448,80 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Symbol well-known values + iterables
         add_func("ts_symbol_iterator",            &[], &[i64_type]);
         add_func("ts_normalize_iterable",         &[i64_type], &[i64_type]);
+
+        // Node.js path module
+        add_func("ts_path_join",                  &[i64_type], &[i64_type]);
+        add_func("ts_path_resolve",               &[i64_type], &[i64_type]);
+        add_func("ts_path_dirname",               &[i64_type], &[i64_type]);
+        add_func("ts_path_basename",              &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_path_extname",               &[i64_type], &[i64_type]);
+        add_func("ts_path_normalize",             &[i64_type], &[i64_type]);
+        add_func("ts_path_is_absolute",           &[i64_type], &[i64_type]);
+        add_func("ts_path_relative",              &[i64_type, i64_type], &[i64_type]);
+
+        // Node.js os module
+        add_func("ts_os_platform",                &[], &[i64_type]);
+        add_func("ts_os_homedir",                 &[], &[i64_type]);
+        add_func("ts_os_tmpdir",                  &[], &[i64_type]);
+        add_func("ts_os_hostname",                &[], &[i64_type]);
+        add_func("ts_os_eol",                     &[], &[i64_type]);
+        add_func("ts_os_arch",                    &[], &[i64_type]);
+        add_func("ts_os_cpus",                    &[], &[i64_type]);
+
+        // Node.js fs module
+        add_func("ts_fs_read_file_sync",          &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fs_write_file_sync",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fs_exists_sync",             &[i64_type], &[i64_type]);
+        add_func("ts_fs_mkdir_sync",              &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fs_readdir_sync",            &[i64_type], &[i64_type]);
+        add_func("ts_fs_stat_sync",               &[i64_type], &[i64_type]);
+        add_func("ts_fs_unlink_sync",             &[i64_type], &[i64_type]);
+        add_func("ts_fs_rename_sync",             &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fs_copy_file_sync",          &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fs_rm_sync",                 &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fs_read_file_async",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_fs_write_file_async",        &[i64_type, i64_type], &[i64_type]);
+
+        // Node.js crypto module
+        add_func("ts_crypto_random_uuid",         &[], &[i64_type]);
+        add_func("ts_crypto_random_bytes_hex",    &[i64_type], &[i64_type]);
+        add_func("ts_crypto_hash_sync",           &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_crypto_hmac_sync",           &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+
+        // Node.js events module (EventEmitter)
+        add_func("ts_event_emitter_new",          &[], &[i64_type]);
+        add_func("ts_event_emitter_on",           &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_event_emitter_once",         &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_event_emitter_off",          &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_event_emitter_emit",         &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_event_emitter_remove_all_listeners", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_event_emitter_listeners",    &[i64_type, i64_type], &[i64_type]);
+
+        // Node.js buffer module
+        add_func("ts_buffer_from_string",         &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_buffer_from_array",          &[i64_type], &[i64_type]);
+        add_func("ts_buffer_alloc",               &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_buffer_alloc_unsafe",        &[i64_type], &[i64_type]);
+        add_func("ts_buffer_concat",              &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_buffer_to_string",           &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_buffer_length",              &[i64_type], &[i64_type]);
+        add_func("ts_buffer_slice",               &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_buffer_get_byte",            &[i64_type, i64_type], &[i64_type]);
+
+        // Node.js process extensions
+        add_func("ts_process_cwd",                &[], &[i64_type]);
+        add_func("ts_process_platform",           &[], &[i64_type]);
+        add_func("ts_process_version",            &[], &[i64_type]);
+        add_func("ts_process_versions",           &[], &[i64_type]);
+        add_func("ts_process_hrtime",             &[], &[i64_type]);
+        add_func("ts_process_uptime",             &[], &[i64_type]);
+
+        // Mark all runtime-declared functions as emitted so that `declare function`
+        // in shim files doesn't try to re-declare them (which causes MLIR symbol redefinition).
+        drop(add_func);
+        for name in declared_names {
+            self.emitted_functions.insert(name);
+        }
     }
 
     /// Returns true if `class` is `target` or transitively inherits from `target`.
@@ -1416,6 +1544,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             match stmt {
                 Statement::FunctionDeclaration(func) => {
                     let Some(id) = &func.id else { continue };
+                    // `declare function` with no body: register as extern FFI with the declared arity.
+                    if func.declare && func.body.is_none() {
+                        let name = id.name.to_string();
+                        if !self.funcs.contains_key(&name) {
+                            let n = func.params.items.len();
+                            self.funcs.insert(name, FuncSig {
+                                param_types: vec![i64_type; n],
+                                return_type: Some(i64_type),
+                                has_rest: false,
+                                has_this_param: false,
+                            });
+                        }
+                        continue;
+                    }
                     // Skip TypeScript overload signatures (declarations without a body) — they would
                     // shadow the actual implementation's signature with a wrong arity.
                     if func.body.is_none() { continue; }
@@ -1729,6 +1871,39 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     pub fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {
         let Some(id) = &func.id else { return Ok(()) };
+        // `declare function foo(...)` — emit an external function declaration (no body).
+        // This enables FFI: users can link native C/Rust libraries and call them from TypeScript.
+        // All parameters and the return value are i64 (TsVal / NaN-boxed).
+        if func.declare && func.body.is_none() {
+            let name = id.name.to_string();
+            if !self.emitted_functions.insert(name.clone()) {
+                return Ok(());
+            }
+            let i64_type = self.i64_type();
+            let n_params = func.params.items.len();
+            let func_type = FunctionType::new(self.ctx, &vec![i64_type; n_params], &[i64_type]);
+            let private = &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )];
+            let op = func::func(
+                self.ctx,
+                StringAttribute::new(self.ctx, &name),
+                TypeAttribute::new(func_type.into()),
+                Region::new(),
+                private,
+                self.loc,
+            );
+            self.module.body().append_operation(op);
+            // Register as a known function signature so call sites can find it.
+            self.funcs.entry(name).or_insert_with(|| FuncSig {
+                param_types: vec![i64_type; n_params],
+                return_type: Some(i64_type),
+                has_rest: false,
+                has_this_param: false,
+            });
+            return Ok(());
+        }
         // Skip TypeScript overload signatures (declarations without a body).
         if func.body.is_none() { return Ok(()); }
         let name = id.name.to_string();
@@ -2153,12 +2328,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let region = Region::new();
         let entry = region.append_block(Block::new(&param_specs));
 
+        // Track names of borrowed param refs (simple identifiers and rest) so we can
+        // skip releasing them in the end-of-function scope cleanup — callers own them.
+        let mut borrowed_param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
         for (i, param) in params.iter().enumerate() {
             let arg_val: Value<'_, '_> = entry.argument(i)?.into();
             match &param.pattern {
                 BindingPattern::BindingIdentifier(id) => {
-                    scope.insert(id.name.to_string(), arg_val);
+                    let name = id.name.to_string();
+                    borrowed_param_names.insert(name.clone());
+                    scope.insert(name, arg_val);
                 }
                 BindingPattern::ArrayPattern(arr_pat) => {
                     let arg_i64 = self.ensure_i64(arg_val, entry)?;
@@ -2196,7 +2377,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
         if let Some(rest_name) = rest_param_name {
             let rest_idx = params.len();
-            scope.insert(rest_name.to_string(), entry.argument(rest_idx)?.into());
+            let rest_str = rest_name.to_string();
+            borrowed_param_names.insert(rest_str.clone());
+            scope.insert(rest_str, entry.argument(rest_idx)?.into());
         }
 
         let mut current_block = entry;
@@ -2249,6 +2432,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let is_async = is_async_override.unwrap_or(false);
         let saved_fn_return_type = self.fn_return_type;
         let saved_is_async = self.is_async;
+        let saved_fn_params = std::mem::replace(&mut self.current_fn_params, borrowed_param_names.clone());
         self.fn_return_type = return_type;
         self.is_async = is_async;
         if let Some(body) = body {
@@ -2271,8 +2455,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
         self.is_async = saved_is_async;
+        self.current_fn_params = saved_fn_params;
 
-        for (_, v) in &scope {
+        for (name, v) in &scope {
+            // Skip borrowed parameter refs — the caller owns them.
+            if borrowed_param_names.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),

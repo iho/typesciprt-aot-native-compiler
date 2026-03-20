@@ -59,9 +59,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Expression::Identifier(obj_id) = &member.object {
                     if obj_id.name == "process" {
                         let rt_name = match member.property.name.as_str() {
-                            "argv"   => Some("ts_process_argv"),
-                            "env"    => Some("ts_process_env"),
-                            "pid"    => Some("ts_process_pid"),
+                            "argv"     => Some("ts_process_argv"),
+                            "env"      => Some("ts_process_env"),
+                            "pid"      => Some("ts_process_pid"),
+                            "platform" => Some("ts_process_platform"),
+                            "version"  => Some("ts_process_version"),
+                            "versions" => Some("ts_process_versions"),
                             // process.stderr / process.stdout — return UNDEFINED;
                             // write() on these objects will be handled by the callee dispatch.
                             "stderr" | "stdout" => None,
@@ -354,8 +357,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                     None => {
                         // Check if this is a module-level global (not a function, not a builtin).
-                        if self.module_global_names.contains(&name) {
-                            let key_ptr = self.get_string_ptr(&name, block)?;
+                        // Also resolve import aliases (e.g. `import { X as Y }` → look up "X").
+                        let global_lookup = if self.module_global_names.contains(&name) {
+                            Some(name.clone())
+                        } else if let Some(original) = self.module_global_aliases.get(&name).cloned() {
+                            if self.module_global_names.contains(&original) { Some(original) } else { None }
+                        } else {
+                            None
+                        };
+                        if let Some(global_name) = global_lookup {
+                            let key_ptr = self.get_string_ptr(&global_name, block)?;
                             let val: Value<'c, 'b> = block.append_operation(func::call(
                                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
                                 &[key_ptr], &[self.i64_type()], self.loc,
@@ -1038,6 +1049,25 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     &[code_val], &[], self.loc,
                 ));
                 return Ok((None, block));
+            }
+        }
+
+        // Built-in: process.cwd() / process.hrtime() / process.uptime()
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            if matches!(&member.object, Expression::Identifier(id) if id.name == "process") {
+                let rt_name = match member.property.name.as_str() {
+                    "cwd"    => Some("ts_process_cwd"),
+                    "hrtime" => Some("ts_process_hrtime"),
+                    "uptime" => Some("ts_process_uptime"),
+                    _ => None,
+                };
+                if let Some(rt) = rt_name {
+                    let val: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, rt),
+                        &[], &[self.i64_type()], self.loc,
+                    )).result(0)?.into();
+                    return Ok((Some(val), block));
+                }
             }
         }
 

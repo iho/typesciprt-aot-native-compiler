@@ -403,6 +403,8 @@ pub unsafe extern "C" fn ts_release_val(val: TsVal) {
             13 => Some(weak::ts_weakset_destructor as unsafe extern "C" fn(*mut u8)),
             14 => Some(date::ts_date_destructor as unsafe extern "C" fn(*mut u8)),
             15 => Some(weakref::ts_weakref_destructor as unsafe extern "C" fn(*mut u8)),
+            16 => Some(crate::node::events::ts_event_emitter_destructor as unsafe extern "C" fn(*mut u8)),
+            17 => Some(crate::node::buffer::ts_buffer_destructor as unsafe extern "C" fn(*mut u8)),
             _ => None,
         };
 

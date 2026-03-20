@@ -82,8 +82,14 @@ pub fn build_runtime() -> Result<PathBuf> {
         .and_then(|p| p.parent())
         .context("cannot determine workspace root from executable path")?;
 
+    // Detect whether we're running from a release build by checking the target dir name.
+    let is_release = target_dir.file_name().map_or(false, |n| n == "release");
+
     // Allow extra features (e.g. "dhat-heap") via TSCC_RUNTIME_FEATURES env var.
     let mut args = vec!["build", "-p", "ts-runtime"];
+    if is_release {
+        args.push("--release");
+    }
     let extra_features = std::env::var("TSCC_RUNTIME_FEATURES").unwrap_or_default();
     if !extra_features.is_empty() {
         args.extend(["--features", extra_features.as_str()]);

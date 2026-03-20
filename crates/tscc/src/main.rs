@@ -51,6 +51,11 @@ struct Cli {
     /// Enable verbose logging.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Extra native libraries to link (e.g. --link-lib /path/to/libmydb.a).
+    /// Use this to link C/Rust FFI libraries called via `declare function`.
+    #[arg(long = "link-lib", value_name = "PATH")]
+    link_libs: Vec<PathBuf>,
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -136,7 +141,10 @@ fn main() -> Result<()> {
     // ── 7. Link → native binary ───────────────────────────────────────────
 
     info!("linking → {}", bin_path.display());
-    emit::link_binary(&[&obj_path, &runtime_obj], &bin_path)
+    let mut link_inputs: Vec<&std::path::Path> = vec![&obj_path, &runtime_obj];
+    let extra_libs: Vec<&std::path::Path> = cli.link_libs.iter().map(|p| p.as_path()).collect();
+    link_inputs.extend_from_slice(&extra_libs);
+    emit::link_binary(&link_inputs, &bin_path)
         .context("linking failed")?;
 
     println!("✓  compiled to {}", bin_path.display());

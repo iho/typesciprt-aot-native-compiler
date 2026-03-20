@@ -149,8 +149,6 @@ URLS_NODE=(
   "http://$HOST:$NODE_PORT/api/orders"
 )
 
-declare -A AOT_RPS NODE_RPS
-
 for i in "${!ENDPOINTS[@]}"; do
   endpoint="${ENDPOINTS[$i]}"
   info "Benchmarking: $endpoint"
@@ -163,16 +161,14 @@ for i in "${!ENDPOINTS[@]}"; do
   node_rps=$(echo "$node_out" | extract_rps)
   node_lat=$(echo "$node_out" | extract_latency)
 
-  AOT_RPS[$i]=$aot_rps
-  NODE_RPS[$i]=$node_rps
-
   ratio=$(awk "BEGIN {printf \"%.2f\", $aot_rps / $node_rps}" 2>/dev/null || echo "?")
 
   echo ""
   echo -e "  ${BOLD}$endpoint${RESET}"
   printf "  %-20s  %12s req/s  %10s avg latency\n" "AOT (tscc):" "$aot_rps" "$aot_lat"
   printf "  %-20s  %12s req/s  %10s avg latency\n" "Node.js:" "$node_rps" "$node_lat"
-  if (( $(echo "$aot_rps > $node_rps" | awk '{print ($1 > $2)}' 2>/dev/null || echo 0) )); then
+  cmp=$(awk "BEGIN {print ($aot_rps > $node_rps) ? 1 : 0}" 2>/dev/null || echo 0)
+  if [[ "$cmp" == "1" ]]; then
     echo -e "  ${GREEN}AOT is ${ratio}x faster${RESET}"
   else
     inv=$(awk "BEGIN {printf \"%.2f\", $node_rps / $aot_rps}" 2>/dev/null || echo "?")

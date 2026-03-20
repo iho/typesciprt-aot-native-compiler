@@ -33,15 +33,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         ));
 
         // Call module init functions for imported files (initialize imported const values).
-        for (init_idx, init_fn_name) in self.module_init_fns.clone().iter().enumerate() {
-            let idx_val = current_block.append_operation(arith::constant(
-                self.ctx, IntegerAttribute::new(self.i32_type(), init_idx as i64).into(), self.loc,
-            )).result(0)?.into();
-            current_block.append_operation(func::call(
-                self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "__ts_console_log_i32"),
-                &[idx_val], &[], self.loc,
-            ));
+        for init_fn_name in self.module_init_fns.clone().iter() {
             current_block.append_operation(func::call(
                 self.ctx,
                 FlatSymbolRefAttribute::new(self.ctx, init_fn_name),
@@ -2181,6 +2173,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
         let mut current_block = entry;
 
+        // Build import alias map: local_alias → original_export_name.
+        // For `import { MODULE_METADATA as metadataConstants }`, maps "metadataConstants" → "MODULE_METADATA".
+        let mut import_aliases: HashMap<String, String> = HashMap::new();
+        for stmt in &program.body {
+            use oxc_ast::ast::{ImportDeclarationSpecifier, Statement as Stmt};
+            if let Stmt::ImportDeclaration(import) = stmt {
+                if let Some(specs) = &import.specifiers {
+                    for spec in specs {
+                        if let ImportDeclarationSpecifier::ImportSpecifier(s) = spec {
+                            let local = s.local.name.to_string();
+                            let imported = s.imported.name().to_string();
+                            if local != imported {
+                                import_aliases.insert(local, imported);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Inject all currently known module globals so init code can reference them.
         let i64_type = self.i64_type();
         for global_name in self.module_global_names.clone() {
@@ -2192,6 +2204,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 )).result(0)?.into();
                 scope.insert(global_name, val);
             }
+        }
+
+        // Inject import aliases as additional scope entries pointing to the same SSA value.
+        // No extra retain is needed since these are just SSA aliases of the already-retained globals.
+        let alias_entries: Vec<(String, Value<'_, '_>)> = import_aliases.iter()
+            .filter_map(|(alias, original)| {
+                scope.get(original).copied().map(|v| (alias.clone(), v))
+            })
+            .collect();
+        for (alias, val) in alias_entries {
+            scope.entry(alias).or_insert(val);
         }
 
         for stmt in &program.body {

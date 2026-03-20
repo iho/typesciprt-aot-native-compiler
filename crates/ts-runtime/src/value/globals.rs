@@ -20,8 +20,8 @@ pub unsafe extern "C" fn ts_set_module_global(name_ptr: *const i8, val: TsVal) {
         let ptr = val.as_ptr();
         let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
         let header = ptr.sub(header_size) as *const crate::alloc::ArcHeader;
-        let rc = (*header).ref_count.load(std::sync::atomic::Ordering::SeqCst);
-        if rc == 0 || rc == 0xDEAD_BEEF_DEAD_BEEFu64 || rc > 0x100_0000 {
+        let rc = (*header).ref_count.load(std::sync::atomic::Ordering::Relaxed);
+        if rc == 0 || rc == 0xDEAD_BEEFu32 || rc > 0x100_0000 {
             eprintln!("ts_set_module_global: storing freed/corrupted value for key '{}' ptr={:p} rc={:#x}", name, ptr, rc);
             std::process::abort();
         }

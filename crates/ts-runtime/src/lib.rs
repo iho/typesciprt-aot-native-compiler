@@ -33,6 +33,7 @@ pub mod console;
 pub mod exceptions;
 pub mod string;
 pub mod value;
+pub mod node;
 
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
