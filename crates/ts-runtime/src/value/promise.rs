@@ -210,7 +210,6 @@ pub unsafe extern "C" fn ts_promise_all(arr: TsVal) -> TsVal {
         let resolved = ts_promise_await(item);
         results.push(resolved);
     }
-    ts_release_val(arr);
     let out = ts_arr_new(0);
     for v in results {
         ts_arr_push(out, v);
@@ -250,7 +249,6 @@ pub unsafe extern "C" fn ts_promise_all_settled(arr: TsVal) -> TsVal {
         ts_arr_push(out, obj);
         ts_release_val(obj);
     }
-    ts_release_val(arr);
     out
 }
 
@@ -262,9 +260,7 @@ pub unsafe extern "C" fn ts_promise_any(arr: TsVal) -> TsVal {
     } else { 0 };
     if len == 0 { return ts_promise_resolve(UNDEFINED); }
     let item = ts_arr_get(arr, 0);
-    let val = ts_promise_await(item);
-    ts_release_val(arr);
-    val
+    ts_promise_await(item)
 }
 
 // ── Async spawn (spawn_blocking + function pointer) ───────────────────────────

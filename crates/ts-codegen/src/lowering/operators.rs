@@ -1865,19 +1865,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_get_key"),
                 &[obj_i64, idx_i64], &[self.i64_type()], self.loc,
             )).result(0)?.into();
-            let lhs_i32 = self.ensure_i32(cur, block)?;
-            let rhs_i32 = self.ensure_i32(rhs, block)?;
-            let res_i32: Value<'c, 'b> = match operator {
-                AssignmentOperator::Addition       => block.append_operation(arith::addi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                AssignmentOperator::Subtraction    => block.append_operation(arith::subi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                AssignmentOperator::Multiplication => block.append_operation(arith::muli(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                AssignmentOperator::Division       => block.append_operation(arith::divsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                AssignmentOperator::Remainder      => block.append_operation(arith::remsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                _ => bail!("unsupported compound assignment operator on computed member"),
+            let lhs_i64 = self.ensure_i64(cur, block)?;
+            let rhs_i64 = self.ensure_i64(rhs, block)?;
+            let fn_name = match operator {
+                AssignmentOperator::Addition       => "ts_add",
+                AssignmentOperator::Subtraction    => "ts_sub",
+                AssignmentOperator::Multiplication => "ts_mul",
+                AssignmentOperator::Division       => "ts_div",
+                AssignmentOperator::Remainder      => "ts_mod",
+                AssignmentOperator::Exponential    => "ts_pow",
+                AssignmentOperator::BitwiseOR      => "ts_bitor",
+                AssignmentOperator::BitwiseAnd     => "ts_bitand",
+                AssignmentOperator::BitwiseXOR     => "ts_bitxor",
+                AssignmentOperator::ShiftLeft      => "ts_shl",
+                AssignmentOperator::ShiftRight     => "ts_shr",
+                AssignmentOperator::ShiftRightZeroFill => "ts_ushr",
+                op => bail!("unsupported compound assignment operator on computed member: {:?}", op),
             };
-            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[cur], &[], self.loc));
-            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[self.ensure_i64(rhs, block)?], &[], self.loc));
-            self.ensure_i64(res_i32, block)?
+            let res: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, fn_name),
+                &[lhs_i64, rhs_i64], &[self.i64_type()], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+            res
         };
 
         // Use ts_obj_set_val_key for dynamic key access (works for both string and integer keys).
@@ -1934,7 +1945,23 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 AssignmentOperator::ShiftLeft      => block.append_operation(arith::shli(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
                 AssignmentOperator::ShiftRight     => block.append_operation(arith::shrsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
                 AssignmentOperator::ShiftRightZeroFill => block.append_operation(arith::shrui(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
-                _ => bail!("unsupported compound assignment operator on private field"),
+                AssignmentOperator::Exponential => {
+                    let lhs_i64_2 = self.ensure_i64(cur, block)?;
+                    let rhs_i64_2 = self.ensure_i64(rhs, block)?;
+                    let res: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_pow"),
+                        &[lhs_i64_2, rhs_i64_2], &[self.i64_type()], self.loc,
+                    )).result(0)?.into();
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64_2], &[], self.loc));
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64_2], &[], self.loc));
+                    // Return early since res is already i64
+                    return {
+                        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"), &[obj_i64, key_ptr, res], &[], self.loc));
+                        block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                        Ok((Some(res), block))
+                    };
+                }
+                op => bail!("unsupported compound assignment operator on private field: {:?}", op),
             };
             block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[cur], &[], self.loc));
             block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[self.ensure_i64(rhs, block)?], &[], self.loc));
