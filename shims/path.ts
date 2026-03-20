@@ -19,5 +19,22 @@ export function relative(from: string, to: string): string { return ts_path_rela
 export const sep = "/";
 export const delimiter = ":";
 
-const path = { join, resolve, dirname, basename, extname, normalize, isAbsolute, relative, sep, delimiter };
+export function parse(p: string): { root: string; dir: string; base: string; ext: string; name: string } {
+  const root = p.startsWith('/') ? '/' : '';
+  const dir = ts_path_dirname(p);
+  const base = ts_path_basename(p, '');
+  const ext = ts_path_extname(p);
+  const name = ext ? base.substring(0, base.length - ext.length) : base;
+  return { root, dir, base, ext, name };
+}
+
+export function format(obj: { root?: string; dir?: string; base?: string; ext?: string; name?: string }): string {
+  if (obj.base) {
+    return obj.dir ? ts_path_join([obj.dir, obj.base] as any) : obj.base;
+  }
+  const base = (obj.name || '') + (obj.ext || '');
+  return obj.dir ? ts_path_join([obj.dir, base] as any) : base;
+}
+
+const path = { join, resolve, dirname, basename, extname, normalize, isAbsolute, relative, sep, delimiter, parse, format };
 export default path;

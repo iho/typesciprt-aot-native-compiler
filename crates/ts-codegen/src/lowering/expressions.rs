@@ -411,7 +411,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             return Ok((Some(fn_val), block));
                         }
                         // Check if this is a top-level function referenced as a first-class value.
-                        if self.funcs.contains_key(&name) {
+                        // Also resolve import aliases (e.g. `import { parse as pathParse }` → "parse").
+                        let func_key = if self.funcs.contains_key(&name) {
+                            name.clone()
+                        } else if let Some(alias_target) = self.module_global_aliases.get(&name) {
+                            if self.funcs.contains_key(alias_target.as_str()) { alias_target.clone() } else { name.clone() }
+                        } else { name.clone() };
+                        if self.funcs.contains_key(&func_key) {
+                            let name = func_key;
                             let i64t = self.i64_type();
                             let i32t = self.i32_type();
                             let sig = self.funcs[&name].clone();
@@ -1091,6 +1098,42 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
+        // Built-in: performance.now() / performance.mark(name) / performance.measure(name, start)
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            if matches!(&member.object, Expression::Identifier(id) if id.name == "performance") {
+                match member.property.name.as_str() {
+                    "now" => {
+                        let val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_performance_now"),
+                            &[], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        return Ok((Some(val), block));
+                    }
+                    "mark" => {
+                        let i64t = self.i64_type();
+                        let undef: Value<'c, '_> = block.append_operation(arith::constant(
+                            self.ctx,
+                            IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                            self.loc,
+                        )).result(0).unwrap().into();
+                        let name_arg = if let Some(arg) = call.arguments.first() {
+                            if let Some(expr) = arg.as_expression() {
+                                let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                                block = nb;
+                                v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef)
+                            } else { undef }
+                        } else { undef };
+                        let val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_performance_mark"),
+                            &[name_arg], &[i64t], self.loc,
+                        )).result(0)?.into();
+                        return Ok((Some(val), block));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Built-in: addEventListener(event, handler) — registers a global fetch handler
         if let Expression::Identifier(callee_id) = &call.callee {
             if callee_id.name == "addEventListener" {
@@ -1549,8 +1592,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // User-defined function call
         if let Expression::Identifier(callee_id) = &call.callee {
             let raw_name = callee_id.name.to_string();
-            // Resolve alias: `const foo = bar` — use the canonical name for the MLIR call.
-            let name = if let Some(canon) = self.builtin_aliases.get(&raw_name) {
+            // Resolve alias: `const foo = bar` or `import { parse as pathParse }` — use the canonical name for the MLIR call.
+            let name = if let Some(canon) = self.builtin_aliases.get(&raw_name).or_else(|| self.module_global_aliases.get(&raw_name)) {
                 if self.funcs.contains_key(canon.as_str()) { canon.clone() } else { raw_name }
             } else { raw_name };
             if let Some(sig) = self.funcs.get(&name).cloned() {

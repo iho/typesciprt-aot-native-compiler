@@ -421,20 +421,57 @@ fn process_import_recursive<'c, 'm>(
             _ => {}
         }
     }
+    // Derive a module name from the file path (e.g. "shims/path.ts" → "path") for
+    // module-scoped naming when exported function names collide across shim modules.
+    let module_name: String = path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Helper: lower a function from this module, using a prefixed name if the bare name
+    // is already claimed by a previously loaded module. Record the mapping in module_exports.
+    macro_rules! lower_with_module_tracking {
+        ($func:expr) => {{
+            let func = $func;
+            if let Some(id) = &func.id {
+                let orig_name = id.name.to_string();
+                if !func.declare && func.body.is_some() {
+                    let actual_name = if lowerer.emitted_functions.contains(&orig_name) {
+                        // Name already claimed — use a module-prefixed variant.
+                        format!("__shim_{}_{}", module_name, orig_name)
+                    } else {
+                        orig_name.clone()
+                    };
+                    if actual_name != orig_name {
+                        lowerer.lower_function_declaration_as(func, &actual_name)?;
+                    } else {
+                        lowerer.lower_function_declaration(func)?;
+                    }
+                    lowerer.module_exports
+                        .entry(module_name.clone())
+                        .or_insert_with(HashMap::new)
+                        .insert(orig_name, actual_name);
+                } else {
+                    lowerer.lower_function_declaration(func)?;
+                }
+            }
+        }};
+    }
+
     for stmt in &imported.body {
         match stmt {
             Statement::FunctionDeclaration(func) => {
-                lowerer.lower_function_declaration(func)?;
+                lower_with_module_tracking!(func);
             }
             Statement::ExportNamedDeclaration(exp) => {
                 if let Some(Declaration::FunctionDeclaration(func)) = &exp.declaration {
-                    lowerer.lower_function_declaration(func)?;
+                    lower_with_module_tracking!(func);
                 }
             }
             Statement::ExportDefaultDeclaration(exp) => {
                 use oxc_ast::ast::ExportDefaultDeclarationKind;
                 if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &exp.declaration {
-                    lowerer.lower_function_declaration(func)?;
+                    lower_with_module_tracking!(func);
                 }
             }
             _ => {}
@@ -479,6 +516,7 @@ pub fn lower_program<'c>(
         builtin_aliases: HashMap::new(),
         module_global_names: std::collections::HashSet::new(),
         module_global_aliases: HashMap::new(),
+        module_exports: HashMap::new(),
         builtin_wrappers_emitted: std::collections::HashSet::new(),
         lowered_classes: std::collections::HashSet::new(),
         emitted_functions: std::collections::HashSet::new(),
@@ -561,13 +599,30 @@ pub fn lower_program<'c>(
         if let Statement::ImportDeclaration(import) = stmt {
             if let Some(specs) = &import.specifiers {
                 let src = import.source.value.as_str();
+                // Derive module name from source (e.g. "node:path" → "path", "./foo/bar" → "bar").
+                let src_module_name: String = if src.starts_with("node:") {
+                    src["node:".len()..].to_string()
+                } else {
+                    src.rsplit('/').next().unwrap_or(src)
+                        .trim_end_matches(".ts").to_string()
+                };
                 for spec in specs {
                     match spec {
                         ImportDeclarationSpecifier::ImportSpecifier(s) => {
                             let alias = s.local.name.to_string();
                             let original = s.imported.name().to_string();
-                            if alias != original {
-                                lowerer.module_global_aliases.insert(alias, original);
+                            // Resolve to the actual MLIR function name via module_exports.
+                            // This handles the case where two modules export functions with the
+                            // same name (e.g. util::format and path::format).
+                            let actual_name = lowerer.module_exports
+                                .get(&src_module_name)
+                                .and_then(|m| m.get(&original))
+                                .cloned()
+                                .unwrap_or_else(|| original.clone());
+                            // Always register the alias (even if alias == original) when
+                            // the actual MLIR name differs from the export name.
+                            if alias != actual_name || original != actual_name {
+                                lowerer.module_global_aliases.insert(alias, actual_name);
                             }
                         }
                         ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
@@ -703,6 +758,10 @@ struct Lowerer<'c, 'm> {
     /// E.g. `import { MODULE_METADATA as metadataConstants }` adds "metadataConstants" → "MODULE_METADATA".
     /// Used during Identifier resolution so aliased imports resolve to the correct module global.
     module_global_aliases: HashMap<String, String>,
+    /// Per-module export tables: module_name → { exported_name → actual_mlir_name }.
+    /// Tracks the actual MLIR function name used for each export (may differ from the export name
+    /// when there's a naming collision between modules, e.g. util::format vs path::format).
+    module_exports: HashMap<String, HashMap<String, String>>,
     /// Tracks which built-in wrapper MLIR functions have already been emitted.
     builtin_wrappers_emitted: std::collections::HashSet<String>,
     /// Tracks which classes have already been lowered (to prevent re-emission from duplicate imports).
@@ -1585,8 +1644,24 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_process_hrtime",             &[], &[i64_type]);
         add_func("ts_process_uptime",             &[], &[i64_type]);
 
+        // performance built-in
+        add_func("ts_performance_now",            &[], &[i64_type]);
+        add_func("ts_performance_mark",           &[i64_type], &[i64_type]);
+        add_func("ts_performance_measure",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_performance_get_entries_by_name", &[i64_type], &[i64_type]);
+
+        // Node.js dns module
+        add_func("ts_dns_lookup",                 &[i64_type], &[i64_type]);
+        add_func("ts_dns_resolve",                &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_dns_lookup_async",           &[i64_type], &[i64_type]);
+        add_func("ts_dns_resolve_async",          &[i64_type, i64_type], &[i64_type]);
+
         // Node.js http module
         add_func("ts_http_server_listen",         &[i64_type, i64_type], &[i64_type]);
+
+        // Node.js net module
+        add_func("ts_net_server_listen",          &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_net_connect",                &[i64_type, i64_type, i64_type], &[i64_type]);
 
         // Node.js url module
         add_func("ts_url_parse",                  &[i64_type, i64_type], &[i64_type]);
@@ -1985,7 +2060,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     // ── Function declarations ─────────────────────────────────────────────
 
+    pub fn lower_function_declaration_as(&mut self, func: &Function<'_>, emit_name: &str) -> Result<()> {
+        self.lower_function_declaration_impl(func, Some(emit_name))
+    }
+
     pub fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {
+        self.lower_function_declaration_impl(func, None)
+    }
+
+    fn lower_function_declaration_impl(&mut self, func: &Function<'_>, name_override: Option<&str>) -> Result<()> {
         let Some(id) = &func.id else { return Ok(()) };
         // `declare function foo(...)` — emit an external function declaration (no body).
         // This enables FFI: users can link native C/Rust libraries and call them from TypeScript.
@@ -2022,7 +2105,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
         // Skip TypeScript overload signatures (declarations without a body).
         if func.body.is_none() { return Ok(()); }
-        let name = id.name.to_string();
+        let name = name_override.map(|s| s.to_string()).unwrap_or_else(|| id.name.to_string());
         // Skip re-emission when multiple imported modules declare the same function name.
         if !self.emitted_functions.insert(name.clone()) {
             return Ok(());

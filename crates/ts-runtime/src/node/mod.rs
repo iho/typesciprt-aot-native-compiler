@@ -8,10 +8,13 @@ pub mod events;
 pub mod buffer;
 pub mod process_ext;
 pub mod http;
+pub mod net;
 pub mod url;
 pub mod child_process;
 pub mod zlib;
 pub mod readline;
+pub mod perf_hooks;
+pub mod dns;
 
 pub use events::HEAP_TAG_EVENT_EMITTER;
 pub use buffer::HEAP_TAG_BUFFER;
