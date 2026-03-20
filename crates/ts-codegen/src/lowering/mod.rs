@@ -1217,6 +1217,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_sleep",           &[i32_type], &[i64_type]);
         add_func("ts_promise_race",     &[i64_type, i64_type], &[i64_type]);
         add_func("ts_promise_race_all", &[i64_type], &[i64_type]);
+        add_func("ts_promise_then",     &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_promise_catch",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_promise_finally",  &[i64_type, i64_type], &[i64_type]);
         add_func("ts_set_timeout",     &[i64_type, i64_type], &[i64_type]);
         add_func("ts_set_interval",    &[i64_type, i64_type], &[i64_type]);
         add_func("ts_clear_timeout",   &[i64_type], &[i64_type]);
@@ -1743,7 +1746,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     // Skip TypeScript overload signatures (declarations without a body) — they would
                     // shadow the actual implementation's signature with a wrong arity.
                     if func.body.is_none() { continue; }
-                    let name = id.name.to_string();
+                    let raw = id.name.to_string();
+                    let name = if raw == "main" {
+                        // "main" conflicts with LLVM entry point — rename and add alias so call sites resolve.
+                        self.module_global_aliases.insert("main".to_string(), "__user_main".to_string());
+                        "__user_main".to_string()
+                    } else { raw };
                     // First-wins: if a function with this name was already registered (from an
                     // earlier imported module), keep the existing signature so it stays consistent
                     // with the first-emitted body (see emitted_functions in lower_function_declaration).
@@ -2113,7 +2121,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
         // Skip TypeScript overload signatures (declarations without a body).
         if func.body.is_none() { return Ok(()); }
-        let name = name_override.map(|s| s.to_string()).unwrap_or_else(|| id.name.to_string());
+        let raw_name = name_override.map(|s| s.to_string()).unwrap_or_else(|| id.name.to_string());
+        // "main" conflicts with the LLVM entry point emitted by lower_main_function.
+        let name = if raw_name == "main" { "__user_main".to_string() } else { raw_name };
         // Skip re-emission when multiple imported modules declare the same function name.
         if !self.emitted_functions.insert(name.clone()) {
             return Ok(());

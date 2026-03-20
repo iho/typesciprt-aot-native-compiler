@@ -105,6 +105,57 @@ pub unsafe extern "C" fn ts_promise_await(val: TsVal) -> TsVal {
     result
 }
 
+/// Resolve the value of a promise without consuming it (borrows the promise).
+/// Always returns an owned reference to the resolved value.
+unsafe fn borrow_resolved(val: TsVal) -> TsVal {
+    if !val.is_ptr() { return val; }
+    let ptr = val.as_ptr();
+    let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
+    let header = ptr.sub(header_size) as *const crate::alloc::ArcHeader;
+    if (*header).tag != TAG_PROMISE_ALLOC {
+        // Non-Promise: the value itself is the resolved value. Retain it to give caller an owned ref.
+        ts_retain_val(val);
+        return val;
+    }
+    let promise = &*(ptr as *const TsPromise);
+    let result = block_until_resolved(promise.resolved.clone(), promise.notify.clone());
+    ts_retain_val(result); // give caller an owned ref
+    result
+}
+
+/// `.then(onFulfilled)` — calls the callback with the resolved value, returns a new Promise.
+/// Borrows both `promise` and `callback`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_promise_then(promise: TsVal, callback: TsVal) -> TsVal {
+    use super::func::dispatch_callback;
+    let resolved = borrow_resolved(promise); // borrows promise, returns owned resolved value
+    let result = dispatch_callback(callback, &[resolved]);
+    ts_release_val(resolved);
+    // result may itself be a Promise; if so, flatten it
+    let final_result = borrow_resolved(result);
+    let out = ts_promise_resolve(final_result);
+    ts_release_val(final_result);
+    ts_release_val(result);
+    out
+}
+
+/// `.catch(onRejected)` — in our runtime errors are passed as values, treat like .then.
+#[no_mangle]
+pub unsafe extern "C" fn ts_promise_catch(promise: TsVal, callback: TsVal) -> TsVal {
+    ts_promise_then(promise, callback)
+}
+
+/// `.finally(onFinally)` — calls callback with no args, returns original promise value.
+#[no_mangle]
+pub unsafe extern "C" fn ts_promise_finally(promise: TsVal, callback: TsVal) -> TsVal {
+    use super::func::dispatch_callback;
+    let resolved = borrow_resolved(promise); // borrows promise
+    dispatch_callback(callback, &[]);
+    let out = ts_promise_resolve(resolved);
+    ts_release_val(resolved);
+    out
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ts_promise_destructor(ptr: *mut u8) {
     let p = ptr as *mut TsPromise;

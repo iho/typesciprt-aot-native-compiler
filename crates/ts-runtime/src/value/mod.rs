@@ -301,6 +301,7 @@ pub use regexp::{
 pub use promise::{
     ts_promise_resolve, ts_promise_await, ts_promise_destructor,
     ts_promise_race, ts_promise_race_all, ts_promise_all, ts_promise_all_settled, ts_promise_any, ts_promise_reject,
+    ts_promise_then, ts_promise_catch, ts_promise_finally,
     ts_sleep,
     ts_set_timeout, ts_set_interval, ts_clear_timeout, ts_clear_interval, ts_queue_microtask,
     ts_async_spawn0, ts_async_spawn1, ts_async_spawn2, ts_async_spawn3, ts_async_spawn4,

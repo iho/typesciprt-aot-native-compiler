@@ -2250,7 +2250,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 "getHours" | "getMinutes" | "getSeconds" | "getMilliseconds" |
                 "toISOString" | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleString" |
                 // WeakRef
-                "deref"
+                "deref" |
+                // Promise chaining
+                "then" | "catch" | "finally"
             ));
             if is_builtin {
                 // If any argument is a spread, handle specially or fall through to dynamic.
@@ -2960,6 +2962,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     "toLocaleString"       => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_date_to_string"),             &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
                     // ── WeakRef methods ────────────────────────────────────────
                     "deref" => Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_weakref_deref"), &[obj_i64], &[i64t], self.loc)).result(0)?.into()),
+                    // ── Promise chaining ───────────────────────────────────────
+                    "then" | "catch" | "finally" => {
+                        let undef_const: Value<'c, 'b> = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc)).result(0)?.into();
+                        let cb = *arg_vals.first().unwrap_or(&undef_const);
+                        let fn_name = match method_name.as_str() {
+                            "then"    => "ts_promise_then",
+                            "catch"   => "ts_promise_catch",
+                            _         => "ts_promise_finally",
+                        };
+                        Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, fn_name), &[obj_i64, cb], &[i64t], self.loc)).result(0)?.into())
+                    }
                     _ => None,
                 };
 
