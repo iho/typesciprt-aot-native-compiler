@@ -70,7 +70,13 @@ pub unsafe extern "C" fn ts_release(ptr: *mut u8, destructor: Option<unsafe exte
     if old_rc == 0 || old_rc == 0xDEAD_BEEF_DEAD_BEEFu64 || old_rc > 0x100_0000 {
         // Double-free detected: refcount was already 0 or poisoned (use-after-free).
         eprintln!("ts_release: double-free/use-after-free detected at ptr={:p} old_rc={:#x}", ptr, old_rc);
-        // Print a backtrace for debugging.
+        // Dump memory around the ptr for context
+        let header_start = ptr.sub(header_size);
+        eprintln!("  Memory dump (header-24 to data+48):");
+        for i in 0..10usize {
+            let p = header_start.add(i * 8) as *const u64;
+            eprintln!("  [{:+4}] {:p} = {:#018x}", (i as isize * 8) - (header_size as isize), p, *p);
+        }
         let bt = std::backtrace::Backtrace::capture();
         eprintln!("{}", bt);
         std::process::abort();

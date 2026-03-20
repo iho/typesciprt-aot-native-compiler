@@ -106,12 +106,149 @@ fn find_npm_shim(package_name: &str, from_dir: &std::path::Path) -> Option<std::
     None
 }
 
+/// Read a simple string field from a package.json without a JSON parser dependency.
+fn read_package_json_field(pkg_dir: &std::path::Path, field: &str) -> Option<String> {
+    let content = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
+    let needle = format!("\"{}\"", field);
+    let pos = content.find(&needle)?;
+    let after = &content[pos + needle.len()..];
+    let colon = after.find(':')? + 1;
+    let after_colon = after[colon..].trim_start();
+    if after_colon.starts_with('"') {
+        let inner = &after_colon[1..];
+        let end = inner.find('"')?;
+        Some(inner[..end].to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve a TypeScript source file within a package directory.
+/// Tries multiple strategies: src/index.ts, "source" field, main-based heuristic.
+fn resolve_ts_in_pkg(pkg_dir: &std::path::Path, sub_path: &str) -> Option<std::path::PathBuf> {
+    if sub_path.is_empty() {
+        // No sub-path: look for package root TypeScript source
+        // 1. src/index.ts (common for monorepo packages)
+        let src_idx = pkg_dir.join("src").join("index.ts");
+        if src_idx.exists() { return Some(src_idx); }
+        // 2. "source" field in package.json
+        if let Some(src_field) = read_package_json_field(pkg_dir, "source") {
+            let src_path = pkg_dir.join(&src_field);
+            if src_path.exists() { return Some(src_path); }
+        }
+        // 3. "main" field: if it's dist/foo.js, look for src/foo.ts
+        if let Some(main) = read_package_json_field(pkg_dir, "main") {
+            if main.contains("dist/") || main.contains("/dist/") {
+                let ts_main = main
+                    .replace("dist/", "src/")
+                    .replace(".js", ".ts")
+                    .replace(".cjs", ".ts")
+                    .replace(".mjs", ".ts");
+                let ts_path = pkg_dir.join(&ts_main);
+                if ts_path.exists() { return Some(ts_path); }
+            }
+        }
+        // 4. index.ts at root
+        let root_idx = pkg_dir.join("index.ts");
+        if root_idx.exists() { return Some(root_idx); }
+        None
+    } else {
+        // Has sub-path: try to find the TypeScript file for that sub-path
+        // e.g., "dist/foo/bar" → "src/foo/bar.ts"; "lib/foo" → "src/foo.ts"
+        let base = sub_path
+            .trim_end_matches(".js")
+            .trim_end_matches(".cjs")
+            .trim_end_matches(".mjs");
+        // Strip known compiled-output prefixes to get the logical name
+        let logical = base
+            .trim_start_matches("dist/")
+            .trim_start_matches("lib/")
+            .trim_start_matches("esm/");
+        // Try candidates in priority order: src/<logical>.ts, <base>.ts, <logical>.ts
+        for prefix in &["src", ""] {
+            for name in &[logical, base] {
+                let path = if prefix.is_empty() {
+                    pkg_dir.join(format!("{}.ts", name))
+                } else {
+                    pkg_dir.join(prefix).join(format!("{}.ts", name))
+                };
+                if path.exists() { return Some(path); }
+                let idx = if prefix.is_empty() {
+                    pkg_dir.join(name).join("index.ts")
+                } else {
+                    pkg_dir.join(prefix).join(name).join("index.ts")
+                };
+                if idx.exists() { return Some(idx); }
+            }
+        }
+        None
+    }
+}
+
+/// Resolve a bare npm package specifier via node_modules lookup.
+/// Walks up the directory tree from `from_dir` to find the first `node_modules/` that contains
+/// the package. Prefers TypeScript source over compiled JS.
+fn resolve_npm_package(spec: &str, from_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Use absolute path for the walk so relative `from_dir` values (like ".") resolve correctly.
+    let from_dir = if from_dir.is_relative() {
+        std::env::current_dir().ok()?.join(from_dir)
+    } else {
+        from_dir.to_path_buf()
+    };
+    // Split spec into package name and optional sub-path.
+    // e.g., "@vendure/core"         → pkg="@vendure/core", sub=""
+    //        "typeorm/entity"        → pkg="typeorm", sub="entity"
+    //        "@nestjs/common/utils"  → pkg="@nestjs/common", sub="utils"
+    let (pkg_name, sub_path) = if spec.starts_with('@') {
+        // Scoped package: first two segments are the name
+        let parts: Vec<&str> = spec.splitn(3, '/').collect();
+        if parts.len() >= 2 {
+            let name = format!("{}/{}", parts[0], parts[1]);
+            let sub = if parts.len() == 3 { parts[2] } else { "" };
+            (name, sub.to_string())
+        } else {
+            (spec.to_string(), String::new())
+        }
+    } else {
+        // Unscoped package: first segment is the name
+        if let Some(slash) = spec.find('/') {
+            (spec[..slash].to_string(), spec[slash+1..].to_string())
+        } else {
+            (spec.to_string(), String::new())
+        }
+    };
+
+    // Walk up directory tree looking for node_modules/<pkg_name>
+    let mut dir = from_dir.to_path_buf();
+    loop {
+        let pkg_dir = dir.join("node_modules").join(&pkg_name);
+        if pkg_dir.exists() {
+            // Resolve symlinks to get the real package directory
+            let real_pkg = std::fs::canonicalize(&pkg_dir).unwrap_or(pkg_dir);
+            if let Some(ts_path) = resolve_ts_in_pkg(&real_pkg, &sub_path) {
+                tracing::debug!("npm resolved: {} → {}", spec, ts_path.display());
+                return Some(ts_path);
+            } else {
+                tracing::warn!("npm package '{}' found but no TypeScript source (JS-only, skipping)", spec);
+                return None;
+            }
+        }
+        if !dir.pop() { break; }
+    }
+    tracing::warn!("npm package '{}' not found in any node_modules", spec);
+    None
+}
+
 fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    // Bare specifiers (npm package names): look for shims walking up the directory tree.
+    // Bare specifiers (npm package names): look for shims, then node_modules.
     if !src.starts_with("./") && !src.starts_with("../") {
         if src.starts_with("node:") { return None; }
-        // Simple package name (no path separator after optional @scope/)
-        return find_npm_shim(src, base_dir);
+        // 1. Shim files take priority (allows overriding any package)
+        if let Some(shim) = find_npm_shim(src, base_dir) {
+            return Some(shim);
+        }
+        // 2. node_modules lookup (prefer TypeScript source)
+        return resolve_npm_package(src, base_dir);
     }
     let joined = base_dir.join(src);
     // Normalize away `.` components in the path.
@@ -307,6 +444,7 @@ pub fn lower_program<'c>(
         module_global_names: std::collections::HashSet::new(),
         builtin_wrappers_emitted: std::collections::HashSet::new(),
         lowered_classes: std::collections::HashSet::new(),
+        emitted_functions: std::collections::HashSet::new(),
         closure_env_indices: HashMap::new(),
         current_fn_params: std::collections::HashSet::new(),
         module_init_fns: Vec::new(),
@@ -460,6 +598,9 @@ struct Lowerer<'c, 'm> {
     builtin_wrappers_emitted: std::collections::HashSet<String>,
     /// Tracks which classes have already been lowered (to prevent re-emission from duplicate imports).
     lowered_classes: std::collections::HashSet<String>,
+    /// Tracks which user-defined functions have already been emitted (to prevent redefinition errors
+    /// when multiple imported modules declare the same helper function, e.g. `isPromise`).
+    emitted_functions: std::collections::HashSet<String>,
     /// When inside a closure body with captures, maps captured variable name → env array index.
     /// Used to write back mutations to captured variables into the env array.
     closure_env_indices: HashMap<String, usize>,
@@ -1275,7 +1416,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             match stmt {
                 Statement::FunctionDeclaration(func) => {
                     let Some(id) = &func.id else { continue };
+                    // Skip TypeScript overload signatures (declarations without a body) — they would
+                    // shadow the actual implementation's signature with a wrong arity.
+                    if func.body.is_none() { continue; }
                     let name = id.name.to_string();
+                    // First-wins: if a function with this name was already registered (from an
+                    // earlier imported module), keep the existing signature so it stays consistent
+                    // with the first-emitted body (see emitted_functions in lower_function_declaration).
+                    if self.funcs.contains_key(&name) { continue; }
                     let explicit_rest = func.params.rest.is_some();
                     let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
                         crate::lowering::expressions::body_uses_arguments(&b.statements)
@@ -1294,8 +1442,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
                 Statement::ExportNamedDeclaration(export) => {
                     if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
+                        if func.body.is_none() { continue; } // Skip overload signatures
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
+                            if self.funcs.contains_key(&name) { continue; }
                             let explicit_rest = func.params.rest.is_some();
                             let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
                                 crate::lowering::expressions::body_uses_arguments(&b.statements)
@@ -1320,8 +1470,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 Statement::ExportDefaultDeclaration(export) => {
                     use oxc_ast::ast::ExportDefaultDeclarationKind;
                     if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
+                        if func.body.is_none() { continue; } // Skip overload signatures
                         if let Some(id) = &func.id {
                             let name = id.name.to_string();
+                            if self.funcs.contains_key(&name) { continue; }
                             let explicit_rest = func.params.rest.is_some();
                             let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
                                 crate::lowering::expressions::body_uses_arguments(&b.statements)
@@ -1548,8 +1700,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }));
         }
 
-        // Pass 2: insert in order; inherit from parent (already inserted if declared first)
+        // Pass 2: insert in order; inherit from parent (already inserted if declared first).
+        // First-wins: skip classes already registered (from an earlier imported module) to keep
+        // class signatures consistent with the first-emitted body (see lowered_classes).
         for (class_name, mut sig) in own_members {
+            if self.classes.contains_key(&class_name) { continue; }
             if let Some(parent_name) = sig.parent.clone() {
                 if let Some(parent_sig) = self.classes.get(&parent_name).cloned() {
                     for (n, m) in &parent_sig.methods {
@@ -1577,6 +1732,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Skip TypeScript overload signatures (declarations without a body).
         if func.body.is_none() { return Ok(()); }
         let name = id.name.to_string();
+        // Skip re-emission when multiple imported modules declare the same function name.
+        if !self.emitted_functions.insert(name.clone()) {
+            return Ok(());
+        }
         let i32_type = self.i32_type();
         let i64_type = self.i64_type();
         // All functions return i64 (NaN-boxed TsVal) so they can return any value including heap objects.

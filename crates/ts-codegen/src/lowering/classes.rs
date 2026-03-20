@@ -246,9 +246,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     // ── Constructor ───────────────────────────────────────────────────────
 
     fn lower_class_constructor(&mut self, class_name: &str, class: &Class<'_>) -> Result<()> {
+        // Find the constructor WITH a body (skip overload signatures).
         let constructor = class.body.body.iter().find_map(|elem| {
             if let ClassElement::MethodDefinition(m) = elem {
-                if m.kind == MethodDefinitionKind::Constructor { Some(m) } else { None }
+                if m.kind == MethodDefinitionKind::Constructor && m.value.body.is_some() { Some(m) } else { None }
             } else {
                 None
             }
@@ -380,7 +381,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
 
-            // If the parent constructor expects more args than we collected, pad with UNDEFINED.
+            // Normalize call_args to exactly parent_arity: pad with UNDEFINED or truncate.
             let parent_arity = parent_name.as_deref()
                 .and_then(|n| self.classes.get(n))
                 .map(|sig| sig.constructor_arity)
@@ -393,6 +394,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 )).result(0)?.into();
                 call_args.push(undef);
             }
+            call_args.truncate(parent_arity);
 
             current.append_operation(func::call(
                 self.ctx,

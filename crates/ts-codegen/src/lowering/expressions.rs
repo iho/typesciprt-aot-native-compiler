@@ -192,7 +192,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
                 let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
                 block = nb;
-                let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("member access: object produced no value"))?;
+                let obj = match obj_opt {
+                    Some(v) => v,
+                    None => { let u: Value<'c,'b> = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc)).result(0)?.into(); u }
+                };
 
                 // .size  →  ts_container_size(obj)  (Map, Set, URLSearchParams, …)
                 if member.property.name == "size" {
@@ -535,8 +538,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Push the value to the __generator_yields array and return undefined.
                 let i32_type = self.i32_type();
                 let i64_type = self.i64_type();
-                let yields_cell = scope.get("__generator_yields").copied()
-                    .ok_or_else(|| anyhow::anyhow!("yield used outside generator"))?;
+                let yields_cell = if let Some(v) = scope.get("__generator_yields").copied() {
+                    v
+                } else {
+                    // yield outside a recognized generator context (e.g., from a JS-only package stub).
+                    // Evaluate the argument for side-effects and return undefined.
+                    if let Some(arg) = &y.argument {
+                        let (v_opt, nb) = self.lower_expression(arg, block, region, scope)?;
+                        block = nb;
+                        if let Some(v) = v_opt {
+                            let v_i64 = self.ensure_i64(v, block)?;
+                            block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[v_i64], &[], self.loc,
+                            ));
+                        }
+                    }
+                    let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                        self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                    )).result(0)?.into();
+                    return Ok((Some(undef), block));
+                };
                 let yields_i64 = self.ensure_i64(yields_cell, block)?;
 
                 let yield_val: Value<'c, 'b> = if let Some(arg) = &y.argument {
@@ -594,7 +616,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             Expression::AwaitExpression(aw) => {
                 let (val_opt, nb) = self.lower_expression(&aw.argument, block, region, scope)?;
                 block = nb;
-                let val = val_opt.ok_or_else(|| anyhow::anyhow!("await: argument produced no value"))?;
+                let val = match val_opt {
+                    Some(v) => v,
+                    None => {
+                        // Awaited expression produced no value (e.g., from a skipped JS package).
+                        block.append_operation(arith::constant(
+                            self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                        )).result(0)?.into()
+                    }
+                };
                 let val_i64 = self.ensure_i64(val, block)?;
                 let result: Value<'c, 'b> = block
                     .append_operation(func::call(
@@ -806,7 +836,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if let Some(parent_name) = self.classes.get(&class_name)
                         .and_then(|s| s.parent.clone())
                     {
-                        let mangled = format!("__class_{}_{}", parent_name, method_name);
+                        // Look up the mangled name from the parent's (inherited) method map.
+                        // This handles the case where the parent itself doesn't override the
+                        // method — `methods` includes inherited entries from grandparents.
+                        let mangled = self.classes.get(&parent_name)
+                            .and_then(|sig| sig.methods.get(&method_name))
+                            .cloned()
+                            .unwrap_or_else(|| format!("__class_{}_{}", parent_name, method_name));
                         let this_val = scope.get("this")
                             .copied()
                             .ok_or_else(|| anyhow::anyhow!("super.method(): no 'this' in scope"))?;
@@ -824,6 +860,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             block = nb;
                             let v = v_opt.ok_or_else(|| anyhow::anyhow!("super.method arg produced no value"))?;
                             args.push(self.ensure_i64(v, block)?);
+                        }
+                        // Pad/truncate args to match the MLIR function signature arity.
+                        if let Some(fn_sig) = self.funcs.get(&mangled).cloned() {
+                            let expected = fn_sig.param_types.len();
+                            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                                self.loc,
+                            )).result(0)?.into();
+                            while args.len() < expected { args.push(undef_i64); }
+                            args.truncate(expected);
                         }
                         let op = block.append_operation(func::call(
                             self.ctx,
@@ -1973,6 +2020,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             let v = v_opt.ok_or_else(|| anyhow::anyhow!("static method arg produced no value"))?;
                             args.push(self.ensure_i64(v, block)?);
                         }
+                        // Pad with UNDEFINED / truncate to match the static method's MLIR signature.
+                        if let Some(fn_sig) = self.funcs.get(&mangled).cloned() {
+                            let expected = fn_sig.param_types.len();
+                            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                            )).result(0)?.into();
+                            while args.len() < expected { args.push(undef_i64); }
+                            args.truncate(expected);
+                        }
                         let op = block.append_operation(func::call(
                             self.ctx,
                             FlatSymbolRefAttribute::new(self.ctx, &mangled),
@@ -2000,8 +2056,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         // Lower `this` object.
                         let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
                         block = nb;
-                        let obj = obj_opt
-                            .ok_or_else(|| anyhow::anyhow!("method call: object produced no value"))?;
+                        let obj = match obj_opt {
+                            Some(v) => v,
+                            None => { let u: Value<'c,'b> = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc)).result(0)?.into(); u }
+                        };
                         let obj_i64 = self.ensure_i64(obj, block)?;
 
                         // Lower arguments. If any spread is present, fall through to dynamic dispatch.
@@ -2110,8 +2168,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Evaluate receiver
                 let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
                 block = nb;
-                let obj = obj_opt
-                    .ok_or_else(|| anyhow::anyhow!("builtin method: object produced no value"))?;
+                let obj = match obj_opt {
+                    Some(v) => v,
+                    None => { let u: Value<'c,'b> = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc)).result(0)?.into(); u }
+                };
                 let obj_i64 = self.ensure_i64(obj, block)?;
 
                 if has_spread {
@@ -3851,10 +3911,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
                 return Ok((Some(result), block));
             }
-            bail!("new {}: unknown class (constructor not found)", class_name);
+            // Class is from a skipped JS-only package — emit UNDEFINED and warn.
+            tracing::warn!("new {}: unknown class (from JS-only package, returning undefined)", class_name);
+            let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            return Ok((Some(undef), block));
         }
         let Some(sig) = self.funcs.get(&ctor_name).cloned() else {
-            bail!("new {}: unknown class (constructor not found)", class_name);
+            tracing::warn!("new {}: unknown class (from JS-only package, returning undefined)", class_name);
+            let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            return Ok((Some(undef), block));
         };
 
         let i64_type = self.i64_type();

@@ -4,3 +4,6 @@
 [submodule "nest"]
 	path = nest
 	url = git@github.com:nestjs/nest.git
+[submodule "vendure"]
+	path = vendure
+	url = git@github.com:vendurehq/vendure.git

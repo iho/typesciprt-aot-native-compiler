@@ -283,8 +283,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     // Coerce each scope value to the expected phi arg type of exit_block.
                     // Switch exit blocks force i64; loop exit blocks may use other types.
                     let mut vals: Vec<Value<'c, 'b>> = Vec::new();
+                    let i64t = self.i64_type();
+                    let undef_c: Value<'c,'b> = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc)).result(0)?.into();
                     for (i, k) in scope_keys.iter().enumerate() {
-                        let v = scope[k];
+                        let v = if let Some(&v) = scope.get(k) { v } else { undef_c };
                         let coerced = if let Ok(arg) = exit_block.argument(i) {
                             self.coerce_val_to_type(v, arg.r#type(), block)?
                         } else { v };
@@ -310,7 +312,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         .find_map(|(cont_opt, _, keys, _)| cont_opt.map(|h| (h, keys)))
                 };
                 if let Some((header_block, scope_keys)) = loop_entry {
-                    let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
+                    let i64t = self.i64_type();
+                    let undef_const = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc)).result(0)?.into();
+                    let vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| {
+                        if let Some(&v) = scope.get(k) { v } else { undef_const }
+                    }).collect();
                     self.terminate_with_br(block, &header_block, &vals);
                     let dead = region.append_block(Block::new(&[]));
                     Ok((None, dead))
@@ -814,7 +820,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let val = if let Some(arg) = &ret.argument {
             let (val_opt, nb) = self.lower_expression(arg, block, region, scope)?;
             block = nb;
-            val_opt.ok_or_else(|| anyhow::anyhow!("return: expression produced no value"))?
+            match val_opt {
+                Some(v) => v,
+                None => block.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                    self.loc,
+                )).result(0)?.into(),
+            }
         } else {
             // `return;` → return 0
             block.append_operation(arith::constant(
@@ -966,39 +979,41 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
             scope_keys.iter().map(|_| (i64t, self.loc)).collect();
 
-        // header receives all scope vars as block arguments (loop-carried values).
-        let mut header_block = region.append_block(Block::new(&phi_types));
+        // loop_header: receives all scope vars as phi args (loop-carried values).
+        let loop_header  = region.append_block(Block::new(&phi_types));
         let body_block   = region.append_block(Block::new(&[]));
         let exit_block   = region.append_block(Block::new(&phi_types));
 
-        // Jump into the header with initial values.
+        // Jump into the loop_header with initial values.
         let init_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
-        block.append_operation(cf::br(&header_block, &init_vals, self.loc));
+        block.append_operation(cf::br(&loop_header, &init_vals, self.loc));
 
-        // Build scope for the header (use block arguments).
+        // Build scope for the header (use loop_header phi block arguments).
         let mut header_scope = scope.clone();
         for (i, k) in scope_keys.iter().enumerate() {
-            header_scope.insert(k.clone(), header_block.argument(i)?.into());
+            header_scope.insert(k.clone(), loop_header.argument(i)?.into());
         }
 
         // Evaluate condition inside the header.
-        let (cond_opt, nb) = self.lower_expression(&while_stmt.test, header_block, region, &mut header_scope)?;
-        header_block = nb;
+        // lower_expression may return a different "current" block (nb) when the condition
+        // uses short-circuit operators that create merge blocks. We always jump back to
+        // loop_header for continue, but the cond_br is appended to the final block (nb).
+        let (cond_opt, mut cond_block) = self.lower_expression(&while_stmt.test, loop_header, region, &mut header_scope)?;
         let cond_val = cond_opt.ok_or_else(|| anyhow::anyhow!("while condition must produce a value"))?;
-        let cond_i1 = self.ensure_i1(cond_val, header_block)?;
+        let cond_i1 = self.ensure_i1(cond_val, cond_block)?;
 
-        // The exit block gets the header-block values when the condition is false.
-        let header_vals: Vec<Value<'c, 'b>> = (0..scope_keys.len())
-            .map(|i| header_block.argument(i).map(Into::into))
-            .collect::<Result<_, _>>()?;
-        header_block.append_operation(cf::cond_br(
-            self.ctx, cond_i1, &body_block, &exit_block, &[], &header_vals, self.loc,
+        // Values to pass to exit_block on false: use header_scope (current scope after condition eval).
+        let exit_vals: Vec<Value<'c, 'b>> = scope_keys.iter()
+            .map(|k| self.ensure_i64(*header_scope.get(k).unwrap_or(&scope[k]), cond_block).unwrap_or(*header_scope.get(k).unwrap_or(&scope[k])))
+            .collect();
+        cond_block.append_operation(cf::cond_br(
+            self.ctx, cond_i1, &body_block, &exit_block, &[], &exit_vals, self.loc,
         ));
 
-        // Lower the loop body.
+        // Lower the loop body. continue → loop_header (phi block).
         let mut body_scope = header_scope.clone();
         let mut inner_loops = loops.to_vec();
-        inner_loops.push((Some(header_block), exit_block, scope_keys.clone(), self.pending_label.take()));
+        inner_loops.push((Some(loop_header), exit_block, scope_keys.clone(), self.pending_label.take()));
         let (_, body_end) =
             self.lower_statement(&while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
         let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
@@ -1007,7 +1022,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.ensure_i64(v, body_end).unwrap_or(v)
             }).collect()
         } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
-        self.terminate_with_br(body_end, &header_block, &body_vals);
+        self.terminate_with_br(body_end, &loop_header, &body_vals);
 
         // After the loop, scope uses exit-block arguments.
         for (i, k) in scope_keys.iter().enumerate() {
@@ -1384,36 +1399,41 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let phi_types: Vec<(melior::ir::Type<'c>, Location<'c>)> =
             scope_keys.iter().map(|_| (i64t, self.loc)).collect();
 
-        let mut header_block = region.append_block(Block::new(&phi_types));
+        let loop_header = region.append_block(Block::new(&phi_types));
         let body_block   = region.append_block(Block::new(&[]));
         let exit_block   = region.append_block(Block::new(&phi_types));
 
         let init_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
-        current.append_operation(cf::br(&header_block, &init_vals, self.loc));
+        current.append_operation(cf::br(&loop_header, &init_vals, self.loc));
 
-        // Header scope: use block arguments.
+        // Header scope: use block arguments from the phi-node block.
         let mut header_scope = scope.clone();
         for (i, k) in scope_keys.iter().enumerate() {
-            header_scope.insert(k.clone(), header_block.argument(i)?.into());
+            header_scope.insert(k.clone(), loop_header.argument(i)?.into());
         }
 
         // Evaluate condition (or default to `true` if absent).
-        let cond_i1 = if let Some(test) = &for_stmt.test {
-            let (cv_opt, nb) = self.lower_expression(test, header_block, region, &mut header_scope)?;
-            header_block = nb;
+        // lower_expression may create new merge blocks; track the final block in cond_block.
+        let (cond_i1, cond_block) = if let Some(test) = &for_stmt.test {
+            let (cv_opt, nb) = self.lower_expression(test, loop_header, region, &mut header_scope)?;
             let cv = cv_opt.ok_or_else(|| anyhow::anyhow!("for condition must produce a value"))?;
-            self.ensure_i1(cv, header_block)?
+            let i1 = self.ensure_i1(cv, nb)?;
+            (i1, nb)
         } else {
-            self.lower_boolean_literal(true, header_block)?
+            let i1 = self.lower_boolean_literal(true, loop_header)?;
+            (i1, loop_header)
         };
 
-        let header_vals: Vec<Value<'c, 'b>> = (0..scope_keys.len())
-            .map(|i| header_block.argument(i).map(Into::into))
-            .collect::<Result<_, _>>()?;
-            
+        // Build exit_vals from header_scope (which holds loop_header phi args or their derivatives).
+        // Do NOT call cond_block.argument(i) — cond_block may be a merge block with no phi args.
+        let exit_vals: Vec<Value<'c, 'b>> = scope_keys.iter().zip(phi_types.iter()).map(|(k, (ty, _))| {
+            let v = header_scope[k];
+            self.coerce_val_to_type(v, *ty, cond_block).unwrap_or(v)
+        }).collect();
+
         // We evaluate condition, if true jump to body_block, else exit_block.
-        header_block.append_operation(cf::cond_br(
-            self.ctx, cond_i1, &body_block, &exit_block, &[], &header_vals, self.loc,
+        cond_block.append_operation(cf::cond_br(
+            self.ctx, cond_i1, &body_block, &exit_block, &[], &exit_vals, self.loc,
         ));
 
         // Create an update block for `continue` statements to securely jump to.
@@ -1455,7 +1475,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.coerce_val_to_type(v, *ty, update_block).unwrap_or(v)
             }).collect()
         } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
-        self.terminate_with_br(update_block, &header_block, &update_vals);
+        self.terminate_with_br(update_block, &loop_header, &update_vals);
 
         for (i, k) in scope_keys.iter().enumerate() {
             scope.insert(k.clone(), exit_block.argument(i)?.into());

@@ -16,7 +16,6 @@ fn globals_map() -> &'static RwLock<HashMap<String, TsVal>> {
 #[no_mangle]
 pub unsafe extern "C" fn ts_set_module_global(name_ptr: *const i8, val: TsVal) {
     let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-    // Debug: log all module global stores with pointer info.
     if val.is_ptr() {
         let ptr = val.as_ptr();
         let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
@@ -26,7 +25,6 @@ pub unsafe extern "C" fn ts_set_module_global(name_ptr: *const i8, val: TsVal) {
             eprintln!("ts_set_module_global: storing freed/corrupted value for key '{}' ptr={:p} rc={:#x}", name, ptr, rc);
             std::process::abort();
         }
-        eprintln!("DBG set_global '{}' ptr={:p} rc={} tag={}", name, ptr, rc, (*header).tag);
     }
     ts_retain_val(val);
     let mut map = globals_map().write().unwrap();

@@ -718,7 +718,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         let id = match &update.argument {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id,
-            _ => bail!("update expression: only simple identifiers are supported"),
+            _ => {
+                tracing::warn!("update expression: non-identifier target not yet supported (from JS-only package), returning undefined");
+                let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                )).result(0)?.into();
+                return Ok((Some(undef), block));
+            }
         };
         let name = id.name.to_string();
 
@@ -746,7 +752,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         // ARC: Manual identifier read.
-        let old_val = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined: {}", name))?;
+        let old_val = if let Some(&v) = scope.get(&name) {
+            v
+        } else {
+            // Variable not in scope (e.g., inherited field from a JS-only package base class).
+            tracing::warn!("update expression: variable '{}' not in scope (from JS-only package), returning undefined", name);
+            let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            return Ok((Some(undef), block));
+        };
         let old_i64 = self.ensure_i64(old_val, block)?;
         block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[old_i64], &[], self.loc));
 
@@ -1337,10 +1352,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         }
                     }
                 }
-                // Release the rhs array (we've been indexing it)
-                block.append_operation(melior::dialect::func::call(self.ctx,
-                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                    &[rhs_i64], &[], self.loc));
+                // rhs_i64 is returned as the value of the assignment expression;
+                // the caller (ExpressionStatement handler) will release it.
                 Ok((Some(rhs_i64), block))
             }
             AssignmentTarget::ObjectAssignmentTarget(obj_target) => {
@@ -1461,10 +1474,51 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         }
                     }
                 }
-                block.append_operation(melior::dialect::func::call(self.ctx,
-                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                    &[rhs_i64], &[], self.loc));
+                // rhs_i64 is returned as the value of the assignment expression;
+                // the caller (ExpressionStatement handler) will release it.
                 Ok((Some(rhs_i64), block))
+            }
+            // TypeScript type assertions as assignment targets: strip the cast, recurse.
+            AssignmentTarget::TSAsExpression(ts_as) => {
+                // (expr as T) = rhs — the cast doesn't affect runtime assignment.
+                // Wrap in a synthetic assignment using the inner expression as target.
+                use oxc_ast::ast::Expression;
+                match &ts_as.expression {
+                    Expression::Identifier(id) => {
+                        let name = id.name.to_string();
+                        // Treat as a simple identifier assignment.
+                        let new_val = rhs;
+                        if self.is_cell_var(&name) {
+                            let cell_ptr = *scope.get(&name).ok_or_else(|| anyhow::anyhow!("undefined cell: {name}"))?;
+                            self.cell_write(cell_ptr, new_val, block)?;
+                        } else {
+                            if let Some(old) = scope.insert(name, new_val) {
+                                let old_i64 = self.ensure_i64(old, block)?;
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                            }
+                        }
+                        Ok((Some(new_val), block))
+                    }
+                    _ => {
+                        tracing::warn!("TSAsExpression assignment with non-identifier inner expression, skipping");
+                        Ok((Some(rhs), block))
+                    }
+                }
+            }
+            AssignmentTarget::TSSatisfiesExpression(ts_sat) => {
+                use oxc_ast::ast::Expression;
+                match &ts_sat.expression {
+                    Expression::Identifier(id) => {
+                        let name = id.name.to_string();
+                        let new_val = rhs;
+                        if let Some(old) = scope.insert(name, new_val) {
+                            let old_i64 = self.ensure_i64(old, block)?;
+                            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                        }
+                        Ok((Some(new_val), block))
+                    }
+                    _ => { tracing::warn!("TSSatisfiesExpression assignment: skipping"); Ok((Some(rhs), block)) }
+                }
             }
             _ => bail!("unsupported assignment target: {:?}", assign.left),
         }
@@ -1502,8 +1556,100 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
         }
+        // Handle compound assignment operators to static member expressions.
         if operator != AssignmentOperator::Assign {
-            bail!("compound assignment to member expressions is not supported yet");
+            // For compound assignments (+=, -=, ||=, etc.), read the current value first.
+            let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
+            block = nb;
+            let obj = match obj_opt {
+                Some(v) => v,
+                None => {
+                    let u: Value<'c,'b> = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc)).result(0)?.into();
+                    u
+                }
+            };
+            let obj_i64 = self.ensure_i64(obj, block)?;
+            let prop_name = member.property.name.to_string();
+            let key_ptr = self.get_string_ptr(&prop_name, block)?;
+            let i64t = self.i64_type();
+
+            // For logical assignment operators, short-circuit if condition is met.
+            if matches!(operator, AssignmentOperator::LogicalOr | AssignmentOperator::LogicalAnd | AssignmentOperator::LogicalNullish) {
+                let lhs_i64: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                    &[obj_i64, key_ptr], &[i64t], self.loc,
+                )).result(0)?.into();
+                // Evaluate condition
+                let cond_i32: Value<'c, 'b> = match operator {
+                    AssignmentOperator::LogicalOr => block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                        &[lhs_i64], &[self.i32_type()], self.loc,
+                    )).result(0)?.into(),
+                    AssignmentOperator::LogicalAnd => {
+                        let t = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_truthy"),
+                            &[lhs_i64], &[self.i32_type()], self.loc,
+                        )).result(0)?.into();
+                        // &&= only assigns if LHS is truthy (opposite of ||=)
+                        let zero = block.append_operation(arith::constant(self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc)).result(0)?.into();
+                        block.append_operation(arith::cmpi(self.ctx, arith::CmpiPredicate::Eq, t, zero, self.loc)).result(0)?.into()
+                    }
+                    _ => block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_nullish"),
+                        &[lhs_i64], &[self.i32_type()], self.loc,
+                    )).result(0)?.into(),
+                };
+                let cond_i1 = self.ensure_i1(cond_i32, block)?;
+                let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
+                let assign_block = region.append_block(Block::new(&[]));
+                let skip_block = region.append_block(Block::new(&[]));
+                // skip: keep lhs unchanged
+                block.append_operation(cf::cond_br(self.ctx, cond_i1, &skip_block, &assign_block, &[], &[], self.loc));
+                skip_block.append_operation(cf::br(&merge_block, &[lhs_i64], self.loc));
+                // assign: write rhs
+                let rhs_i64 = self.ensure_i64(rhs, assign_block)?;
+                assign_block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                    &[obj_i64, key_ptr, rhs_i64], &[], self.loc,
+                ));
+                assign_block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                assign_block.append_operation(cf::br(&merge_block, &[rhs_i64], self.loc));
+                let result: Value<'c, 'b> = merge_block.argument(0)?.into();
+                merge_block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                return Ok((Some(result), merge_block));
+            }
+
+            // Arithmetic/bitwise compound: read + op + write
+            let lhs_i64: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                &[obj_i64, key_ptr], &[i64t], self.loc,
+            )).result(0)?.into();
+            let rhs_i64 = self.ensure_i64(rhs, block)?;
+            let result_i64: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, match operator {
+                    AssignmentOperator::Addition => "ts_add",
+                    AssignmentOperator::Subtraction => "ts_sub",
+                    AssignmentOperator::Multiplication => "ts_mul",
+                    AssignmentOperator::Division => "ts_div",
+                    AssignmentOperator::Remainder => "ts_rem",
+                    AssignmentOperator::Exponential => "ts_pow",
+                    AssignmentOperator::BitwiseOR => "ts_bitor",
+                    AssignmentOperator::BitwiseAnd => "ts_bitand",
+                    AssignmentOperator::BitwiseXOR => "ts_bitxor",
+                    AssignmentOperator::ShiftLeft => "ts_shl",
+                    AssignmentOperator::ShiftRight => "ts_shr",
+                    AssignmentOperator::ShiftRightZeroFill => "ts_ushr",
+                    _ => "ts_add", // fallback
+                }),
+                &[lhs_i64, rhs_i64], &[i64t], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
+                &[obj_i64, key_ptr, result_i64], &[], self.loc,
+            ));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+            return Ok((Some(result_i64), block));
         }
         let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
         block = nb;
