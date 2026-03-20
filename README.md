@@ -643,7 +643,7 @@ Run benchmarks yourself:
 ## Testing
 
 ```bash
-# Run all 75 integration tests (requires LLVM)
+# Run all 86 integration tests (requires LLVM)
 cargo test -p tscc -- --include-ignored --test-threads=1
 
 # Run a single test
@@ -656,10 +656,24 @@ Always use `--test-threads=1` to avoid race conditions in concurrent LLVM codege
 
 ## What's Not Yet Implemented
 
-- `fetch()` global (HTTP client)
-- Generator functions (`function*`, `yield`)
-- Async class methods
-- `WeakRef`
+**Language semantics:**
+- Lazy generator semantics — `function*` / `yield` compiles but eagerly collects all yielded values into an array; infinite or stateful generators won't work correctly
+- Rejected promise propagation — `await Promise.reject(err)` inside a `try/catch` does not throw; rejection is silently swallowed
+- `Proxy` and full `Reflect` API (only `Reflect.defineMetadata` / `getMetadata` are implemented)
+- Custom `Symbol.iterator` protocols — `for...of` works on `Array`, `String`, `Map`, `Set`, and `Map.entries()` but not on user-defined iterables
+- Dynamic `import()` expressions — only static `import` declarations are supported
+- True weak-reference semantics — `WeakRef`, `WeakMap`, `WeakSet` are implemented but use strong (ARC) references, so they don't enable GC-style lifecycle management
+- `eval()` and `new Function()` — not possible in an AOT compiler
+
+**Standard library gaps:**
+- `Intl` APIs (locale-aware formatting, collation, etc.)
+- `console.group` / `console.table` / `console.time` / `console.timeEnd`
+- `Object.defineProperty` with getter/setter descriptors on plain objects (class getters/setters work)
+- `RegExp` named capture groups and lookbehind assertions
+
+**Tooling:**
+- Source maps / debug info — generated binaries have no DWARF; stack traces are Rust-level
+- Single-file output only — no tree-shaking or bundle splitting
 
 ---
 
