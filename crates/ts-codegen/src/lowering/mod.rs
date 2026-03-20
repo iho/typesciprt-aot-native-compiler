@@ -1588,6 +1588,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Node.js http module
         add_func("ts_http_server_listen",         &[i64_type, i64_type], &[i64_type]);
 
+        // Node.js url module
+        add_func("ts_url_parse",                  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_url_resolve",                &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_url_format",                 &[i64_type], &[i64_type]);
+
+        // Node.js child_process module
+        add_func("ts_exec_sync",                  &[i64_type], &[i64_type]);
+        add_func("ts_spawn_sync",                 &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_exec_async",                 &[i64_type], &[i64_type]);
+
+        // Node.js zlib module
+        add_func("ts_zlib_deflate_sync",          &[i64_type], &[i64_type]);
+        add_func("ts_zlib_inflate_sync",          &[i64_type], &[i64_type]);
+        add_func("ts_zlib_gzip_sync",             &[i64_type], &[i64_type]);
+        add_func("ts_zlib_gunzip_sync",           &[i64_type], &[i64_type]);
+        add_func("ts_zlib_deflate_async",         &[i64_type], &[i64_type]);
+        add_func("ts_zlib_inflate_async",         &[i64_type], &[i64_type]);
+        add_func("ts_zlib_gzip_async",            &[i64_type], &[i64_type]);
+        add_func("ts_zlib_gunzip_async",          &[i64_type], &[i64_type]);
+
+        // Node.js readline module
+        add_func("ts_readline_question",          &[i64_type], &[i64_type]);
+        add_func("ts_readline_read_line",         &[], &[i64_type]);
+
         // Node-API export registration (used in --emit-node-addon mode).
         add_func("ts_napi_register_export", &[ptr_type, ptr_type, i32_type], &[]);
 

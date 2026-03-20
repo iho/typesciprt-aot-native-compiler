@@ -21,7 +21,7 @@ napi = []
 
 [dependencies]
 dhat = { version = "0.3", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time", "net", "process"] }
 regex = "1"
 url = "2"
 hyper = { version = "1", features = ["http1", "server"] }
@@ -38,3 +38,4 @@ rand    = "0.8"
 uuid    = { version = "1", features = ["v4"] }
 pbkdf2  = { version = "0.12", features = ["simple"] }
 scrypt  = "0.11"
+flate2  = "1"

@@ -20,7 +20,7 @@ pub(crate) fn get_runtime() -> &'static tokio::runtime::Runtime {
 
 const TAG_PROMISE_ALLOC: u8 = 3;
 
-pub(super) fn make_promise_pair() -> (
+pub(crate) fn make_promise_pair() -> (
     std::sync::Arc<std::sync::OnceLock<TsVal>>,
     std::sync::Arc<tokio::sync::Notify>,
 ) {
@@ -30,7 +30,7 @@ pub(super) fn make_promise_pair() -> (
     )
 }
 
-pub(super) unsafe fn alloc_promise(p: TsPromise) -> TsVal {
+pub(crate) unsafe fn alloc_promise(p: TsPromise) -> TsVal {
     let size = std::mem::size_of::<TsPromise>();
     let ptr = crate::alloc::ts_alloc_rc(size, TAG_PROMISE_ALLOC) as *mut TsPromise;
     if ptr.is_null() { return NULL; }
@@ -38,7 +38,7 @@ pub(super) unsafe fn alloc_promise(p: TsPromise) -> TsVal {
     TsVal::from_ptr(ptr as *mut u8)
 }
 
-pub(super) fn resolve_arc(
+pub(crate) fn resolve_arc(
     resolved: &std::sync::Arc<std::sync::OnceLock<TsVal>>,
     notify:   &std::sync::Arc<tokio::sync::Notify>,
     val: TsVal,

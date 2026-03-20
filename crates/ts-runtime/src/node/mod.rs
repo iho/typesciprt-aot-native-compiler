@@ -8,6 +8,10 @@ pub mod events;
 pub mod buffer;
 pub mod process_ext;
 pub mod http;
+pub mod url;
+pub mod child_process;
+pub mod zlib;
+pub mod readline;
 
 pub use events::HEAP_TAG_EVENT_EMITTER;
 pub use buffer::HEAP_TAG_BUFFER;
