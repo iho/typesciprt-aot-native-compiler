@@ -13,8 +13,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AOT_PORT=19888
 NODE_PORT=19889
 DURATION=10
-CONNECTIONS=100
+CONNECTIONS=50
 THREADS=4
+# Use 127.0.0.1 explicitly to avoid IPv4/IPv6 mismatch (some servers bind IPv4 only)
+HOST=127.0.0.1
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -35,9 +37,17 @@ cleanup() {
   wait "$NODE_PID" 2>/dev/null || true
 }
 
+TOOL=""
+
 check_deps() {
-  if ! command -v wrk &>/dev/null; then
-    error "wrk not found. Install with: brew install wrk (macOS) / apt install wrk (Linux)"
+  if command -v wrk &>/dev/null; then
+    TOOL=wrk
+  elif command -v ab &>/dev/null; then
+    TOOL=ab
+    warn "wrk not found, falling back to ab (apache bench). Install wrk for better results:"
+    warn "  brew install wrk  (macOS) / apt install wrk  (Linux)"
+  else
+    error "No HTTP benchmark tool found. Install wrk or ab."
     exit 1
   fi
   if ! command -v node &>/dev/null; then
@@ -49,7 +59,7 @@ check_deps() {
 wait_for_port() {
   local port=$1 name=$2 pid=$3
   local attempts=0
-  while ! curl -sf "http://localhost:$port/health" >/dev/null 2>&1; do
+  while ! curl -sf "http://$HOST:$port/health" >/dev/null 2>&1; do
     if ! kill -0 "$pid" 2>/dev/null; then
       error "$name server (pid=$pid) died before becoming ready"
       exit 1
@@ -64,19 +74,31 @@ wait_for_port() {
   success "$name server ready on :$port"
 }
 
-run_wrk() {
+run_bench() {
   local url=$1
-  wrk -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" "$url" 2>&1
+  if [[ "$TOOL" == wrk ]]; then
+    wrk -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" "$url" 2>&1
+  else
+    # ab: use -n (requests = duration * estimated rps) approximation
+    local n=$(( CONNECTIONS * DURATION * 200 ))
+    ab -n "$n" -c "$CONNECTIONS" -q "$url" 2>&1
+  fi
 }
 
 extract_rps() {
-  # Extract requests/sec from wrk output
-  grep "Requests/sec:" | awk '{print $2}'
+  if [[ "$TOOL" == wrk ]]; then
+    grep "Requests/sec:" | awk '{print $2}'
+  else
+    grep "Requests per second:" | awk '{print $4}'
+  fi
 }
 
 extract_latency() {
-  # Extract avg latency from wrk output
-  grep "Latency" | awk '{print $2}'
+  if [[ "$TOOL" == wrk ]]; then
+    grep "Latency" | awk '{print $2}'
+  else
+    grep "Time per request:" | head -1 | awk '{print $4 " ms"}'
+  fi
 }
 
 check_deps
@@ -114,17 +136,17 @@ ENDPOINTS=(
 )
 
 URLS_AOT=(
-  "http://localhost:$AOT_PORT/health"
-  "http://localhost:$AOT_PORT/api/products"
-  "http://localhost:$AOT_PORT/api/products/1"
-  "http://localhost:$AOT_PORT/api/orders"
+  "http://$HOST:$AOT_PORT/health"
+  "http://$HOST:$AOT_PORT/api/products"
+  "http://$HOST:$AOT_PORT/api/products/1"
+  "http://$HOST:$AOT_PORT/api/orders"
 )
 
 URLS_NODE=(
-  "http://localhost:$NODE_PORT/health"
-  "http://localhost:$NODE_PORT/api/products"
-  "http://localhost:$NODE_PORT/api/products/1"
-  "http://localhost:$NODE_PORT/api/orders"
+  "http://$HOST:$NODE_PORT/health"
+  "http://$HOST:$NODE_PORT/api/products"
+  "http://$HOST:$NODE_PORT/api/products/1"
+  "http://$HOST:$NODE_PORT/api/orders"
 )
 
 declare -A AOT_RPS NODE_RPS
@@ -133,11 +155,11 @@ for i in "${!ENDPOINTS[@]}"; do
   endpoint="${ENDPOINTS[$i]}"
   info "Benchmarking: $endpoint"
 
-  aot_out=$(run_wrk "${URLS_AOT[$i]}")
+  aot_out=$(run_bench "${URLS_AOT[$i]}")
   aot_rps=$(echo "$aot_out" | extract_rps)
   aot_lat=$(echo "$aot_out" | extract_latency)
 
-  node_out=$(run_wrk "${URLS_NODE[$i]}")
+  node_out=$(run_bench "${URLS_NODE[$i]}")
   node_rps=$(echo "$node_out" | extract_rps)
   node_lat=$(echo "$node_out" | extract_latency)
 
