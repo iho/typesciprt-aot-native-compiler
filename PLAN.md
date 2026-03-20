@@ -324,8 +324,8 @@ Gaps identified by static analysis of the current lowering code. Ordered by prac
 ### [x] 7. `import.meta`
 `import.meta.url`, `import.meta.dirname`, `import.meta.env` — implemented via `ts_import_meta_new()` runtime function; `Expression::MetaProperty` handled in `expressions.rs`.
 
-### [ ] 8. Generator functions
-`function*` / `yield` not supported. Yield outside a generator context returns `undefined`.
+### [x] 8. Generator functions
+`function*` / `yield` — already implemented. Generator collects all yielded values into a TsArray and returns it (eager evaluation model). `for...of`, spread `[...gen()]` work correctly.
 
 ---
 
