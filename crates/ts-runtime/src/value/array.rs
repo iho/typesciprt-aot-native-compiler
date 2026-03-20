@@ -96,6 +96,10 @@ pub unsafe extern "C" fn ts_iterable_len(val: TsVal) -> TsVal {
             let s = &*(val.as_ptr() as *const TsString);
             TsVal::from_i32(s.inner.chars().count() as i32)
         }
+        11 => {
+            let set = &*(val.as_ptr() as *const super::TsSet);
+            TsVal::from_i32(set.entries.len() as i32)
+        }
         _ => TsVal::from_i32(0),
     }
 }
@@ -112,6 +116,16 @@ pub unsafe extern "C" fn ts_iterable_get(val: TsVal, idx: i32) -> TsVal {
                 let mut bytes = c.to_string().into_bytes();
                 bytes.push(0u8);
                 super::string_val::ts_string_new(bytes.as_ptr() as *const i8)
+            } else {
+                UNDEFINED
+            }
+        }
+        11 => {
+            let set = &*(val.as_ptr() as *const super::TsSet);
+            if (idx as usize) < set.entries.len() {
+                let v = set.entries[idx as usize];
+                ts_retain_val(v);
+                v
             } else {
                 UNDEFINED
             }
@@ -144,6 +158,15 @@ pub unsafe extern "C" fn ts_normalize_iterable(val: TsVal) -> TsVal {
             let sv = super::string_val::ts_string_new(bytes.as_ptr() as *const i8);
             ts_arr_push(arr, sv);
             ts_release_val(sv);
+        }
+        return arr;
+    }
+    if tag == 11 {
+        // Set: collect entries into array
+        let set = &*(val.as_ptr() as *const super::TsSet);
+        let arr = ts_arr_new(0);
+        for &v in &set.entries {
+            ts_arr_push(arr, v);
         }
         return arr;
     }
@@ -234,15 +257,28 @@ pub unsafe extern "C" fn ts_arr_shift(arr_val: TsVal) -> TsVal {
 }
 
 /// Append all elements of `src` to `dst` (implements `[...src, ...]`).
+/// Supports TsArray (tag=1) and TsSet (tag=11) sources.
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_push_all(dst: TsVal, src: TsVal) {
     if !dst.is_ptr() || heap_tag(dst) != 1 { return; }
-    if !src.is_ptr() || heap_tag(src) != 1 { return; }
-    let src_arr = &*(src.as_ptr() as *const TsArray);
+    if !src.is_ptr() { return; }
     let dst_arr = &mut *(dst.as_ptr() as *mut TsArray);
-    for &val in &src_arr.elements {
-        ts_retain_val(val);
-        dst_arr.elements.push(val);
+    match heap_tag(src) {
+        1 => {
+            let src_arr = &*(src.as_ptr() as *const TsArray);
+            for &val in &src_arr.elements {
+                ts_retain_val(val);
+                dst_arr.elements.push(val);
+            }
+        }
+        11 => {
+            let set = &*(src.as_ptr() as *const super::TsSet);
+            for &val in &set.entries {
+                ts_retain_val(val);
+                dst_arr.elements.push(val);
+            }
+        }
+        _ => {}
     }
 }
 
