@@ -12,8 +12,8 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use melior::ir::operation::OperationPrintingFlags;
 use melior::ir::operation::OperationLike;
+use melior::ir::operation::OperationPrintingFlags;
 use oxc_allocator::Allocator;
 use tracing::info;
 
@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long)]
     emit_llvm: bool,
 
-    /// Optimisation level: 0-3 (default: 2).
+    /// Optimisation level: 0-3.
     #[arg(short = 'O', default_value = "2")]
     opt_level: u8,
 
@@ -72,8 +72,7 @@ fn main() -> Result<()> {
     let filter = if cli.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .init();
 
@@ -88,17 +87,16 @@ fn main() -> Result<()> {
     // ── 2. Parse TypeScript → OXC AST ────────────────────────────────────
 
     let alloc = Allocator::default();
-    let program =
-        parse_typescript(&alloc, &source, &file_name)?;
+    let program = parse_typescript(&alloc, &source, &file_name)?;
 
     info!("lowering to MLIR");
 
     // ── 3. Lower AST → MLIR ───────────────────────────────────────────────
 
-    let mut cg  = CodegenContext::new();
+    let mut cg = CodegenContext::new();
     cg.addon_mode = cli.emit_node_addon;
-    let mut module  = lower_program(&cg, &program, &file_name)
-        .context("AST → MLIR lowering failed")?;
+    let mut module =
+        lower_program(&cg, &program, &file_name).context("AST → MLIR lowering failed")?;
 
     if cli.emit_mlir {
         let flags = OperationPrintingFlags::new();
@@ -114,15 +112,17 @@ fn main() -> Result<()> {
         let s = module.as_operation().to_string();
         std::fs::write("/tmp/hono_debug.mlir", &s).ok();
     }
-    run_lowering_pipeline(&cg.mlir, &mut module)
-        .context("MLIR pass pipeline failed")?;
+    run_lowering_pipeline(&cg.mlir, &mut module).context("MLIR pass pipeline failed")?;
 
     // ── 5. Translate MLIR → LLVM IR ───────────────────────────────────────
 
     let stem = cli.input.file_stem().unwrap_or_default();
-    let out_dir = cli.input.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let ll_path  = out_dir.join(format!("{}.ll",  stem.to_string_lossy()));
-    let obj_path = out_dir.join(format!("{}.o",   stem.to_string_lossy()));
+    let out_dir = cli
+        .input
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let ll_path = out_dir.join(format!("{}.ll", stem.to_string_lossy()));
+    let obj_path = out_dir.join(format!("{}.o", stem.to_string_lossy()));
     let bin_path = cli.output.clone().unwrap_or_else(|| {
         if cli.emit_node_addon {
             out_dir.join(format!("{}.node", stem.to_string_lossy()))
@@ -131,8 +131,7 @@ fn main() -> Result<()> {
         }
     });
 
-    emit::mlir_to_llvm_ir(&module, &ll_path)
-        .context("mlir → llvm IR translation failed")?;
+    emit::mlir_to_llvm_ir(&module, &ll_path).context("mlir → llvm IR translation failed")?;
 
     if cli.emit_llvm {
         println!("{}", fs::read_to_string(&ll_path)?);
@@ -160,11 +159,9 @@ fn main() -> Result<()> {
     link_inputs.extend_from_slice(&extra_libs);
 
     if cli.emit_node_addon {
-        emit::link_node_addon(&link_inputs, &bin_path)
-            .context("linking node addon failed")?;
+        emit::link_node_addon(&link_inputs, &bin_path).context("linking node addon failed")?;
     } else {
-        emit::link_binary(&link_inputs, &bin_path)
-            .context("linking failed")?;
+        emit::link_binary(&link_inputs, &bin_path).context("linking failed")?;
     }
 
     println!("✓  compiled to {}", bin_path.display());
