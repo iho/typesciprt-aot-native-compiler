@@ -788,6 +788,30 @@ pub unsafe extern "C" fn ts_arr_from(iterable: TsVal, map_fn: TsVal) -> TsVal {
         return result;
     }
 
+    // Case 4: TsSet — iterate its entries.
+    if iterable.is_ptr() && heap_tag(iterable) == 11 {
+        let set_ptr = iterable.as_ptr() as *const super::TsSet;
+        let len = (*set_ptr).entries.len();
+        let result = ts_arr_new(0);
+        for i in 0..len {
+            let elem = { let r = &*set_ptr; r.entries[i] };
+            ts_retain_val(elem);
+            let index = TsVal::from_i32(i as i32);
+            let out = if has_map {
+                ts_retain_val(iterable);
+                let v = dispatch_callback(map_fn, &[elem, index, iterable]);
+                ts_release_val(iterable);
+                ts_release_val(elem);
+                v
+            } else {
+                elem
+            };
+            ts_arr_push(result, out);
+            ts_release_val(out);
+        }
+        return result;
+    }
+
     // Fallback: return empty array.
     ts_arr_new(0)
 }

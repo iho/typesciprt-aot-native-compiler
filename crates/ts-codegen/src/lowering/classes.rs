@@ -31,6 +31,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             });
             let mut methods: HashMap<String, String> = HashMap::new();
             let mut method_arity: HashMap<String, usize> = HashMap::new();
+            let mut method_has_rest: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut statics: HashMap<String, String> = HashMap::new();
             let mut getters: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut setters: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -58,9 +59,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     (MethodDefinitionKind::Set, false) => { setters.insert(mname); }
                     (MethodDefinitionKind::Method, true) => { statics.insert(mname.clone(), format!("__class_{}_{}", class_name, mname)); }
                     (MethodDefinitionKind::Method, false) => {
-                        let rest = if method.value.params.rest.is_some() { 1 } else { 0 };
-                        let arity = 1 + method.value.params.items.len() + rest;
+                        let has_rest = method.value.params.rest.is_some();
+                        let arity = 1 + method.value.params.items.len() + if has_rest { 1 } else { 0 };
                         method_arity.insert(mname.clone(), arity);
+                        if has_rest { method_has_rest.insert(mname.clone()); }
                         methods.insert(mname.clone(), format!("__class_{}_{}", class_name, mname));
                     }
                     _ => {}
@@ -71,6 +73,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             if let Some(psig) = parent_sig {
                 for (k, v) in &psig.methods { methods.entry(k.clone()).or_insert_with(|| v.clone()); }
                 for (k, v) in &psig.method_arity { method_arity.entry(k.clone()).or_insert(*v); }
+                for k in &psig.method_has_rest { method_has_rest.insert(k.clone()); }
                 for (k, v) in &psig.statics { statics.entry(k.clone()).or_insert_with(|| v.clone()); }
                 for k in &psig.getters { getters.insert(k.clone()); }
                 for k in &psig.setters { setters.insert(k.clone()); }
@@ -90,6 +93,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 constructor_arity,
                 methods,
                 method_arity,
+                method_has_rest,
                 statics,
                 getters,
                 setters,

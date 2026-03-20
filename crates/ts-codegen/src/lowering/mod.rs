@@ -74,6 +74,8 @@ struct ClassSig {
     methods:  HashMap<String, String>,                  // instance method name → mangled
     /// Arity of each instance method (number of MLIR params including `self`).
     method_arity: HashMap<String, usize>,
+    /// Instance methods that have a rest parameter (last MLIR param is a TsArray).
+    method_has_rest: std::collections::HashSet<String>,
     statics:  HashMap<String, String>,                  // static method name → mangled
     getters:  std::collections::HashSet<String>,        // property names with getters
     setters:  std::collections::HashSet<String>,        // property names with setters
@@ -871,6 +873,7 @@ fn lower_cjs_module<'c, 'm>(
 }
 
 /// Collect local import paths declared in a parsed program, relative to `base_dir`.
+/// Also collects dynamic `import('specifier')` calls so they are compiled ahead-of-time.
 fn collect_local_imports(
     program: &oxc_ast::ast::Program<'_>,
     base_dir: &std::path::Path,
@@ -899,7 +902,70 @@ fn collect_local_imports(
             }
         }
     }
+    // Also collect dynamic import() calls: import('specifier')
+    collect_dynamic_imports_stmts(&program.body, base_dir, &mut paths);
     paths
+}
+
+fn collect_dynamic_imports_stmts(
+    stmts: &[oxc_ast::ast::Statement<'_>],
+    base_dir: &std::path::Path,
+    paths: &mut Vec<std::path::PathBuf>,
+) {
+    use oxc_ast::ast::{Statement, Expression};
+    for stmt in stmts {
+        match stmt {
+            Statement::ExpressionStatement(es) => collect_dynamic_imports_expr(&es.expression, base_dir, paths),
+            Statement::VariableDeclaration(vd) => {
+                for decl in &vd.declarations {
+                    if let Some(init) = &decl.init {
+                        collect_dynamic_imports_expr(init, base_dir, paths);
+                    }
+                }
+            }
+            Statement::ReturnStatement(r) => {
+                if let Some(arg) = &r.argument {
+                    collect_dynamic_imports_expr(arg, base_dir, paths);
+                }
+            }
+            Statement::BlockStatement(b) => collect_dynamic_imports_stmts(&b.body, base_dir, paths),
+            Statement::IfStatement(i) => {
+                collect_dynamic_imports_stmts(std::slice::from_ref(&i.consequent), base_dir, paths);
+                if let Some(alt) = &i.alternate {
+                    collect_dynamic_imports_stmts(std::slice::from_ref(alt), base_dir, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_dynamic_imports_expr(
+    expr: &oxc_ast::ast::Expression<'_>,
+    base_dir: &std::path::Path,
+    paths: &mut Vec<std::path::PathBuf>,
+) {
+    use oxc_ast::ast::Expression;
+    match expr {
+        Expression::ImportExpression(import_expr) => {
+            if let Expression::StringLiteral(s) = &import_expr.source {
+                if let Some(p) = resolve_local_import(s.value.as_str(), base_dir) {
+                    paths.push(p);
+                }
+            }
+        }
+        Expression::AwaitExpression(a) => collect_dynamic_imports_expr(&a.argument, base_dir, paths),
+        Expression::CallExpression(c) => {
+            collect_dynamic_imports_expr(&c.callee, base_dir, paths);
+            for arg in &c.arguments {
+                if let Some(e) = arg.as_expression() {
+                    collect_dynamic_imports_expr(e, base_dir, paths);
+                }
+            }
+        }
+        Expression::AssignmentExpression(a) => collect_dynamic_imports_expr(&a.right, base_dir, paths),
+        _ => {}
+    }
 }
 
 /// Recursively load and lower a local import file and all its transitive dependencies.
@@ -2098,6 +2164,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_weakset_delete",             &[i64_type, i64_type], &[i64_type]);
 
         // Reflect metadata API
+        add_func("ts_reflect_metadata_decorator", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_apply_decorators",           &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_reflect_define_metadata",    &[i64_type, i64_type, i64_type, i64_type], &[]);
         add_func("ts_reflect_get_metadata",       &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_reflect_get_own_metadata",   &[i64_type, i64_type, i64_type], &[i64_type]);
@@ -2555,6 +2623,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
             let mut methods: HashMap<String, String> = HashMap::new();
             let mut method_arity: HashMap<String, usize> = HashMap::new();
+            let mut method_has_rest: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut statics: HashMap<String, String> = HashMap::new();
             let mut getters: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut setters: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2605,9 +2674,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     (MethodDefinitionKind::Method, false) => {
                         let mangled = format!("__class_{}_{}", class_name, name);
                         // arity = 1 (self) + positional params + (1 if rest param)
-                        let rest = if method.value.params.rest.is_some() { 1 } else { 0 };
-                        let arity = 1 + method.value.params.items.len() + rest;
+                        let has_rest = method.value.params.rest.is_some();
+                        let arity = 1 + method.value.params.items.len() + if has_rest { 1 } else { 0 };
                         method_arity.insert(name.clone(), arity);
+                        if has_rest { method_has_rest.insert(name.clone()); }
                         methods.insert(name, mangled);
                     }
                     _ => {}
@@ -2636,6 +2706,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 constructor_arity,
                 methods,
                 method_arity,
+                method_has_rest,
                 statics,
                 getters,
                 setters,
@@ -2656,6 +2727,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                     for (n, a) in &parent_sig.method_arity {
                         sig.method_arity.entry(n.clone()).or_insert(*a);
+                    }
+                    for n in &parent_sig.method_has_rest {
+                        sig.method_has_rest.insert(n.clone());
                     }
                     for n in &parent_sig.getters {
                         if !sig.getters.contains(n) { sig.getters.insert(n.clone()); }

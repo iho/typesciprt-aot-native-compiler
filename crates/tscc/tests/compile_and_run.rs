@@ -164,6 +164,23 @@ fn npm_esm_package() {
     assert!(out.contains("PI: 3.14159"), "got: {out:?}");
 }
 
+// ── Reflect.metadata / __spreadArray / dynamic import ────────────────────────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn reflect_metadata_and_decorators() {
+    let root = repo_root();
+    let out = compile_and_capture(
+        &root.join("examples/test_reflect_dynamic.ts"),
+        &root.join("target/test-reflect-dynamic"),
+    );
+    assert!(out.contains("injectable: true"), "got: {out:?}");
+    assert!(out.contains("column type: varchar"), "got: {out:?}");
+    assert!(out.contains("email design:type: string"), "got: {out:?}");
+    assert!(out.contains("spread: 1,2,3,4,5,6"), "got: {out:?}");
+    assert!(out.contains("reflect/dynamic tests done"), "got: {out:?}");
+}
+
 // ── v0.1 – arithmetic & variables ────────────────────────────────────────────
 
 #[test]

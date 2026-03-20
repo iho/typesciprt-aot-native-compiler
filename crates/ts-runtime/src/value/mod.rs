@@ -355,6 +355,7 @@ pub use reflect::{
     ts_reflect_has_metadata, ts_reflect_has_own_metadata,
     ts_reflect_get_metadata_keys, ts_reflect_get_own_metadata_keys,
     ts_reflect_delete_metadata,
+    ts_reflect_metadata_decorator, ts_apply_decorators,
 };
 pub use container::{
     ts_container_get, ts_container_set, ts_container_add,
