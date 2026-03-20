@@ -99,8 +99,20 @@ fn load_import_static(path: &std::path::Path) -> Option<oxc_ast::ast::Program<'s
 fn find_npm_shim(package_name: &str, from_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dir = from_dir.to_path_buf();
     loop {
-        let shim = dir.join("shims").join(format!("{}.ts", package_name));
+        let shims = dir.join("shims");
+        // Direct match: shims/package-name.ts
+        let shim = shims.join(format!("{}.ts", package_name));
         if shim.exists() { return Some(shim); }
+        // Scoped packages: @scope/name → shims/@scope/name.ts
+        // Also try shims/scope__name.ts as alternative flat layout
+        if package_name.starts_with('@') {
+            let flat = package_name.trim_start_matches('@').replace('/', "__");
+            let flat_shim = shims.join(format!("{}.ts", flat));
+            if flat_shim.exists() { return Some(flat_shim); }
+        }
+        // Directory-style: shims/package-name/index.ts
+        let index_shim = shims.join(package_name).join("index.ts");
+        if index_shim.exists() { return Some(index_shim); }
         if !dir.pop() { break; }
     }
     None
@@ -1308,6 +1320,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_process_argv",        &[], &[i64_type]);
         add_func("ts_process_env",         &[], &[i64_type]);
         add_func("ts_process_pid",         &[], &[i64_type]);
+        add_func("ts_import_meta_new",     &[], &[i64_type]);
 
         // Additional builtins
         add_func("ts_promise_reject",       &[i64_type], &[i64_type]);
@@ -1608,6 +1621,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if let Some(Declaration::VariableDeclaration(vd)) = &export.declaration {
                         self.collect_const_sigs(vd, i64_type);
                     }
+                    // Exported decorated classes are stored as module globals at runtime.
+                    if let Some(Declaration::ClassDeclaration(class)) = &export.declaration {
+                        if !class.decorators.is_empty() {
+                            if let Some(id) = &class.id {
+                                self.module_global_names.insert(id.name.to_string());
+                            }
+                        }
+                    }
                 }
                 Statement::ExportDefaultDeclaration(export) => {
                     use oxc_ast::ast::ExportDefaultDeclarationKind;
@@ -1638,6 +1659,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 // Module-level `const name = identifier` — track as alias.
                 Statement::VariableDeclaration(vd) => {
                     self.collect_const_sigs(vd, i64_type);
+                }
+                // Decorated class declarations are stored as module globals at runtime
+                // so that top-level function declarations can access them via ts_get_module_global.
+                Statement::ClassDeclaration(class) => {
+                    if !class.decorators.is_empty() {
+                        if let Some(id) = &class.id {
+                            self.module_global_names.insert(id.name.to_string());
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1955,73 +1985,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     scope.insert(pname.clone(), param_val);
                     param_names.insert(pname);
                 }
-                BindingPattern::ObjectPattern(obj_pat) => {
-                    // function foo({ x, y: z, a = 1 }: ...) — destructure the param
+                BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => {
+                    // function foo({ x, y: { z } }: ...) or foo([a, [b, c]]: ...) — recursive destructure
                     let param_i64 = self.ensure_i64(param_val, current_block)?;
-                    for prop in &obj_pat.properties {
-                        let key_str = match prop.key.static_name() {
-                            Some(n) => n.into_owned(),
-                            None => continue,
-                        };
-                        let (var_name, default_init): (String, Option<&_>) = match &prop.value {
-                            BindingPattern::BindingIdentifier(id) => (id.name.to_string(), None),
-                            BindingPattern::AssignmentPattern(ap) => {
-                                if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                                    (id.name.to_string(), Some(&ap.right))
-                                } else { continue }
-                            }
-                            _ => continue,
-                        };
-                        let key_ptr = self.get_string_ptr(&key_str, current_block)?;
-                        let field_val: Value<'_, '_> = current_block.append_operation(func::call(
-                            self.ctx,
-                            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
-                            &[param_i64, key_ptr],
-                            &[i64_type], self.loc,
-                        )).result(0)?.into();
-                        let final_val = if let Some(default_expr) = default_init {
-                            let is_undef: Value<'_, '_> = current_block.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
-                                &[field_val], &[i32_type], self.loc,
-                            )).result(0)?.into();
-                            let is_undef_i1 = self.ensure_i1(is_undef, current_block)?;
-                            let merge_blk = region.append_block(Block::new(&[(i64_type, self.loc)]));
-                            let def_blk = region.append_block(Block::new(&[]));
-                            current_block.append_operation(cf::cond_br(
-                                self.ctx, is_undef_i1, &def_blk, &merge_blk, &[], &[field_val], self.loc,
-                            ));
-                            let mut def_scope = scope.clone();
-                            let (dv_opt, post_def) = self.lower_expression(default_expr, def_blk, &region, &mut def_scope)?;
-                            let dv = dv_opt.ok_or_else(|| anyhow::anyhow!("obj param default: no value"))?;
-                            let dv_i64 = self.ensure_i64(dv, post_def)?;
-                            post_def.append_operation(cf::br(&merge_blk, &[dv_i64], self.loc));
-                            current_block = merge_blk;
-                            merge_blk.argument(0)?.into()
-                        } else {
-                            field_val
-                        };
-                        scope.insert(var_name.clone(), final_val);
-                        param_names.insert(var_name);
-                    }
-                }
-                BindingPattern::ArrayPattern(arr_pat) => {
-                    // function foo([a, b]: ...) — destructure the array param
-                    let param_i64 = self.ensure_i64(param_val, current_block)?;
-                    for (idx, elem_opt) in arr_pat.elements.iter().enumerate() {
-                        let Some(elem) = elem_opt else { continue };
-                        if let BindingPattern::BindingIdentifier(id) = elem {
-                            let ename = id.name.to_string();
-                            let idx_val: Value<'_, '_> = current_block.append_operation(arith::constant(
-                                self.ctx,
-                                IntegerAttribute::new(i32_type, idx as i64).into(), self.loc,
-                            )).result(0)?.into();
-                            let elem_val: Value<'_, '_> = current_block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
-                                &[param_i64, idx_val], &[i64_type], self.loc,
-                            )).result(0)?.into();
-                            scope.insert(ename.clone(), elem_val);
-                            param_names.insert(ename);
+                    let scope_before: std::collections::HashSet<String> = scope.keys().cloned().collect();
+                    current_block = self.lower_bind_pattern(&param.pattern, param_i64, current_block, &region, &mut scope)?;
+                    // Track newly bound names as param names.
+                    for name in scope.keys() {
+                        if !scope_before.contains(name) {
+                            param_names.insert(name.clone());
                         }
                     }
                 }
@@ -2333,6 +2305,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let mut borrowed_param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
+        let mut current_block = entry;
         for (i, param) in params.iter().enumerate() {
             let arg_val: Value<'_, '_> = entry.argument(i)?.into();
             match &param.pattern {
@@ -2341,36 +2314,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     borrowed_param_names.insert(name.clone());
                     scope.insert(name, arg_val);
                 }
-                BindingPattern::ArrayPattern(arr_pat) => {
-                    let arg_i64 = self.ensure_i64(arg_val, entry)?;
-                    for (elem_idx, elem) in arr_pat.elements.iter().enumerate() {
-                        if let Some(BindingPattern::BindingIdentifier(id)) = elem {
-                            let idx_c: Value<'_, '_> = entry.append_operation(arith::constant(
-                                self.ctx, IntegerAttribute::new(self.i32_type(), elem_idx as i64).into(), self.loc,
-                            )).result(0)?.into();
-                            let elem_val: Value<'_, '_> = entry.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
-                                &[arg_i64, idx_c], &[i64_type], self.loc,
-                            )).result(0)?.into();
-                            scope.insert(id.name.to_string(), elem_val);
-                        }
-                    }
-                }
-                BindingPattern::ObjectPattern(obj_pat) => {
-                    let arg_i64 = self.ensure_i64(arg_val, entry)?;
-                    for prop in &obj_pat.properties {
-                        if let (oxc_ast::ast::PropertyKey::StaticIdentifier(key_id),
-                                BindingPattern::BindingIdentifier(val_id)) =
-                            (&prop.key, &prop.value)
-                        {
-                            let key_ptr = self.get_string_ptr(key_id.name.as_str(), entry)?;
-                            let prop_val: Value<'_, '_> = entry.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
-                                &[arg_i64, key_ptr], &[i64_type], self.loc,
-                            )).result(0)?.into();
-                            scope.insert(val_id.name.to_string(), prop_val);
-                        }
-                    }
+                BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
+                    // Recursive destructuring in function/closure params.
+                    let arg_i64 = self.ensure_i64(arg_val, current_block)?;
+                    current_block = self.lower_bind_pattern(&param.pattern, arg_i64, current_block, &region, &mut scope)?;
                 }
                 _ => {}
             }
@@ -2381,8 +2328,6 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             borrowed_param_names.insert(rest_str.clone());
             scope.insert(rest_str, entry.argument(rest_idx)?.into());
         }
-
-        let mut current_block = entry;
 
         // Inject module-level global variables into scope via ts_get_module_global.
         // This allows module-level functions to access module-level non-function consts.

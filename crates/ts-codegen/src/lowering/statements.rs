@@ -343,9 +343,97 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     None => return Ok((None, block)),
                 };
                 let (block, ctor_val) = self.emit_class_constructor_val(&class_name, block)?;
+
+                // emitDecoratorMetadata: collect constructor parameter type names,
+                // build a TsArray, and call ts_reflect_define_metadata("design:paramtypes", arr, ctor).
+                // NestJS requires this to resolve DI dependencies from constructor type annotations.
+                let ctor_param_type_names: Vec<Option<String>> = {
+                    use oxc_ast::ast::{ClassElement, MethodDefinitionKind, TSType, TSTypeName};
+                    let mut names = vec![];
+                    for elem in &class.body.body {
+                        if let ClassElement::MethodDefinition(m) = elem {
+                            if m.kind == MethodDefinitionKind::Constructor {
+                                for param in &m.value.params.items {
+                                    let name = param.type_annotation.as_ref()
+                                        .and_then(|ta| {
+                                            if let TSType::TSTypeReference(tref) = &ta.type_annotation {
+                                                if let TSTypeName::IdentifierReference(id) = &tref.type_name {
+                                                    Some(id.name.to_string())
+                                                } else { None }
+                                            } else { None }
+                                        });
+                                    names.push(name);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    names
+                };
+
                 // Apply class decorators in reverse order (bottom-to-top).
                 let mut cur_val = ctor_val;
                 let mut cur_block = block;
+
+                // Emit design:paramtypes metadata if there are constructor parameter types.
+                // This mirrors TypeScript's emitDecoratorMetadata compiler option.
+                if !ctor_param_type_names.is_empty() {
+                    let i64t = self.i64_type();
+                    let i32t = self.i32_type();
+                    // Build TsArray of type values (looked up from scope).
+                    // Use capacity=0 so ts_arr_new creates an empty array; ts_arr_push
+                    // appends at indices 0,1,... (capacity pre-fills with UNDEFINED which
+                    // would shift pushed items to wrong indices).
+                    let arr_val: Value<'c, '_> = cur_block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                        &[cur_block.append_operation(arith::constant(
+                            self.ctx, IntegerAttribute::new(i32t, 0).into(), self.loc,
+                        )).result(0)?.into()],
+                        &[i64t], self.loc,
+                    )).result(0)?.into();
+                    for type_name in &ctor_param_type_names {
+                        let type_val: Value<'c, '_> = if let Some(name) = type_name {
+                            if let Some(&v) = scope.get(name.as_str()) {
+                                self.ensure_i64(v, cur_block)?
+                            } else {
+                                cur_block.append_operation(arith::constant(
+                                    self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                                )).result(0)?.into()
+                            }
+                        } else {
+                            cur_block.append_operation(arith::constant(
+                                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                            )).result(0)?.into()
+                        };
+                        cur_block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                            &[arr_val, type_val], &[], self.loc,
+                        ));
+                    }
+                    // Call ts_reflect_define_metadata("design:paramtypes", arr, ctor)
+                    let key_ptr = self.get_string_ptr("design:paramtypes", cur_block)?;
+                    let key_str: Value<'c, '_> = cur_block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_string_new"),
+                        &[key_ptr], &[i64t], self.loc,
+                    )).result(0)?.into();
+                    let ctor_i64 = self.ensure_i64(cur_val, cur_block)?;
+                    let undef_i64: Value<'c, '_> = cur_block.append_operation(arith::constant(
+                        self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                    )).result(0)?.into();
+                    cur_block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_define_metadata"),
+                        &[key_str, arr_val, ctor_i64, undef_i64], &[], self.loc,
+                    ));
+                    cur_block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[key_str], &[], self.loc,
+                    ));
+                    cur_block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[arr_val], &[], self.loc,
+                    ));
+                }
+
                 for dec in class.decorators.iter().rev() {
                     let (dec_opt, nb) = self.lower_expression(&dec.expression, cur_block, region, scope)?;
                     cur_block = nb;
@@ -391,7 +479,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                 }
                 // Store the (possibly replaced) class constructor in scope.
-                scope.insert(class_name, cur_val);
+                scope.insert(class_name.clone(), cur_val);
+                // Also store in the runtime module global map so top-level function declarations
+                // (e.g. bootstrap()) can access the constructor via ts_get_module_global.
+                if self.module_global_names.contains(&class_name) {
+                    let i64t = self.i64_type();
+                    let cur_i64 = self.ensure_i64(cur_val, cur_block)?;
+                    let key_ptr = self.get_string_ptr(&class_name, cur_block)?;
+                    cur_block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_set_module_global"),
+                        &[key_ptr, cur_i64], &[], self.loc,
+                    ));
+                }
                 Ok((None, cur_block))
             }
             Statement::TSInterfaceDeclaration(_)
@@ -445,6 +544,144 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             _ => {
                 tracing::debug!("skipping unimplemented statement kind");
                 Ok((None, block))
+            }
+        }
+    }
+
+    // ── Recursive binding pattern helper ─────────────────────────────────
+
+    /// Bind `source_val` to `pat`, inserting variables into `scope`.
+    /// Handles arbitrarily nested ObjectPattern / ArrayPattern / AssignmentPattern.
+    /// Does NOT release `source_val` — the caller is responsible for ARC.
+    pub(super) fn lower_bind_pattern<'b>(
+        &mut self,
+        pat: &BindingPattern<'_>,
+        source_val: Value<'c, 'b>,
+        mut block: BlockRef<'c, 'b>,
+        region: &'b Region<'c>,
+        scope: &mut HashMap<String, Value<'c, 'b>>,
+    ) -> Result<BlockRef<'c, 'b>> {
+        match pat {
+            BindingPattern::BindingIdentifier(id) => {
+                scope.insert(id.name.to_string(), source_val);
+                Ok(block)
+            }
+            BindingPattern::AssignmentPattern(ap) => {
+                // Apply default value when source_val is undefined.
+                let i64t = self.i64_type();
+                let i32t = self.i32_type();
+                let is_undef: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
+                    &[source_val], &[i32t], self.loc,
+                )).result(0)?.into();
+                let is_undef_i1 = self.ensure_i1(is_undef, block)?;
+                let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
+                let default_block = region.append_block(Block::new(&[]));
+                block.append_operation(cf::cond_br(
+                    self.ctx, is_undef_i1, &default_block, &merge_block, &[], &[source_val], self.loc,
+                ));
+                let mut def_scope = scope.clone();
+                let (def_opt, post_def) = self.lower_expression(&ap.right, default_block, region, &mut def_scope)?;
+                let def_val = def_opt.ok_or_else(|| anyhow::anyhow!("nested destructuring default: no value"))?;
+                let def_i64 = self.ensure_i64(def_val, post_def)?;
+                post_def.append_operation(cf::br(&merge_block, &[def_i64], self.loc));
+                block = merge_block;
+                let chosen: Value<'c, 'b> = merge_block.argument(0)?.into();
+                self.lower_bind_pattern(&ap.left, chosen, block, region, scope)
+            }
+            BindingPattern::ObjectPattern(obj_pat) => {
+                let obj_i64 = self.ensure_i64(source_val, block)?;
+                let mut extracted_keys: Vec<String> = Vec::new();
+                for prop in &obj_pat.properties {
+                    let key_str = match prop.key.static_name() {
+                        Some(n) => n.into_owned(),
+                        None => {
+                            tracing::debug!("skipping computed key in nested destructuring");
+                            continue;
+                        }
+                    };
+                    let key_ptr = self.get_string_ptr(&key_str, block)?;
+                    let field_val: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                        &[obj_i64, key_ptr], &[self.i64_type()], self.loc,
+                    )).result(0)?.into();
+                    extracted_keys.push(key_str);
+                    block = self.lower_bind_pattern(&prop.value, field_val, block, region, scope)?;
+                }
+                if let Some(rest_el) = &obj_pat.rest {
+                    if let BindingPattern::BindingIdentifier(rest_id) = &rest_el.argument {
+                        let rest_name = rest_id.name.to_string();
+                        let n_keys = extracted_keys.len() as i32;
+                        let i32t = self.i32_type();
+                        let n_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                            self.ctx, IntegerAttribute::new(i32t, n_keys as i64).into(), self.loc,
+                        )).result(0)?.into();
+                        let keys_arr: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                            &[n_val], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        for (idx, ks) in extracted_keys.iter().enumerate() {
+                            let kp = self.get_string_ptr(ks, block)?;
+                            let kv: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_string_new"),
+                                &[kp], &[self.i64_type()], self.loc,
+                            )).result(0)?.into();
+                            let iv: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx, IntegerAttribute::new(i32t, idx as i64).into(), self.loc,
+                            )).result(0)?.into();
+                            block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
+                                &[keys_arr, iv, kv], &[], self.loc,
+                            ));
+                            block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[kv], &[], self.loc,
+                            ));
+                        }
+                        let rest_val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_rest"),
+                            &[obj_i64, keys_arr], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[keys_arr], &[], self.loc,
+                        ));
+                        scope.insert(rest_name, rest_val);
+                    }
+                }
+                Ok(block)
+            }
+            BindingPattern::ArrayPattern(arr_pat) => {
+                let arr_i64 = self.ensure_i64(source_val, block)?;
+                let mut extracted_count: i64 = 0;
+                for (i, elem) in arr_pat.elements.iter().enumerate() {
+                    let Some(elem_pat) = elem else {
+                        extracted_count = i as i64 + 1;
+                        continue;
+                    };
+                    let idx_val = self.lower_numeric_literal(i as i64, block)?;
+                    let elem_val: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
+                        &[arr_i64, idx_val], &[self.i64_type()], self.loc,
+                    )).result(0)?.into();
+                    extracted_count = i as i64 + 1;
+                    block = self.lower_bind_pattern(elem_pat, elem_val, block, region, scope)?;
+                }
+                if let Some(rest_el) = &arr_pat.rest {
+                    if let BindingPattern::BindingIdentifier(rest_id) = &rest_el.argument {
+                        let rest_name = rest_id.name.to_string();
+                        let i32t = self.i32_type();
+                        let start_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                            self.ctx, IntegerAttribute::new(i32t, extracted_count).into(), self.loc,
+                        )).result(0)?.into();
+                        let rest_val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_rest"),
+                            &[arr_i64, start_val], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        scope.insert(rest_name, rest_val);
+                    }
+                }
+                Ok(block)
             }
         }
     }
@@ -518,177 +755,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                 }
 
-                BindingPattern::ObjectPattern(obj_pat) => {
-                    // const { a, b, ...rest } = expr  →  evaluate expr once, then ts_obj_get each key
+                BindingPattern::ObjectPattern(_) => {
+                    // const { a, b: { c }, ...rest } = expr — delegate to recursive helper.
                     let Some(init) = &declarator.init else { continue };
                     let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
                     block = nb;
                     let Some(obj_val) = val_opt else { continue };
                     let obj_i64 = self.ensure_i64(obj_val, block)?;
-
-                    let mut extracted_keys: Vec<String> = Vec::new();
-                    for prop in &obj_pat.properties {
-                        // Determine the property key string (only static keys for now).
-                        let key_str = match prop.key.static_name() {
-                            Some(n) => n.into_owned(),
-                            None => {
-                                tracing::debug!("skipping computed destructuring key");
-                                continue;
-                            }
-                        };
-                        // Handle nested object destructuring: { x: { y } }
-                        if let BindingPattern::ObjectPattern(nested_obj) = &prop.value {
-                            let key_ptr = self.get_string_ptr(&key_str, block)?;
-                            let nested_val: Value<'c, 'b> = block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
-                                &[obj_i64, key_ptr],
-                                &[self.i64_type()],
-                                self.loc,
-                            )).result(0)?.into();
-                            extracted_keys.push(key_str);
-                            for nested_prop in &nested_obj.properties {
-                                let nested_key = match nested_prop.key.static_name() {
-                                    Some(n) => n.into_owned(),
-                                    None => continue,
-                                };
-                                let nkey_ptr = self.get_string_ptr(&nested_key, block)?;
-                                let nfield: Value<'c, 'b> = block.append_operation(func::call(
-                                    self.ctx,
-                                    FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
-                                    &[nested_val, nkey_ptr],
-                                    &[self.i64_type()],
-                                    self.loc,
-                                )).result(0)?.into();
-                                let nvar = match &nested_prop.value {
-                                    BindingPattern::BindingIdentifier(id) => id.name.to_string(),
-                                    BindingPattern::AssignmentPattern(ap) => {
-                                        if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                                            id.name.to_string()
-                                        } else { continue }
-                                    }
-                                    _ => continue,
-                                };
-                                scope.insert(nvar, nfield);
-                            }
-                            continue;
-                        }
-
-                        // Determine binding name and optional default initializer.
-                        let (var_name, default_init) = match &prop.value {
-                            BindingPattern::BindingIdentifier(id) => (id.name.to_string(), None),
-                            BindingPattern::AssignmentPattern(ap) => {
-                                if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                                    (id.name.to_string(), Some(&ap.right))
-                                } else {
-                                    tracing::debug!("skipping nested destructuring pattern");
-                                    continue;
-                                }
-                            }
-                            _ => {
-                                tracing::debug!("skipping nested destructuring pattern");
-                                continue;
-                            }
-                        };
-                        let key_ptr = self.get_string_ptr(&key_str, block)?;
-                        let field_val: Value<'c, 'b> = block.append_operation(func::call(
-                            self.ctx,
-                            FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
-                            &[obj_i64, key_ptr],
-                            &[self.i64_type()],
-                            self.loc,
-                        )).result(0)?.into();
-                        // Handle default value: if field is undefined, use the initializer.
-                        let final_val = if let Some(default_expr) = default_init {
-                            let i64t = self.i64_type();
-                            let i32t = self.i32_type();
-                            let is_undef: Value<'c, 'b> = block.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
-                                &[field_val], &[i32t], self.loc,
-                            )).result(0)?.into();
-                            let is_undef_i1 = self.ensure_i1(is_undef, block)?;
-                            let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
-                            let default_block = region.append_block(Block::new(&[]));
-                            block.append_operation(cf::cond_br(
-                                self.ctx, is_undef_i1, &default_block, &merge_block, &[], &[field_val], self.loc,
-                            ));
-                            let mut def_scope = scope.clone();
-                            let (def_opt, post_def) = self.lower_expression(default_expr, default_block, region, &mut def_scope)?;
-                            let def_val = def_opt.ok_or_else(|| anyhow::anyhow!("destructuring default: no value"))?;
-                            let def_i64 = self.ensure_i64(def_val, post_def)?;
-                            post_def.append_operation(cf::br(&merge_block, &[def_i64], self.loc));
-                            block = merge_block;
-                            merge_block.argument(0)?.into()
-                        } else {
-                            field_val
-                        };
-                        scope.insert(var_name, final_val);
-                        extracted_keys.push(key_str);
-                    }
-
-                    // Handle rest element: `const { a, ...rest } = obj`
-                    if let Some(rest_el) = &obj_pat.rest {
-                        if let BindingPattern::BindingIdentifier(rest_id) = &rest_el.argument {
-                            let rest_name = rest_id.name.to_string();
-                            // Build a TsArray of excluded key strings.
-                            let n_keys = extracted_keys.len() as i32;
-                            let i32_type = self.i32_type();
-                            let n_val: Value<'c, 'b> = block.append_operation(arith::constant(
-                                self.ctx,
-                                IntegerAttribute::new(i32_type, n_keys as i64).into(),
-                                self.loc,
-                            )).result(0)?.into();
-                            let keys_arr: Value<'c, 'b> = block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
-                                &[n_val],
-                                &[self.i64_type()],
-                                self.loc,
-                            )).result(0)?.into();
-                            for (idx, key_str) in extracted_keys.iter().enumerate() {
-                                let key_ptr = self.get_string_ptr(key_str, block)?;
-                                let key_val: Value<'c, 'b> = block.append_operation(func::call(
-                                    self.ctx,
-                                    FlatSymbolRefAttribute::new(self.ctx, "ts_string_new"),
-                                    &[key_ptr],
-                                    &[self.i64_type()],
-                                    self.loc,
-                                )).result(0)?.into();
-                                let idx_val: Value<'c, 'b> = block.append_operation(arith::constant(
-                                    self.ctx,
-                                    IntegerAttribute::new(i32_type, idx as i64).into(),
-                                    self.loc,
-                                )).result(0)?.into();
-                                block.append_operation(func::call(
-                                    self.ctx,
-                                    FlatSymbolRefAttribute::new(self.ctx, "ts_arr_set"),
-                                    &[keys_arr, idx_val, key_val],
-                                    &[],
-                                    self.loc,
-                                ));
-                                block.append_operation(func::call(
-                                    self.ctx,
-                                    FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                                    &[key_val], &[], self.loc,
-                                ));
-                            }
-                            let rest_val: Value<'c, 'b> = block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_obj_rest"),
-                                &[obj_i64, keys_arr],
-                                &[self.i64_type()],
-                                self.loc,
-                            )).result(0)?.into();
-                            block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                                &[keys_arr], &[], self.loc,
-                            ));
-                            scope.insert(rest_name, rest_val);
-                        }
-                    }
-
-                    // ARC: release the init expression value now that we have extracted all fields.
+                    block = self.lower_bind_pattern(&declarator.id, obj_i64, block, region, scope)?;
+                    // ARC: release the init expression value now that all fields are extracted.
                     block.append_operation(func::call(
                         self.ctx,
                         FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
@@ -696,94 +771,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     ));
                 }
 
-                BindingPattern::ArrayPattern(arr_pat) => {
-                    // const [x, y, ...rest] = expr  →  evaluate expr once, then ts_arr_get each index
+                BindingPattern::ArrayPattern(_) => {
+                    // const [x, y, ...rest] = expr — delegate to recursive helper.
                     let Some(init) = &declarator.init else { continue };
                     let (val_opt, nb) = self.lower_expression(init, block, region, scope)?;
                     block = nb;
                     let Some(arr_val) = val_opt else { continue };
                     let arr_i64 = self.ensure_i64(arr_val, block)?;
-
-                    let mut extracted_count: i64 = 0;
-                    for (i, elem) in arr_pat.elements.iter().enumerate() {
-                        let Some(pat) = elem else {
-                            extracted_count = i as i64 + 1;
-                            continue;
-                        }; // skip holes
-                        let (var_name, default_init) = match pat {
-                            BindingPattern::BindingIdentifier(id) => (id.name.to_string(), None),
-                            BindingPattern::AssignmentPattern(ap) => {
-                                if let BindingPattern::BindingIdentifier(id) = &ap.left {
-                                    (id.name.to_string(), Some(&ap.right))
-                                } else {
-                                    tracing::debug!("skipping nested array destructuring in default");
-                                    extracted_count = i as i64 + 1;
-                                    continue;
-                                }
-                            }
-                            _ => {
-                                tracing::debug!("skipping nested array destructuring");
-                                extracted_count = i as i64 + 1;
-                                continue;
-                            }
-                        };
-                        let idx_val = self.lower_numeric_literal(i as i64, block)?;
-                        let elem_val: Value<'c, 'b> = block.append_operation(func::call(
-                            self.ctx,
-                            FlatSymbolRefAttribute::new(self.ctx, "ts_arr_get"),
-                            &[arr_i64, idx_val],
-                            &[self.i64_type()],
-                            self.loc,
-                        )).result(0)?.into();
-                        // Apply default if present.
-                        let final_val = if let Some(default_expr) = default_init {
-                            let i64t = self.i64_type();
-                            let i32t = self.i32_type();
-                            let is_undef: Value<'c, 'b> = block.append_operation(func::call(
-                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_is_undefined"),
-                                &[elem_val], &[i32t], self.loc,
-                            )).result(0)?.into();
-                            let is_undef_i1 = self.ensure_i1(is_undef, block)?;
-                            let merge_block = region.append_block(Block::new(&[(i64t, self.loc)]));
-                            let default_block = region.append_block(Block::new(&[]));
-                            block.append_operation(cf::cond_br(
-                                self.ctx, is_undef_i1, &default_block, &merge_block, &[], &[elem_val], self.loc,
-                            ));
-                            let mut def_scope = scope.clone();
-                            let (def_opt, post_def) = self.lower_expression(default_expr, default_block, region, &mut def_scope)?;
-                            let def_val = def_opt.ok_or_else(|| anyhow::anyhow!("array destructuring default: no value"))?;
-                            let def_i64 = self.ensure_i64(def_val, post_def)?;
-                            post_def.append_operation(cf::br(&merge_block, &[def_i64], self.loc));
-                            block = merge_block;
-                            merge_block.argument(0)?.into()
-                        } else {
-                            elem_val
-                        };
-                        scope.insert(var_name, final_val);
-                        extracted_count = i as i64 + 1;
-                    }
-
-                    // Handle rest element: `const [a, b, ...rest] = arr`
-                    if let Some(rest_el) = &arr_pat.rest {
-                        if let BindingPattern::BindingIdentifier(rest_id) = &rest_el.argument {
-                            let rest_name = rest_id.name.to_string();
-                            let i32_type = self.i32_type();
-                            let start_val: Value<'c, 'b> = block.append_operation(arith::constant(
-                                self.ctx,
-                                IntegerAttribute::new(i32_type, extracted_count).into(),
-                                self.loc,
-                            )).result(0)?.into();
-                            let rest_val: Value<'c, 'b> = block.append_operation(func::call(
-                                self.ctx,
-                                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_rest"),
-                                &[arr_i64, start_val],
-                                &[self.i64_type()],
-                                self.loc,
-                            )).result(0)?.into();
-                            scope.insert(rest_name, rest_val);
-                        }
-                    }
-
+                    block = self.lower_bind_pattern(&declarator.id, arr_i64, block, region, scope)?;
                     // ARC: release the init expression value.
                     block.append_operation(func::call(
                         self.ctx,

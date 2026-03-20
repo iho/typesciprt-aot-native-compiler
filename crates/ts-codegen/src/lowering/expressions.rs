@@ -544,6 +544,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                 }
             }
+            Expression::MetaProperty(meta) => {
+                // import.meta — return an object with url/dirname/filename/env.
+                // new.target — return undefined (not supported in this compiler).
+                if meta.meta.name.as_str() == "import" && meta.property.name.as_str() == "meta" {
+                    let val: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_import_meta_new"),
+                        &[], &[self.i64_type()], self.loc,
+                    )).result(0)?.into();
+                    Ok((Some(val), block))
+                } else {
+                    // new.target or unknown — return undefined
+                    let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                        self.ctx,
+                        IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                        self.loc,
+                    )).result(0)?.into();
+                    Ok((Some(undef), block))
+                }
+            }
             Expression::YieldExpression(y) => {
                 // `yield expr` in a generator function:
                 // Push the value to the __generator_yields array and return undefined.
@@ -3921,7 +3941,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     1 => "ts_func_call1",
                     2 => "ts_func_call2",
                     3 => "ts_func_call3",
-                    _ => bail!("dynamic new: too many constructor args (max 3 supported)"),
+                    4 => "ts_func_call4",
+                    _ => bail!("dynamic new: too many constructor args (max 4 supported)"),
                 };
                 let mut call_args = vec![fn_val_i64];
                 call_args.extend_from_slice(&args);

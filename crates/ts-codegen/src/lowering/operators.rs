@@ -713,13 +713,53 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     return Ok((Some(old_i64), block));
                 }
             }
+            oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                // arr[i]++  /  obj[key]++  /  arr[i]--
+                let (obj_opt, nb) = self.lower_expression(&m.object, block, _region, scope)?;
+                block = nb;
+                let obj_val = obj_opt.ok_or_else(|| anyhow::anyhow!("update computed member: object produced no value"))?;
+                let obj_i64 = self.ensure_i64(obj_val, block)?;
+                let (key_opt, nb) = self.lower_expression(&m.expression, block, _region, scope)?;
+                block = nb;
+                let key_val = key_opt.ok_or_else(|| anyhow::anyhow!("update computed member: key produced no value"))?;
+                let key_i64 = self.ensure_i64(key_val, block)?;
+                let i64t = self.i64_type();
+                // Read old value.
+                let old_i64: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_get_key"),
+                    &[obj_i64, key_i64], &[i64t], self.loc,
+                )).result(0)?.into();
+                // Compute new value.
+                let old_i32 = self.ensure_i32(old_i64, block)?;
+                let one = self.lower_numeric_literal(1, block)?;
+                let new_i32: Value<'c, 'b> = match update.operator {
+                    UpdateOperator::Increment => block.append_operation(arith::addi(old_i32, one, self.loc)).result(0)?.into(),
+                    UpdateOperator::Decrement => block.append_operation(arith::subi(old_i32, one, self.loc)).result(0)?.into(),
+                };
+                let new_i64 = self.ensure_i64(new_i32, block)?;
+                // Write back.
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set_val_key"),
+                    &[obj_i64, key_i64, new_i64], &[], self.loc,
+                ));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[key_i64], &[], self.loc));
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[obj_i64], &[], self.loc));
+                if update.prefix {
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[old_i64], &[], self.loc));
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"), &[new_i64], &[], self.loc));
+                    return Ok((Some(new_i64), block));
+                } else {
+                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[new_i64], &[], self.loc));
+                    return Ok((Some(old_i64), block));
+                }
+            }
             _ => {}
         }
 
         let id = match &update.argument {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id,
             _ => {
-                tracing::warn!("update expression: non-identifier target not yet supported (from JS-only package), returning undefined");
+                tracing::warn!("update expression: non-identifier target not yet supported, returning undefined");
                 let undef: Value<'c, 'b> = block.append_operation(arith::constant(
                     self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
                 )).result(0)?.into();
@@ -1777,20 +1817,45 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         use oxc_ast::ast::AssignmentOperator;
-        if operator != AssignmentOperator::Assign {
-            bail!("compound assignment to private fields is not supported");
-        }
         let field_key = format!("__priv_{}", member.field.name.as_str());
         let (obj_opt, nb) = self.lower_expression(&member.object, block, region, scope)?;
         block = nb;
         let obj = obj_opt.ok_or_else(|| anyhow::anyhow!("private field assignment: object produced no value"))?;
         let obj_i64 = self.ensure_i64(obj, block)?;
         let key_ptr = self.get_string_ptr(&field_key, block)?;
-        let val_i64 = self.ensure_i64(rhs, block)?;
+        let new_val: Value<'c, 'b> = if operator == AssignmentOperator::Assign {
+            self.ensure_i64(rhs, block)?
+        } else {
+            // Compound assignment: read current value, compute new value.
+            let i64t = self.i64_type();
+            let cur: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get"),
+                &[obj_i64, key_ptr], &[i64t], self.loc,
+            )).result(0)?.into();
+            let lhs_i32 = self.ensure_i32(cur, block)?;
+            let rhs_i32 = self.ensure_i32(rhs, block)?;
+            let res_i32: Value<'c, 'b> = match operator {
+                AssignmentOperator::Addition       => block.append_operation(arith::addi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Subtraction    => block.append_operation(arith::subi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Multiplication => block.append_operation(arith::muli(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Division       => block.append_operation(arith::divsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::Remainder      => block.append_operation(arith::remsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::BitwiseAnd     => block.append_operation(arith::andi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::BitwiseOR      => block.append_operation(arith::ori(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::BitwiseXOR     => block.append_operation(arith::xori(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::ShiftLeft      => block.append_operation(arith::shli(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::ShiftRight     => block.append_operation(arith::shrsi(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                AssignmentOperator::ShiftRightZeroFill => block.append_operation(arith::shrui(lhs_i32, rhs_i32, self.loc)).result(0)?.into(),
+                _ => bail!("unsupported compound assignment operator on private field"),
+            };
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[cur], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[self.ensure_i64(rhs, block)?], &[], self.loc));
+            self.ensure_i64(res_i32, block)?
+        };
         block.append_operation(func::call(
             self.ctx,
             FlatSymbolRefAttribute::new(self.ctx, "ts_obj_set"),
-            &[obj_i64, key_ptr, val_i64],
+            &[obj_i64, key_ptr, new_val],
             &[], self.loc,
         ));
         block.append_operation(func::call(
@@ -1798,7 +1863,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
             &[obj_i64], &[], self.loc,
         ));
-        Ok((Some(rhs), block))
+        Ok((Some(new_val), block))
     }
 
     /// Logical assignment to a static member: `obj.prop ??= rhs` / `obj.prop ||= rhs` / `obj.prop &&= rhs`

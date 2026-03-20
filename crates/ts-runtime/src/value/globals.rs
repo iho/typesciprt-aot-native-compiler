@@ -89,3 +89,47 @@ pub unsafe extern "C" fn ts_process_env() -> TsVal {
     obj
 }
 
+/// import.meta — returns an object with `url`, `dirname`, `filename`, and `env` properties.
+#[no_mangle]
+pub unsafe extern "C" fn ts_import_meta_new() -> TsVal {
+    let meta = ts_obj_new();
+    // Determine the executable path.
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("unknown"));
+    let exe_str = exe_path.to_string_lossy();
+    // url = "file://<exe_path>"
+    let url_s = format!("file://{}\0", exe_str);
+    let url_val = ts_string_new(url_s.as_ptr() as *const i8);
+    let url_key = b"url\0";
+    let url_key_str = ts_string_new(url_key.as_ptr() as *const i8);
+    ts_obj_set_val_key(meta, url_key_str, url_val);
+    ts_release_val(url_key_str);
+    ts_release_val(url_val);
+    // dirname = parent directory
+    let dir_s = exe_path.parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let dir_s = format!("{}\0", dir_s);
+    let dir_val = ts_string_new(dir_s.as_ptr() as *const i8);
+    let dir_key = b"dirname\0";
+    let dir_key_str = ts_string_new(dir_key.as_ptr() as *const i8);
+    ts_obj_set_val_key(meta, dir_key_str, dir_val);
+    ts_release_val(dir_key_str);
+    ts_release_val(dir_val);
+    // filename = full path
+    let file_s = format!("{}\0", exe_str);
+    let file_val = ts_string_new(file_s.as_ptr() as *const i8);
+    let file_key = b"filename\0";
+    let file_key_str = ts_string_new(file_key.as_ptr() as *const i8);
+    ts_obj_set_val_key(meta, file_key_str, file_val);
+    ts_release_val(file_key_str);
+    ts_release_val(file_val);
+    // env = process.env equivalent
+    let env_val = ts_process_env();
+    let env_key = b"env\0";
+    let env_key_str = ts_string_new(env_key.as_ptr() as *const i8);
+    ts_obj_set_val_key(meta, env_key_str, env_val);
+    ts_release_val(env_key_str);
+    ts_release_val(env_val);
+    meta
+}
+

@@ -183,6 +183,7 @@ fn hono_request_headers() {
 // ── NestJS-style server ───────────────────────────────────────────────────────
 
 const NEST_PORT: u16 = 13000; // avoids conflict with test_nest default (3000)
+const NEST_UNMODIFIED_PORT: u16 = 13001;
 
 fn nest_fixture() -> PathBuf {
     // test_nest.ts imports nest-native.ts which calls bootstrapNative(AppModule, 3000).
@@ -242,4 +243,60 @@ fn nest_not_found() {
     let (code, body) = curl(&url, &[]);
     assert_eq!(code, 404);
     assert_eq!(body.trim(), "Not Found");
+}
+
+// ── nestjs_unmodified.ts — standard @nestjs/common + @nestjs/core decorators ──
+
+fn start_nest_unmodified() -> (ServerGuard, PathBuf) {
+    // nestjs_unmodified.ts hardcodes port 3000; patch to NEST_UNMODIFIED_PORT.
+    let src  = repo_root().join("examples/nestjs_unmodified.ts");
+    let dest = repo_root().join("examples/nest_unmodified_fixture.ts");
+    let source = std::fs::read_to_string(&src).unwrap();
+    let patched = source.replace("app.listen(3000)", &format!("app.listen({NEST_UNMODIFIED_PORT})"));
+    std::fs::write(&dest, patched).unwrap();
+
+    let out = repo_root().join("target/test-nest-unmodified");
+    compile_server(&dest, &out);
+    let child = Command::new(&out).spawn().expect("server binary failed to spawn");
+    wait_for_port(NEST_UNMODIFIED_PORT);
+    (ServerGuard(child), out)
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn nest_unmodified_get_root() {
+    let (_guard, _) = start_nest_unmodified();
+    let url = format!("http://127.0.0.1:{NEST_UNMODIFIED_PORT}/api");
+    let (code, body) = curl(&url, &[]);
+    assert_eq!(code, 200, "expected 200, got {code}");
+    assert_eq!(body.trim(), "Hello from NestJS!");
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn nest_unmodified_get_hello() {
+    let (_guard, _) = start_nest_unmodified();
+    let url = format!("http://127.0.0.1:{NEST_UNMODIFIED_PORT}/api/hello");
+    let (code, body) = curl(&url, &[]);
+    assert_eq!(code, 200, "expected 200, got {code}");
+    assert_eq!(body.trim(), "Hello World!");
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn nest_unmodified_post_echo() {
+    let (_guard, _) = start_nest_unmodified();
+    let url = format!("http://127.0.0.1:{NEST_UNMODIFIED_PORT}/api/echo");
+    let (code, body) = curl(&url, &["-X", "POST"]);
+    assert_eq!(code, 200, "expected 200, got {code}");
+    assert_eq!(body.trim(), "echo!");
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn nest_unmodified_not_found() {
+    let (_guard, _) = start_nest_unmodified();
+    let url = format!("http://127.0.0.1:{NEST_UNMODIFIED_PORT}/api/no-such-route");
+    let (code, _) = curl(&url, &[]);
+    assert_eq!(code, 404, "expected 404, got {code}");
 }
