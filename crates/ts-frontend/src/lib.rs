@@ -37,15 +37,15 @@ pub struct ParsedModule<'src> {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Parse `source` as a TypeScript file and return a `ParsedModule`.
+/// Parse `source` with an explicit `SourceType` and return a `Program`.
 ///
 /// Returns an error if OXC reports any parse errors.
-pub fn parse_typescript<'src>(
+pub fn parse_source<'src>(
     alloc: &'src Allocator,
     source: &'src str,
     file_name: &str,
+    source_type: SourceType,
 ) -> Result<Program<'src>, FrontendError> {
-    let source_type = SourceType::ts();
     let ParserReturn {
         program,
         errors,
@@ -66,4 +66,15 @@ pub fn parse_typescript<'src>(
     }
 
     Ok(program)
+}
+
+/// Parse `source` as a TypeScript file and return a `Program`.
+///
+/// Returns an error if OXC reports any parse errors.
+pub fn parse_typescript<'src>(
+    alloc: &'src Allocator,
+    source: &'src str,
+    file_name: &str,
+) -> Result<Program<'src>, FrontendError> {
+    parse_source(alloc, source, file_name, SourceType::ts())
 }

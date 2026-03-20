@@ -2404,4 +2404,210 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok(())
     }
 
+    /// Emit a module-init function for a CJS module.
+    /// This handles:
+    /// - exports.foo = non_function_expr → ts_set_module_global("foo", value)
+    /// - module.exports = { foo: non_fn_val } → ts_set_module_global("foo", value)
+    /// - Other non-export statements (variable declarations, etc.) → lowered as side-effects
+    pub(super) fn lower_cjs_module_init(&mut self, program: &oxc_ast::ast::Program<'_>) -> Result<()> {
+        use oxc_ast::ast::{Statement, Expression, AssignmentTarget};
+
+        // Check if there's anything to emit
+        let has_init = program.body.iter().any(|stmt| match stmt {
+            Statement::VariableDeclaration(_) => true,
+            Statement::ExpressionStatement(es) => {
+                match &es.expression {
+                    Expression::AssignmentExpression(assign) => {
+                        // exports.foo = non-function  OR  module.exports = {...}
+                        match &assign.left {
+                            AssignmentTarget::StaticMemberExpression(member) => {
+                                let is_exports = if let Expression::Identifier(id) = &member.object {
+                                    id.name == "exports"
+                                } else { false };
+                                let is_mod_exp_prop = if let Expression::StaticMemberExpression(inner) = &member.object {
+                                    if let Expression::Identifier(id) = &inner.object {
+                                        id.name == "module" && inner.property.name == "exports"
+                                    } else { false }
+                                } else { false };
+                                let is_mod_exp_root = if let Expression::Identifier(id) = &member.object {
+                                    id.name == "module" && member.property.name == "exports"
+                                } else { false };
+                                let rhs = Lowerer::strip_ts_casts(&assign.right);
+                                let is_fn = matches!(rhs,
+                                    Expression::FunctionExpression(_) |
+                                    Expression::ArrowFunctionExpression(_)
+                                );
+                                (is_exports || is_mod_exp_prop || is_mod_exp_root) && !is_fn
+                            }
+                            _ => false,
+                        }
+                    }
+                    // require() calls and other expressions are side-effects
+                    Expression::CallExpression(call) => {
+                        if let Expression::Identifier(id) = &call.callee {
+                            id.name != "require"  // skip bare require() calls
+                        } else {
+                            true
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        });
+
+        if !has_init { return Ok(()); }
+
+        let i64_type = self.i64_type();
+        let fn_name = format!("__init_module_{}", self.module_init_fn_count);
+        self.module_init_fn_count += 1;
+        let fn_type = melior::ir::r#type::FunctionType::new(self.ctx, &[], &[]);
+
+        let region = melior::ir::Region::new();
+        let entry = region.append_block(melior::ir::Block::new(&[]));
+        let mut scope: HashMap<String, melior::ir::Value<'_, '_>> = HashMap::new();
+        let mut current_block = entry;
+
+        // Inject known module globals into scope
+        for global_name in self.module_global_names.clone() {
+            if !scope.contains_key(&global_name) {
+                let key_ptr = self.get_string_ptr(&global_name, current_block)?;
+                let val: melior::ir::Value<'_, '_> = current_block.append_operation(melior::dialect::func::call(
+                    self.ctx, melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                    &[key_ptr], &[i64_type], self.loc,
+                )).result(0)?.into();
+                scope.insert(global_name, val);
+            }
+        }
+
+        for stmt in &program.body {
+            match stmt {
+                Statement::VariableDeclaration(_) => {
+                    let (_, nb) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
+                    current_block = nb;
+                }
+                Statement::ExpressionStatement(es) => {
+                    match &es.expression {
+                        Expression::AssignmentExpression(assign) => {
+                            match &assign.left {
+                                AssignmentTarget::StaticMemberExpression(member) => {
+                                    let is_exports = if let Expression::Identifier(id) = &member.object {
+                                        id.name == "exports"
+                                    } else { false };
+                                    let is_mod_exp_prop = if let Expression::StaticMemberExpression(inner) = &member.object {
+                                        if let Expression::Identifier(id) = &inner.object {
+                                            id.name == "module" && inner.property.name == "exports"
+                                        } else { false }
+                                    } else { false };
+
+                                    if is_exports || is_mod_exp_prop {
+                                        let export_name = member.property.name.to_string();
+                                        let rhs = Lowerer::strip_ts_casts(&assign.right);
+                                        let is_fn = matches!(rhs,
+                                            Expression::FunctionExpression(_) |
+                                            Expression::ArrowFunctionExpression(_)
+                                        );
+                                        if !is_fn {
+                                            // Evaluate the value and store as module global
+                                            let (val_opt, nb) = self.lower_expression(rhs, current_block, &region, &mut scope)?;
+                                            current_block = nb;
+                                            if let Some(val) = val_opt {
+                                                let val_i64 = self.ensure_i64(val, current_block)?;
+                                                let key_ptr = self.get_string_ptr(&export_name, current_block)?;
+                                                current_block.append_operation(melior::dialect::func::call(
+                                                    self.ctx, melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_set_module_global"),
+                                                    &[key_ptr, val_i64], &[], self.loc,
+                                                ));
+                                                current_block.append_operation(melior::dialect::func::call(
+                                                    self.ctx, melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                                    &[val_i64], &[], self.loc,
+                                                ));
+                                            }
+                                        }
+                                    }
+
+                                    // module.exports = { key: non_fn_val, ... }
+                                    let is_mod_exp_root = if let Expression::Identifier(id) = &member.object {
+                                        id.name == "module" && member.property.name == "exports"
+                                    } else { false };
+                                    if is_mod_exp_root {
+                                        let rhs = Lowerer::strip_ts_casts(&assign.right);
+                                        if let Expression::ObjectExpression(obj) = rhs {
+                                            for prop in &obj.properties {
+                                                use oxc_ast::ast::ObjectPropertyKind;
+                                                if let ObjectPropertyKind::ObjectProperty(op) = prop {
+                                                    use oxc_ast::ast::PropertyKey;
+                                                    let key = match &op.key {
+                                                        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                                                        PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+                                                        _ => None,
+                                                    };
+                                                    if let Some(export_name) = key {
+                                                        let v = Lowerer::strip_ts_casts(&op.value);
+                                                        let is_fn = matches!(v,
+                                                            Expression::FunctionExpression(_) |
+                                                            Expression::ArrowFunctionExpression(_)
+                                                        );
+                                                        if !is_fn {
+                                                            let (val_opt, nb) = self.lower_expression(v, current_block, &region, &mut scope)?;
+                                                            current_block = nb;
+                                                            if let Some(val) = val_opt {
+                                                                let val_i64 = self.ensure_i64(val, current_block)?;
+                                                                let key_ptr = self.get_string_ptr(&export_name, current_block)?;
+                                                                current_block.append_operation(melior::dialect::func::call(
+                                                                    self.ctx, melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_set_module_global"),
+                                                                    &[key_ptr, val_i64], &[], self.loc,
+                                                                ));
+                                                                current_block.append_operation(melior::dialect::func::call(
+                                                                    self.ctx, melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                                                    &[val_i64], &[], self.loc,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Release loaded module globals
+        for (gname, val) in &scope {
+            if self.module_global_names.contains(gname) {
+                let v_i64 = self.ensure_i64(*val, current_block)?;
+                current_block.append_operation(melior::dialect::func::call(
+                    self.ctx, melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[v_i64], &[], self.loc,
+                ));
+            }
+        }
+
+        current_block.append_operation(melior::dialect::func::r#return(&[], self.loc));
+
+        let op = melior::dialect::func::func(
+            self.ctx,
+            melior::ir::attribute::StringAttribute::new(self.ctx, &fn_name),
+            melior::ir::attribute::TypeAttribute::new(fn_type.into()),
+            region, &[], self.loc,
+        );
+        self.module.body().append_operation(op);
+        self.funcs.insert(fn_name.clone(), FuncSig {
+            param_types: vec![],
+            return_type: None,
+            has_rest: false,
+            has_this_param: false,
+        });
+        self.module_init_fns.push(fn_name);
+        Ok(())
+    }
+
 }

@@ -85,12 +85,119 @@ struct ClassSig {
 
 /// Parse a local import file and return its Program with 'static lifetime.
 /// Uses Box::leak so the allocator lives for the process lifetime (acceptable for a compiler).
-fn load_import_static(path: &std::path::Path) -> Option<oxc_ast::ast::Program<'static>> {
-    let source = std::fs::read_to_string(path).ok()?;
-    let source: &'static str = Box::leak(source.into_boxed_str());
+/// Returns the parsed program and whether the source was detected as CommonJS.
+fn load_import_static(path: &std::path::Path) -> Option<(oxc_ast::ast::Program<'static>, bool)> {
+    let source_str = std::fs::read_to_string(path).ok()?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let source: &'static str = Box::leak(source_str.into_boxed_str());
     let alloc: &'static oxc_allocator::Allocator =
         Box::leak(Box::new(oxc_allocator::Allocator::default()));
-    ts_frontend::parse_typescript(alloc, source, &path.display().to_string()).ok()
+    let file_name = path.display().to_string();
+
+    match ext {
+        "ts" | "tsx" | "d.ts" => {
+            let prog = ts_frontend::parse_source(alloc, source, &file_name, oxc_span::SourceType::ts()).ok()?;
+            Some((prog, false))
+        }
+        "mjs" => {
+            let prog = ts_frontend::parse_source(alloc, source, &file_name, oxc_span::SourceType::mjs()).ok()?;
+            Some((prog, false))
+        }
+        "cjs" => {
+            let prog = ts_frontend::parse_source(alloc, source, &file_name, oxc_span::SourceType::cjs()).ok()?;
+            Some((prog, true))
+        }
+        "js" => {
+            // Try ESM first, then CJS, then unambiguous
+            if let Ok(prog) = ts_frontend::parse_source(alloc, source, &file_name, oxc_span::SourceType::mjs()) {
+                // Detect CJS by looking for require() calls or module.exports
+                let is_cjs = is_cjs_program(&prog);
+                Some((prog, is_cjs))
+            } else if let Ok(prog) = ts_frontend::parse_source(alloc, source, &file_name, oxc_span::SourceType::cjs()) {
+                Some((prog, true))
+            } else {
+                let prog = ts_frontend::parse_source(alloc, source, &file_name, oxc_span::SourceType::unambiguous()).ok()?;
+                let is_cjs = is_cjs_program(&prog);
+                Some((prog, is_cjs))
+            }
+        }
+        _ => {
+            // Default: try as TypeScript
+            let prog = ts_frontend::parse_source(alloc, source, &file_name, oxc_span::SourceType::ts()).ok()?;
+            Some((prog, false))
+        }
+    }
+}
+
+/// Detect whether a parsed program is CommonJS by checking for require() calls
+/// or module.exports / exports.* assignments at the top level or within functions.
+fn is_cjs_program(program: &oxc_ast::ast::Program<'_>) -> bool {
+    use oxc_ast::ast::{Statement, Expression, MemberExpression};
+    for stmt in &program.body {
+        if stmt_has_cjs_markers(stmt) {
+            return true;
+        }
+    }
+    false
+}
+
+fn stmt_has_cjs_markers(stmt: &oxc_ast::ast::Statement<'_>) -> bool {
+    use oxc_ast::ast::{Statement, Expression};
+    match stmt {
+        Statement::ExpressionStatement(expr_stmt) => {
+            expr_has_cjs_markers(&expr_stmt.expression)
+        }
+        Statement::VariableDeclaration(vd) => {
+            vd.declarations.iter().any(|decl| {
+                decl.init.as_ref().map_or(false, |init| expr_has_cjs_markers(init))
+            })
+        }
+        Statement::BlockStatement(block) => {
+            block.body.iter().any(stmt_has_cjs_markers)
+        }
+        Statement::IfStatement(if_stmt) => {
+            stmt_has_cjs_markers(&if_stmt.consequent) ||
+            if_stmt.alternate.as_ref().map_or(false, |alt| stmt_has_cjs_markers(alt))
+        }
+        _ => false,
+    }
+}
+
+fn expr_has_cjs_markers(expr: &oxc_ast::ast::Expression<'_>) -> bool {
+    use oxc_ast::ast::{Expression, AssignmentTarget, SimpleAssignmentTarget, MemberExpression};
+    match expr {
+        // require('...') call
+        Expression::CallExpression(call) => {
+            if let Expression::Identifier(id) = &call.callee {
+                if id.name == "require" {
+                    return true;
+                }
+            }
+            // Recurse into arguments
+            call.arguments.iter().any(|arg| {
+                arg.as_expression().map_or(false, expr_has_cjs_markers)
+            })
+        }
+        // module.exports = ... or exports.foo = ...
+        Expression::AssignmentExpression(assign) => {
+            let lhs_is_cjs = match &assign.left {
+                AssignmentTarget::StaticMemberExpression(member) => {
+                    let obj_is_module = if let Expression::Identifier(id) = &member.object {
+                        id.name == "module" || id.name == "exports"
+                    } else { false };
+                    let obj_is_module_exports = if let Expression::StaticMemberExpression(inner) = &member.object {
+                        if let Expression::Identifier(id) = &inner.object {
+                            id.name == "module" && inner.property.name == "exports"
+                        } else { false }
+                    } else { false };
+                    obj_is_module || obj_is_module_exports
+                }
+                _ => false,
+            };
+            lhs_is_cjs || expr_has_cjs_markers(&assign.right)
+        }
+        _ => false,
+    }
 }
 
 /// Resolve a relative import source string to an actual `.ts` file path.
@@ -135,8 +242,65 @@ fn read_package_json_field(pkg_dir: &std::path::Path, field: &str) -> Option<Str
     }
 }
 
+/// Parse the "exports" field from package.json to find the best JS entry point.
+/// Handles: string, { ".": string }, { ".": { "import": ..., "default": ..., "require": ... } }
+fn read_package_exports_entry(pkg_dir: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
+    // Find the "exports" key
+    let exports_key = "\"exports\"";
+    let pos = content.find(exports_key)?;
+    let after_key = &content[pos + exports_key.len()..];
+    let colon_pos = after_key.find(':')?;
+    let after_colon = after_key[colon_pos + 1..].trim_start();
+
+    if after_colon.starts_with('"') {
+        // "exports": "./index.js"
+        let inner = &after_colon[1..];
+        let end = inner.find('"')?;
+        return Some(inner[..end].to_string());
+    }
+
+    if after_colon.starts_with('{') {
+        // Object form — look for "." entry
+        let obj_content = after_colon;
+        // Find the "." key
+        let dot_key = "\".\"";
+        if let Some(dot_pos) = obj_content.find(dot_key) {
+            let after_dot = &obj_content[dot_pos + dot_key.len()..];
+            let colon2 = after_dot.find(':')?;
+            let after_colon2 = after_dot[colon2 + 1..].trim_start();
+            if after_colon2.starts_with('"') {
+                // { ".": "./index.js" }
+                let inner = &after_colon2[1..];
+                let end = inner.find('"')?;
+                return Some(inner[..end].to_string());
+            }
+            if after_colon2.starts_with('{') {
+                // { ".": { "import": ..., "default": ..., "require": ... } }
+                // Prefer: import > default > require
+                for condition in &["\"import\"", "\"default\"", "\"require\""] {
+                    if let Some(cond_pos) = after_colon2.find(condition) {
+                        let after_cond = &after_colon2[cond_pos + condition.len()..];
+                        if let Some(cpos) = after_cond.find(':') {
+                            let val = after_cond[cpos + 1..].trim_start();
+                            if val.starts_with('"') {
+                                let inner = &val[1..];
+                                if let Some(end) = inner.find('"') {
+                                    return Some(inner[..end].to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a TypeScript source file within a package directory.
-/// Tries multiple strategies: src/index.ts, "source" field, main-based heuristic.
+/// Tries multiple strategies: src/index.ts, "source" field, main-based heuristic,
+/// and finally JS fallback via "module", "exports", "main" fields and index files.
 fn resolve_ts_in_pkg(pkg_dir: &std::path::Path, sub_path: &str) -> Option<std::path::PathBuf> {
     if sub_path.is_empty() {
         // No sub-path: look for package root TypeScript source
@@ -163,6 +327,27 @@ fn resolve_ts_in_pkg(pkg_dir: &std::path::Path, sub_path: &str) -> Option<std::p
         // 4. index.ts at root
         let root_idx = pkg_dir.join("index.ts");
         if root_idx.exists() { return Some(root_idx); }
+
+        // JS fallbacks: 5. "module" field (ESM build)
+        if let Some(module_field) = read_package_json_field(pkg_dir, "module") {
+            let p = pkg_dir.join(&module_field);
+            if p.exists() { return Some(p); }
+        }
+        // 6. "exports" field
+        if let Some(entry) = read_package_exports_entry(pkg_dir) {
+            let p = pkg_dir.join(&entry);
+            if p.exists() { return Some(p); }
+        }
+        // 7. "main" field (may be .js, .mjs, .cjs)
+        if let Some(main) = read_package_json_field(pkg_dir, "main") {
+            let p = pkg_dir.join(&main);
+            if p.exists() { return Some(p); }
+        }
+        // 8. index.mjs / index.js / index.cjs
+        for idx in &["index.mjs", "index.js", "index.cjs"] {
+            let p = pkg_dir.join(idx);
+            if p.exists() { return Some(p); }
+        }
         None
     } else {
         // Has sub-path: try to find the TypeScript file for that sub-path
@@ -176,7 +361,7 @@ fn resolve_ts_in_pkg(pkg_dir: &std::path::Path, sub_path: &str) -> Option<std::p
             .trim_start_matches("dist/")
             .trim_start_matches("lib/")
             .trim_start_matches("esm/");
-        // Try candidates in priority order: src/<logical>.ts, <base>.ts, <logical>.ts
+        // Try TypeScript candidates in priority order: src/<logical>.ts, <base>.ts, <logical>.ts
         for prefix in &["src", ""] {
             for name in &[logical, base] {
                 let path = if prefix.is_empty() {
@@ -193,6 +378,16 @@ fn resolve_ts_in_pkg(pkg_dir: &std::path::Path, sub_path: &str) -> Option<std::p
                 if idx.exists() { return Some(idx); }
             }
         }
+        // JS fallback: try the sub-path as-is
+        let sub_path_direct = pkg_dir.join(sub_path);
+        if sub_path_direct.exists() { return Some(sub_path_direct); }
+        // Try with .js extension
+        let sub_js = pkg_dir.join(format!("{}.js", base));
+        if sub_js.exists() { return Some(sub_js); }
+        let sub_mjs = pkg_dir.join(format!("{}.mjs", base));
+        if sub_mjs.exists() { return Some(sub_mjs); }
+        let sub_cjs = pkg_dir.join(format!("{}.cjs", base));
+        if sub_cjs.exists() { return Some(sub_cjs); }
         None
     }
 }
@@ -237,11 +432,11 @@ fn resolve_npm_package(spec: &str, from_dir: &std::path::Path) -> Option<std::pa
         if pkg_dir.exists() {
             // Resolve symlinks to get the real package directory
             let real_pkg = std::fs::canonicalize(&pkg_dir).unwrap_or(pkg_dir);
-            if let Some(ts_path) = resolve_ts_in_pkg(&real_pkg, &sub_path) {
-                tracing::debug!("npm resolved: {} → {}", spec, ts_path.display());
-                return Some(ts_path);
+            if let Some(path) = resolve_ts_in_pkg(&real_pkg, &sub_path) {
+                tracing::debug!("npm resolved: {} → {}", spec, path.display());
+                return Some(path);
             } else {
-                tracing::warn!("npm package '{}' found but no TypeScript source (JS-only, skipping)", spec);
+                tracing::warn!("npm package '{}' found but no source entry found", spec);
                 return None;
             }
         }
@@ -305,6 +500,376 @@ fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::pa
     Some(p)
 }
 
+/// Collect require() specifier strings from a CJS program.
+fn collect_require_specs(program: &oxc_ast::ast::Program<'_>) -> Vec<String> {
+    use oxc_ast::ast::{Statement, Expression};
+    let mut specs = Vec::new();
+    for stmt in &program.body {
+        collect_require_specs_stmt(stmt, &mut specs);
+    }
+    specs
+}
+
+fn collect_require_specs_stmt(stmt: &oxc_ast::ast::Statement<'_>, specs: &mut Vec<String>) {
+    use oxc_ast::ast::{Statement, Expression};
+    match stmt {
+        Statement::VariableDeclaration(vd) => {
+            for decl in &vd.declarations {
+                if let Some(init) = &decl.init {
+                    collect_require_specs_expr(init, specs);
+                }
+            }
+        }
+        Statement::ExpressionStatement(es) => {
+            collect_require_specs_expr(&es.expression, specs);
+        }
+        Statement::BlockStatement(block) => {
+            for s in &block.body {
+                collect_require_specs_stmt(s, specs);
+            }
+        }
+        Statement::IfStatement(if_stmt) => {
+            collect_require_specs_stmt(&if_stmt.consequent, specs);
+            if let Some(alt) = &if_stmt.alternate {
+                collect_require_specs_stmt(alt, specs);
+            }
+        }
+        Statement::ReturnStatement(ret) => {
+            if let Some(arg) = &ret.argument {
+                collect_require_specs_expr(arg, specs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_require_specs_expr(expr: &oxc_ast::ast::Expression<'_>, specs: &mut Vec<String>) {
+    use oxc_ast::ast::{Expression, StringLiteral};
+    match expr {
+        Expression::CallExpression(call) => {
+            if let Expression::Identifier(id) = &call.callee {
+                if id.name == "require" {
+                    if let Some(arg) = call.arguments.first() {
+                        if let Some(Expression::StringLiteral(s)) = arg.as_expression() {
+                            specs.push(s.value.to_string());
+                        }
+                    }
+                }
+            }
+            // Recurse into arguments
+            for arg in &call.arguments {
+                if let Some(e) = arg.as_expression() {
+                    collect_require_specs_expr(e, specs);
+                }
+            }
+        }
+        Expression::AssignmentExpression(assign) => {
+            collect_require_specs_expr(&assign.right, specs);
+        }
+        _ => {}
+    }
+}
+
+struct CjsExportNames {
+    functions: Vec<String>,
+    values: Vec<String>,
+}
+
+/// Scan a CJS program for its exports (exports.foo = ..., module.exports.foo = ..., module.exports = {...}).
+fn scan_cjs_exports(program: &oxc_ast::ast::Program<'_>) -> CjsExportNames {
+    use oxc_ast::ast::{Statement, Expression, AssignmentTarget, SimpleAssignmentTarget};
+    let mut functions = Vec::new();
+    let mut values = Vec::new();
+
+    for stmt in &program.body {
+        let expr = match stmt {
+            Statement::ExpressionStatement(es) => &es.expression,
+            _ => continue,
+        };
+
+        match expr {
+            Expression::AssignmentExpression(assign) => {
+                match &assign.left {
+                    AssignmentTarget::StaticMemberExpression(member) => {
+                        // exports.foo = ... or module.exports.foo = ...
+                        let is_exports_direct = if let Expression::Identifier(id) = &member.object {
+                            id.name == "exports"
+                        } else { false };
+
+                        let is_module_exports = if let Expression::StaticMemberExpression(inner) = &member.object {
+                            if let Expression::Identifier(id) = &inner.object {
+                                id.name == "module" && inner.property.name == "exports"
+                            } else { false }
+                        } else { false };
+
+                        if is_exports_direct || is_module_exports {
+                            let export_name = member.property.name.to_string();
+                            let rhs = Lowerer::strip_ts_casts(&assign.right);
+                            match rhs {
+                                Expression::FunctionExpression(_) |
+                                Expression::ArrowFunctionExpression(_) => {
+                                    functions.push(export_name);
+                                }
+                                _ => {
+                                    values.push(export_name);
+                                }
+                            }
+                        }
+
+                        // module.exports = { foo: ..., bar: ... }
+                        let is_module_exports_root = if let Expression::Identifier(id) = &member.object {
+                            id.name == "module" && member.property.name == "exports"
+                        } else { false };
+
+                        if is_module_exports_root {
+                            let rhs = Lowerer::strip_ts_casts(&assign.right);
+                            if let Expression::ObjectExpression(obj) = rhs {
+                                for prop in &obj.properties {
+                                    use oxc_ast::ast::ObjectPropertyKind;
+                                    if let ObjectPropertyKind::ObjectProperty(op) = prop {
+                                        use oxc_ast::ast::PropertyKey;
+                                        let key = match &op.key {
+                                            PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                                            PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+                                            _ => None,
+                                        };
+                                        if let Some(name) = key {
+                                            let v = Lowerer::strip_ts_casts(&op.value);
+                                            match v {
+                                                Expression::FunctionExpression(_) |
+                                                Expression::ArrowFunctionExpression(_) => {
+                                                    functions.push(name);
+                                                }
+                                                _ => {
+                                                    values.push(name);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    CjsExportNames { functions, values }
+}
+
+/// Lower a CJS module into the MLIR module.
+/// Handles:
+/// - Top-level function declarations → lower as MLIR functions
+/// - exports.foo = function(...) { body } → emits @foo as a top-level MLIR function
+/// - exports.foo = identifier (referring to a fn decl) → register identifier as the MLIR name
+/// - exports.foo = expr → emits in a module init function via ts_set_module_global
+/// - module.exports = { foo: fn, bar: val } → same treatment
+/// - Other statements (vars, non-export code) → lowered as module-level init code
+fn lower_cjs_module<'c, 'm>(
+    lowerer: &mut Lowerer<'c, 'm>,
+    program: &oxc_ast::ast::Program<'_>,
+    module_name: &str,
+) -> Result<()> {
+    use oxc_ast::ast::{Statement, Expression, AssignmentTarget, Declaration};
+
+    // Collect function signatures first (hoisting pass)
+    lowerer.collect_function_signatures(program);
+    lowerer.collect_class_definitions(program);
+
+    // Step 1: Lower all top-level function declarations (they may be referenced by exports.foo = fnName)
+    for stmt in &program.body {
+        match stmt {
+            Statement::FunctionDeclaration(func) => {
+                if !func.declare {
+                    lowerer.lower_function_declaration(func)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Build a set of all top-level function declaration names for identifier-export detection
+    let top_level_fns: std::collections::HashSet<String> = program.body.iter().filter_map(|stmt| {
+        if let Statement::FunctionDeclaration(func) = stmt {
+            func.id.as_ref().map(|id| id.name.to_string())
+        } else {
+            None
+        }
+    }).collect();
+
+    // Helper closure: register an export binding given the export name and RHS expression
+    // Returns true if the export was handled as a function (false means treat as value)
+    let register_fn_export = |lowerer: &mut Lowerer<'c, 'm>,
+                               export_name: &str,
+                               rhs: &Expression<'_>,
+                               top_fns: &std::collections::HashSet<String>| -> Result<bool> {
+        let inner = Lowerer::strip_ts_casts(rhs);
+        match inner {
+            Expression::FunctionExpression(func_expr) => {
+                let fn_name = if lowerer.emitted_functions.contains(export_name) {
+                    format!("__shim_{}_{}", module_name, export_name)
+                } else {
+                    export_name.to_string()
+                };
+                lowerer.lower_arrow_or_func_expr_as(func_expr.as_ref(), &fn_name)?;
+                lowerer.emitted_functions.insert(fn_name.clone());
+                lowerer.module_exports
+                    .entry(module_name.to_string())
+                    .or_insert_with(HashMap::new)
+                    .insert(export_name.to_string(), fn_name);
+                Ok(true)
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                let fn_name = if lowerer.emitted_functions.contains(export_name) {
+                    format!("__shim_{}_{}", module_name, export_name)
+                } else {
+                    export_name.to_string()
+                };
+                let params: Vec<&oxc_ast::ast::FormalParameter<'_>> =
+                    arrow.params.items.iter().collect();
+                let rest_name = arrow.params.rest.as_ref()
+                    .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument {
+                        Some(id.name.to_string())
+                    } else { None });
+                lowerer.lower_named_function(
+                    &fn_name, &params,
+                    rest_name.as_deref(),
+                    Some(&arrow.body),
+                    Some(arrow.r#async),
+                    arrow.expression,
+                )?;
+                lowerer.emitted_functions.insert(fn_name.clone());
+                lowerer.module_exports
+                    .entry(module_name.to_string())
+                    .or_insert_with(HashMap::new)
+                    .insert(export_name.to_string(), fn_name);
+                Ok(true)
+            }
+            Expression::Identifier(id) => {
+                // exports.foo = someFn — check if it references a top-level function
+                let fn_id_name = id.name.to_string();
+                if top_fns.contains(&fn_id_name) || lowerer.emitted_functions.contains(&fn_id_name) {
+                    // The function is already emitted under fn_id_name.
+                    // Register export_name as an alias pointing to fn_id_name.
+                    if export_name != fn_id_name {
+                        // Also register the function under the export name if not yet taken
+                        if !lowerer.emitted_functions.contains(export_name) {
+                            // Create a thin wrapper function that calls fn_id_name
+                            let sig = lowerer.funcs.get(&fn_id_name).cloned();
+                            if let Some(sig) = sig {
+                                let n = sig.param_types.len();
+                                let i64t = lowerer.i64_type();
+                                let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+                                    (0..n).map(|_| (i64t, lowerer.loc)).collect();
+                                let func_type = melior::ir::r#type::FunctionType::new(
+                                    lowerer.ctx, &vec![i64t; n], &[i64t]
+                                );
+                                let region = Region::new();
+                                let entry = region.append_block(Block::new(&param_specs));
+                                let mut args: Vec<melior::ir::Value<'_, '_>> = (0..n)
+                                    .map(|i| entry.argument(i).unwrap().into())
+                                    .collect();
+                                let result: melior::ir::Value<'_, '_> = entry.append_operation(
+                                    melior::dialect::func::call(
+                                        lowerer.ctx,
+                                        melior::ir::attribute::FlatSymbolRefAttribute::new(lowerer.ctx, &fn_id_name),
+                                        &args,
+                                        &[i64t],
+                                        lowerer.loc,
+                                    )
+                                ).result(0)?.into();
+                                entry.append_operation(melior::dialect::func::r#return(&[result], lowerer.loc));
+                                let fn_op = melior::dialect::func::func(
+                                    lowerer.ctx,
+                                    melior::ir::attribute::StringAttribute::new(lowerer.ctx, export_name),
+                                    melior::ir::attribute::TypeAttribute::new(func_type.into()),
+                                    region, &[], lowerer.loc,
+                                );
+                                lowerer.module.body().append_operation(fn_op);
+                                lowerer.emitted_functions.insert(export_name.to_string());
+                                lowerer.funcs.insert(export_name.to_string(), sig);
+                            }
+                        }
+                        lowerer.module_global_aliases.insert(export_name.to_string(), fn_id_name.clone());
+                    }
+                    lowerer.module_exports
+                        .entry(module_name.to_string())
+                        .or_insert_with(HashMap::new)
+                        .insert(export_name.to_string(), export_name.to_string());
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    };
+
+    // Step 2: Lower exported functions as top-level MLIR functions
+    for stmt in &program.body {
+        let Statement::ExpressionStatement(es) = stmt else { continue };
+        let Expression::AssignmentExpression(assign) = &es.expression else { continue };
+
+        match &assign.left {
+            AssignmentTarget::StaticMemberExpression(member) => {
+                let is_exports_direct = if let Expression::Identifier(id) = &member.object {
+                    id.name == "exports"
+                } else { false };
+                let is_module_exports_prop = if let Expression::StaticMemberExpression(inner) = &member.object {
+                    if let Expression::Identifier(id) = &inner.object {
+                        id.name == "module" && inner.property.name == "exports"
+                    } else { false }
+                } else { false };
+
+                if is_exports_direct || is_module_exports_prop {
+                    let export_name = member.property.name.to_string();
+                    let handled_as_fn = register_fn_export(lowerer, &export_name, &assign.right, &top_level_fns)?;
+                    if !handled_as_fn {
+                        // Non-function exports go to module globals
+                        lowerer.module_global_names.insert(export_name);
+                    }
+                }
+
+                // module.exports = { ... }
+                let is_module_exports_root = if let Expression::Identifier(id) = &member.object {
+                    id.name == "module" && member.property.name == "exports"
+                } else { false };
+
+                if is_module_exports_root {
+                    let rhs = Lowerer::strip_ts_casts(&assign.right);
+                    if let Expression::ObjectExpression(obj) = rhs {
+                        for prop in &obj.properties {
+                            use oxc_ast::ast::ObjectPropertyKind;
+                            if let ObjectPropertyKind::ObjectProperty(op) = prop {
+                                use oxc_ast::ast::PropertyKey;
+                                let key = match &op.key {
+                                    PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                                    PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+                                    _ => None,
+                                };
+                                if let Some(export_name) = key {
+                                    let handled = register_fn_export(lowerer, &export_name, &op.value, &top_level_fns)?;
+                                    if !handled {
+                                        lowerer.module_global_names.insert(export_name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Emit module init for non-function exports and other module-level code
+    lowerer.lower_cjs_module_init(program)?;
+
+    Ok(())
+}
+
 /// Collect local import paths declared in a parsed program, relative to `base_dir`.
 fn collect_local_imports(
     program: &oxc_ast::ast::Program<'_>,
@@ -348,13 +913,39 @@ fn process_import_recursive<'c, 'm>(
     if visited.contains(&canonical) { return Ok(()); }
     visited.insert(canonical);
 
-    let Some(imported) = load_import_static(path) else {
+    let Some((imported, is_cjs)) = load_import_static(path) else {
         tracing::warn!("failed to resolve import: {}", path.display());
         return Ok(());
     };
 
-    // Process transitive imports depth-first.
+    // For CJS modules, detect require() specifiers and process them recursively.
     let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    if is_cjs {
+        let require_specs = collect_require_specs(&imported);
+        for spec in &require_specs {
+            if let Some(dep_path) = resolve_local_import(spec, base_dir) {
+                process_import_recursive(lowerer, &dep_path, visited)?;
+            }
+        }
+        // Scan what this CJS module exports and lower it
+        let cjs_exports = scan_cjs_exports(&imported);
+        let module_name: String = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        // Register exported names so import aliases work
+        for name in &cjs_exports.functions {
+            lowerer.module_global_names.insert(name.clone());
+        }
+        for name in &cjs_exports.values {
+            lowerer.module_global_names.insert(name.clone());
+        }
+        // Lower the CJS module code
+        lower_cjs_module(lowerer, &imported, &module_name)?;
+        return Ok(());
+    }
+
+    // Process transitive imports depth-first (ESM path).
     for sub_path in collect_local_imports(&imported, base_dir) {
         process_import_recursive(lowerer, &sub_path, visited)?;
     }
@@ -1698,6 +2289,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_readline_question",          &[i64_type], &[i64_type]);
         add_func("ts_readline_read_line",         &[], &[i64_type]);
 
+        // CJS module namespace registry
+        add_func("ts_cjs_register_ns",  &[i64_type, i64_type], &[]);
+        add_func("ts_cjs_require_ns",   &[i64_type], &[i64_type]);
+
         // Node-API export registration (used in --emit-node-addon mode).
         add_func("ts_napi_register_export", &[ptr_type, ptr_type, i32_type], &[]);
 
@@ -2078,6 +2673,166 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     pub fn lower_function_declaration_as(&mut self, func: &Function<'_>, emit_name: &str) -> Result<()> {
         self.lower_function_declaration_impl(func, Some(emit_name))
+    }
+
+    /// Lower a `FunctionExpression` as a named top-level MLIR function.
+    /// Used when lowering CJS exports: `exports.foo = function(...) { ... }` → `@foo`.
+    pub fn lower_arrow_or_func_expr_as(&mut self, func: &oxc_ast::ast::Function<'_>, emit_name: &str) -> Result<()> {
+        // Skip if already emitted under this name
+        if self.emitted_functions.contains(emit_name) {
+            return Ok(());
+        }
+        let i64_type = self.i64_type();
+        let return_type = i64_type;
+        let explicit_rest = func.params.rest.is_some();
+        let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
+            crate::lowering::expressions::body_uses_arguments(&b.statements)
+        });
+        let has_rest = explicit_rest || implicit_rest;
+        let has_this_param = func.this_param.is_some();
+        let this_offset: usize = if has_this_param { 1 } else { 0 };
+        let n_params = func.params.items.len()
+            + if has_rest { 1 } else { 0 }
+            + this_offset;
+        let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
+            (0..n_params).map(|_| (i64_type, self.loc)).collect();
+        let func_type = FunctionType::new(self.ctx, &vec![i64_type; n_params], &[return_type]);
+        let region = Region::new();
+        let entry = region.append_block(Block::new(&param_specs));
+        let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
+        let mut param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if has_this_param {
+            let this_val: Value<'_, '_> = entry.argument(0)?.into();
+            scope.insert("this".to_string(), this_val);
+            param_names.insert("this".to_string());
+        }
+        let mut current_block = entry;
+        for (i, param) in func.params.items.iter().enumerate() {
+            let arg_val: Value<'_, '_> = entry.argument(i + this_offset)?.into();
+            match &param.pattern {
+                BindingPattern::BindingIdentifier(id) => {
+                    let pname = id.name.to_string();
+                    param_names.insert(pname.clone());
+                    scope.insert(pname, arg_val);
+                }
+                BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
+                    let arg_i64 = self.ensure_i64(arg_val, current_block)?;
+                    current_block = self.lower_bind_pattern(&param.pattern, arg_i64, current_block, &region, &mut scope)?;
+                }
+                _ => {}
+            }
+        }
+        if let Some(rest) = &func.params.rest {
+            let rest_idx = func.params.items.len() + this_offset;
+            if let BindingPattern::BindingIdentifier(id) = &rest.rest.argument {
+                let rname = id.name.to_string();
+                param_names.insert(rname.clone());
+                scope.insert(rname, entry.argument(rest_idx)?.into());
+            }
+        }
+        // Inject module globals into scope
+        for global_name in self.module_global_names.clone() {
+            if !scope.contains_key(&global_name) {
+                let key_ptr = self.get_string_ptr(&global_name, entry)?;
+                let val: Value<'_, '_> = entry.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                    &[key_ptr], &[i64_type], self.loc,
+                )).result(0)?.into();
+                scope.insert(global_name, val);
+            }
+        }
+
+        let saved_fn_return_type = self.fn_return_type;
+        let saved_is_async = self.is_async;
+        let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names.clone());
+        let saved_cell_vars = std::mem::replace(&mut self.cell_vars, std::collections::HashSet::new());
+        let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+        self.fn_return_type = return_type;
+        self.is_async = func.r#async;
+
+        let Some(body) = &func.body else {
+            // No body — emit a stub returning undefined
+            let undef_val: Value<'_, '_> = entry.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            entry.append_operation(func::r#return(&[undef_val], self.loc));
+            let fn_op = func::func(
+                self.ctx,
+                StringAttribute::new(self.ctx, emit_name),
+                TypeAttribute::new(func_type.into()),
+                region, &[], self.loc,
+            );
+            self.module.body().append_operation(fn_op);
+            self.fn_return_type = saved_fn_return_type;
+            self.is_async = saved_is_async;
+            self.current_fn_params = saved_fn_params;
+            self.cell_vars = saved_cell_vars;
+            self.cell_captures = saved_cell_captures;
+            self.funcs.insert(emit_name.to_string(), FuncSig {
+                param_types: vec![i64_type; n_params],
+                return_type: Some(return_type),
+                has_rest,
+                has_this_param,
+            });
+            self.emitted_functions.insert(emit_name.to_string());
+            return Ok(());
+        };
+
+        // Compute cell vars for mutable captures
+        let cell_vars_set = crate::lowering::expressions::compute_cell_vars_for_body(&body.statements);
+        self.cell_vars = cell_vars_set;
+
+        let mut result_val: Value<'_, '_> = entry.append_operation(arith::constant(
+            self.ctx, IntegerAttribute::new(return_type, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+        )).result(0)?.into();
+
+        for s in &body.statements {
+            let (v_opt, nb) = self.lower_statement(s, current_block, &region, &mut scope, &[])?;
+            current_block = nb;
+            if let Some(v) = v_opt {
+                result_val = self.ensure_i64(v, current_block)?;
+            }
+        }
+
+        // Release module globals loaded at start
+        for gname in self.module_global_names.clone() {
+            if let Some(val) = scope.get(&gname) {
+                if !param_names.contains(&gname) {
+                    let v_i64 = self.ensure_i64(*val, current_block)?;
+                    current_block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[v_i64], &[], self.loc,
+                    ));
+                }
+            }
+        }
+
+        let undef_i64: Value<'_, '_> = current_block.append_operation(arith::constant(
+            self.ctx, IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+        )).result(0)?.into();
+        self.terminate_with_return(current_block, undef_i64)?;
+
+        let fn_op = func::func(
+            self.ctx,
+            StringAttribute::new(self.ctx, emit_name),
+            TypeAttribute::new(func_type.into()),
+            region, &[], self.loc,
+        );
+        self.module.body().append_operation(fn_op);
+
+        self.fn_return_type = saved_fn_return_type;
+        self.is_async = saved_is_async;
+        self.current_fn_params = saved_fn_params;
+        self.cell_vars = saved_cell_vars;
+        self.cell_captures = saved_cell_captures;
+        self.funcs.insert(emit_name.to_string(), FuncSig {
+            param_types: vec![i64_type; n_params],
+            return_type: Some(return_type),
+            has_rest,
+            has_this_param,
+        });
+        self.emitted_functions.insert(emit_name.to_string());
+        Ok(())
     }
 
     pub fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {

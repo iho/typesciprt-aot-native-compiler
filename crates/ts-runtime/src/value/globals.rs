@@ -1,6 +1,6 @@
-//! Module-level global variables and process built-ins.
+//! Module-level global variables, process built-ins, and CJS module registry.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock, Mutex};
 use std::collections::HashMap;
 use super::{TsVal, UNDEFINED, ts_retain_val, ts_release_val};
 use super::string_val::ts_string_new;
@@ -87,6 +87,58 @@ pub unsafe extern "C" fn ts_process_env() -> TsVal {
         ts_release_val(val_str);
     }
     obj
+}
+
+// ── CJS module namespace registry ────────────────────────────────────────────
+
+/// Global registry mapping CJS module specifier → namespace TsObject.
+/// Used by `require()` to return the exported namespace of a loaded CJS module.
+static CJS_REGISTRY: OnceLock<Mutex<HashMap<String, TsVal>>> = OnceLock::new();
+
+fn cjs_registry() -> &'static Mutex<HashMap<String, TsVal>> {
+    CJS_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extract a Rust String from a TsString value (heap tag 2).
+unsafe fn tsval_to_rust_string(val: TsVal) -> Option<String> {
+    if val.is_ptr() && super::heap_tag(val) == 2 {
+        let s = &*(val.as_ptr() as *const super::TsString);
+        Some(s.inner.clone())
+    } else {
+        None
+    }
+}
+
+/// Register a CJS namespace object under a module specifier.
+/// Called by generated code when a CJS module is initialized.
+/// Takes ownership of `name` (releases it after extracting the string) and `ns`
+/// (retains ns internally so the registry holds a reference).
+#[no_mangle]
+pub unsafe extern "C" fn ts_cjs_register_ns(name: TsVal, ns: TsVal) {
+    let key = tsval_to_rust_string(name).unwrap_or_default();
+    ts_release_val(name);
+    ts_retain_val(ns);
+    let mut reg = cjs_registry().lock().unwrap();
+    if let Some(old) = reg.insert(key, ns) {
+        ts_release_val(old);
+    }
+}
+
+/// Look up a CJS namespace object by module specifier.
+/// Called by `require('specifier')` in generated code.
+/// Takes ownership of `name` (releases it after lookup).
+/// Returns a retained reference to the namespace, or UNDEFINED if not registered.
+#[no_mangle]
+pub unsafe extern "C" fn ts_cjs_require_ns(name: TsVal) -> TsVal {
+    let key = tsval_to_rust_string(name).unwrap_or_default();
+    ts_release_val(name);
+    let reg = cjs_registry().lock().unwrap();
+    if let Some(&val) = reg.get(&key) {
+        ts_retain_val(val);
+        val
+    } else {
+        UNDEFINED
+    }
 }
 
 /// import.meta — returns an object with `url`, `dirname`, `filename`, and `env` properties.

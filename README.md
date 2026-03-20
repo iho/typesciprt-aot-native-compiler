@@ -667,6 +667,6 @@ Always use `--test-threads=1` to avoid race conditions in concurrent LLVM codege
 
 - [MLIR Documentation](https://mlir.llvm.org/)
 - [OXC Parser](https://github.com/web-infra-dev/oxc)
-- [melior Crate](https://github.com/raparic/melior)
+- [melior Crate](https://github.com/mlir-rs/melior)
 - [Hono Framework](https://hono.dev/)
 - [hyper HTTP](https://hyper.rs/)

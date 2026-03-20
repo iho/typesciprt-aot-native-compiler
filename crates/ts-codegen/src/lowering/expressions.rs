@@ -1192,6 +1192,38 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
 
+        // require('specifier') — CommonJS interop.
+        // When the result is destructured at the call site (`const { a, b } = require('x')`),
+        // the variables are already resolved as module globals from the loaded CJS module.
+        // For `const X = require('x')` we call ts_cjs_require_ns to return the namespace object.
+        if let Expression::Identifier(callee_id) = &call.callee {
+            if callee_id.name == "require" {
+                if let Some(arg) = call.arguments.first() {
+                    if let Some(Expression::StringLiteral(spec)) = arg.as_expression() {
+                        let spec_str = spec.value.to_string();
+                        // Return the CJS namespace object for this module
+                        let spec_val = self.lower_string_literal(&spec_str, block)?;
+                        let ns: melior::ir::Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_cjs_require_ns"),
+                            &[spec_val],
+                            &[self.i64_type()],
+                            self.loc,
+                        )).result(0)?.into();
+                        // ts_cjs_require_ns takes ownership of spec_val (retains internally, releases arg)
+                        return Ok((Some(ns), block));
+                    }
+                }
+                // require() with non-literal arg — return UNDEFINED
+                let undef: melior::ir::Value<'c, 'b> = block.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                    self.loc,
+                )).result(0)?.into();
+                return Ok((Some(undef), block));
+            }
+        }
+
         // Built-in: serve(port) with registered listener → ts_serve_worker(port: i32)
         if let Expression::Identifier(callee_id) = &call.callee {
             if callee_id.name == "serve" && call.arguments.len() == 1 {

@@ -121,6 +121,49 @@ fn http_get(port: u16, path: &str) -> String {
     }
 }
 
+/// Compile `input.ts` → binary, run it, and return its stdout.
+fn compile_and_capture(input: &Path, out: &Path) -> String {
+    ensure_tscc_built();
+    let compile = Command::new(tscc_bin())
+        .arg(input)
+        .arg("-o")
+        .arg(out)
+        .status()
+        .expect("tscc failed to spawn");
+    assert!(compile.success(), "tscc compilation failed for {}", input.display());
+    let run = Command::new(out)
+        .output()
+        .expect("compiled binary failed to spawn");
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+// ── npm package resolution ─────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn npm_cjs_package() {
+    let root = repo_root();
+    let out = compile_and_capture(
+        &root.join("examples/cjs_npm_test.ts"),
+        &root.join("target/test-cjs-npm"),
+    );
+    assert!(out.contains("add(3, 4) = 7"), "got: {out:?}");
+    assert!(out.contains("multiply(5, 6) = 30"), "got: {out:?}");
+    assert!(out.contains("version: 1.0.0"), "got: {out:?}");
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn npm_esm_package() {
+    let root = repo_root();
+    let out = compile_and_capture(
+        &root.join("examples/esm_npm_test.ts"),
+        &root.join("target/test-esm-npm"),
+    );
+    assert!(out.contains("Hello, world!"), "got: {out:?}");
+    assert!(out.contains("PI: 3.14159"), "got: {out:?}");
+}
+
 // ── v0.1 – arithmetic & variables ────────────────────────────────────────────
 
 #[test]
