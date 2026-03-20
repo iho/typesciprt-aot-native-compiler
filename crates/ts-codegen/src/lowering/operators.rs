@@ -81,7 +81,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
             let is_arith_op = matches!(binop.operator,
                 BinaryOperator::Subtraction | BinaryOperator::Multiplication |
-                BinaryOperator::Division | BinaryOperator::Remainder);
+                BinaryOperator::Division | BinaryOperator::Remainder |
+                BinaryOperator::Exponential | BinaryOperator::BitwiseOR |
+                BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseXOR |
+                BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight |
+                BinaryOperator::ShiftRightZeroFill);
 
             let result_opt: Option<Value<'c, 'b>> = if is_eq_op {
                 let eq_i32: Value<'c, 'b> = block.append_operation(func::call(
@@ -110,10 +114,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 Some(self.ensure_i1(cmp_i32, block)?)
             } else if is_arith_op {
                 let fn_name = match binop.operator {
-                    BinaryOperator::Subtraction    => "ts_sub",
-                    BinaryOperator::Multiplication => "ts_mul",
-                    BinaryOperator::Division       => "ts_div",
-                    BinaryOperator::Remainder      => "ts_mod",
+                    BinaryOperator::Subtraction       => "ts_sub",
+                    BinaryOperator::Multiplication    => "ts_mul",
+                    BinaryOperator::Division          => "ts_div",
+                    BinaryOperator::Remainder         => "ts_mod",
+                    BinaryOperator::Exponential       => "ts_pow",
+                    BinaryOperator::BitwiseOR         => "ts_bitor",
+                    BinaryOperator::BitwiseAnd        => "ts_bitand",
+                    BinaryOperator::BitwiseXOR        => "ts_bitxor",
+                    BinaryOperator::ShiftLeft         => "ts_shl",
+                    BinaryOperator::ShiftRight        => "ts_shr",
+                    BinaryOperator::ShiftRightZeroFill => "ts_ushr",
                     _ => unreachable!(),
                 };
                 Some(block.append_operation(func::call(
@@ -131,6 +142,34 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 return Ok((result_opt, block));
             }
             // Fall through for other operators (bitwise etc.) using i32 path below.
+        }
+
+        // For ** and bitwise operators with i32 operands, route through runtime (returns i64).
+        let is_runtime_op = matches!(binop.operator,
+            BinaryOperator::Exponential | BinaryOperator::BitwiseOR |
+            BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseXOR |
+            BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight |
+            BinaryOperator::ShiftRightZeroFill);
+        if is_runtime_op {
+            let lhs_i64 = self.ensure_i64(lhs, block)?;
+            let rhs_i64 = self.ensure_i64(rhs, block)?;
+            let fn_name = match binop.operator {
+                BinaryOperator::Exponential        => "ts_pow",
+                BinaryOperator::BitwiseOR          => "ts_bitor",
+                BinaryOperator::BitwiseAnd         => "ts_bitand",
+                BinaryOperator::BitwiseXOR         => "ts_bitxor",
+                BinaryOperator::ShiftLeft          => "ts_shl",
+                BinaryOperator::ShiftRight         => "ts_shr",
+                BinaryOperator::ShiftRightZeroFill => "ts_ushr",
+                _ => unreachable!(),
+            };
+            let res: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, fn_name),
+                &[lhs_i64, rhs_i64], &[self.i64_type()], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+            block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+            return Ok((Some(res), block));
         }
 
         let lhs_i32 = self.ensure_i32(lhs, block)?;
@@ -584,6 +623,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     self.loc,
                 )).result(0)?.into();
                 return Ok((Some(undef), block));
+            }
+            UnaryOperator::BitwiseNot => {
+                let op_i64 = self.ensure_i64(operand, block)?;
+                let res: Value<'c, 'b> = block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_bitnot"),
+                    &[op_i64], &[self.i64_type()], self.loc,
+                )).result(0)?.into();
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[op_i64], &[], self.loc));
+                return Ok((Some(res), block));
             }
             _ => bail!("unsupported unary operator: {:?}", unary.operator),
         };
@@ -1106,7 +1154,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                     block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
                                     res_i32
                                 }
-                                _ => bail!("unsupported compound assignment operator for cell var"),
+                                op => {
+                                    let fn_name = match op {
+                                        AssignmentOperator::Division   => "ts_div",
+                                        AssignmentOperator::Remainder  => "ts_mod",
+                                        AssignmentOperator::Exponential => "ts_pow",
+                                        AssignmentOperator::BitwiseOR  => "ts_bitor",
+                                        AssignmentOperator::BitwiseAnd => "ts_bitand",
+                                        AssignmentOperator::BitwiseXOR => "ts_bitxor",
+                                        AssignmentOperator::ShiftLeft  => "ts_shl",
+                                        AssignmentOperator::ShiftRight => "ts_shr",
+                                        AssignmentOperator::ShiftRightZeroFill => "ts_ushr",
+                                        _ => bail!("unsupported compound assignment operator for cell var: {:?}", op),
+                                    };
+                                    let res: Value<'c, 'b> = block.append_operation(func::call(
+                                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, fn_name),
+                                        &[lhs_i64, rhs_i64], &[self.i64_type()], self.loc,
+                                    )).result(0)?.into();
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                    block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                    res
+                                }
                             };
                             res
                         }
@@ -1174,7 +1242,27 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
                                 res_i32
                             }
-                            _ => bail!("unsupported compound assignment operator"),
+                            op => {
+                                let fn_name = match op {
+                                    AssignmentOperator::Division    => "ts_div",
+                                    AssignmentOperator::Remainder   => "ts_mod",
+                                    AssignmentOperator::Exponential => "ts_pow",
+                                    AssignmentOperator::BitwiseOR   => "ts_bitor",
+                                    AssignmentOperator::BitwiseAnd  => "ts_bitand",
+                                    AssignmentOperator::BitwiseXOR  => "ts_bitxor",
+                                    AssignmentOperator::ShiftLeft   => "ts_shl",
+                                    AssignmentOperator::ShiftRight  => "ts_shr",
+                                    AssignmentOperator::ShiftRightZeroFill => "ts_ushr",
+                                    _ => bail!("unsupported compound assignment operator: {:?}", op),
+                                };
+                                let res: Value<'c, 'b> = block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, fn_name),
+                                    &[lhs_i64, rhs_i64], &[self.i64_type()], self.loc,
+                                )).result(0)?.into();
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[lhs_i64], &[], self.loc));
+                                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[rhs_i64], &[], self.loc));
+                                res
+                            }
                         };
 
                         result_val
@@ -1671,7 +1759,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     AssignmentOperator::Subtraction => "ts_sub",
                     AssignmentOperator::Multiplication => "ts_mul",
                     AssignmentOperator::Division => "ts_div",
-                    AssignmentOperator::Remainder => "ts_rem",
+                    AssignmentOperator::Remainder => "ts_mod",
                     AssignmentOperator::Exponential => "ts_pow",
                     AssignmentOperator::BitwiseOR => "ts_bitor",
                     AssignmentOperator::BitwiseAnd => "ts_bitand",

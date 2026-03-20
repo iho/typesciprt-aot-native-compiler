@@ -307,7 +307,8 @@ pub use promise::{
 };
 pub use operators::{
     ts_number_is_integer, ts_number_is_finite, ts_number_is_nan, ts_number_is_safe_integer,
-    ts_add, ts_sub, ts_mul, ts_div, ts_mod,
+    ts_add, ts_sub, ts_mul, ts_div, ts_mod, ts_pow,
+    ts_bitor, ts_bitand, ts_bitxor, ts_shl, ts_shr, ts_ushr, ts_bitnot,
     ts_lt, ts_le, ts_gt, ts_ge,
     ts_math_abs, ts_math_floor, ts_math_ceil, ts_math_round, ts_math_sqrt,
     ts_math_trunc, ts_math_log, ts_math_log2, ts_math_log10,

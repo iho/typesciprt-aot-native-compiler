@@ -1193,7 +1193,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_sub", &[i64_type, i64_type], &[i64_type]);
         add_func("ts_mul", &[i64_type, i64_type], &[i64_type]);
         add_func("ts_div", &[i64_type, i64_type], &[i64_type]);
-        add_func("ts_mod", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_mod",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_pow",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_bitor",  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_bitand", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_bitxor", &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_shl",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_shr",    &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_ushr",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_bitnot", &[i64_type], &[i64_type]);
         add_func("ts_lt",  &[i64_type, i64_type], &[i32_type]);
         add_func("ts_le",  &[i64_type, i64_type], &[i32_type]);
         add_func("ts_gt",  &[i64_type, i64_type], &[i32_type]);

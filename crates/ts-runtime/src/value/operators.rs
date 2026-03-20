@@ -97,6 +97,44 @@ pub unsafe extern "C" fn ts_mod(a: TsVal, b: TsVal) -> TsVal {
     }
 }
 
+/// Exponentiation (**): Math.pow semantics.
+#[no_mangle]
+pub unsafe extern "C" fn ts_pow(a: TsVal, b: TsVal) -> TsVal {
+    f64_to_ts_num(ts_val_to_f64_raw(a).powf(ts_val_to_f64_raw(b)))
+}
+
+/// Bitwise helpers — operate on i32 representations (JS ToInt32 semantics).
+#[no_mangle]
+pub unsafe extern "C" fn ts_bitor(a: TsVal, b: TsVal) -> TsVal {
+    TsVal::from_i32(a.as_i32() | b.as_i32())
+}
+#[no_mangle]
+pub unsafe extern "C" fn ts_bitand(a: TsVal, b: TsVal) -> TsVal {
+    TsVal::from_i32(a.as_i32() & b.as_i32())
+}
+#[no_mangle]
+pub unsafe extern "C" fn ts_bitxor(a: TsVal, b: TsVal) -> TsVal {
+    TsVal::from_i32(a.as_i32() ^ b.as_i32())
+}
+#[no_mangle]
+pub unsafe extern "C" fn ts_shl(a: TsVal, b: TsVal) -> TsVal {
+    TsVal::from_i32(a.as_i32().wrapping_shl((b.as_i32() as u32) & 0x1F))
+}
+#[no_mangle]
+pub unsafe extern "C" fn ts_shr(a: TsVal, b: TsVal) -> TsVal {
+    TsVal::from_i32(a.as_i32().wrapping_shr((b.as_i32() as u32) & 0x1F))
+}
+#[no_mangle]
+pub unsafe extern "C" fn ts_ushr(a: TsVal, b: TsVal) -> TsVal {
+    let n = (a.as_i32() as u32).wrapping_shr((b.as_i32() as u32) & 0x1F);
+    // JS >>> always returns an unsigned 32-bit integer; represent as i32 in TsVal
+    TsVal::from_i32(n as i32)
+}
+#[no_mangle]
+pub unsafe extern "C" fn ts_bitnot(a: TsVal) -> TsVal {
+    TsVal::from_i32(!a.as_i32())
+}
+
 // ── Comparisons ───────────────────────────────────────────────────────────────
 
 /// JS abstract relational comparison: strings compared lexicographically, else numerically.
