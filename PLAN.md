@@ -299,6 +299,39 @@ The real NestJS injector creates instances via `Object.create(metatype.prototype
 
 ---
 
+## Language Gap Backlog (2026-03-20)
+
+Gaps identified by static analysis of the current lowering code. Ordered by practical impact.
+
+### [ ] 1. `++`/`--` on member/computed targets
+`obj.x++`, `arr[i]++`, `this.count++` silently return `undefined`.
+`operators.rs:lower_update_expression` only handles `BindingIdentifier`; all other targets fall to a warning + return `None`.
+
+### [ ] 2. Compound assignment (`+=`, `-=`, etc.) on computed members
+`arr[i] += 1`, `obj[key] -= 2` not supported. `operators.rs:1748` emits an unsupported-operator error.
+
+### [ ] 3. Compound assignment on private fields
+`this.#field += 1` not supported. `operators.rs:1781` explicitly bails. Only `this.#field = val` works.
+
+### [ ] 4. Logical assignment (`||=`, `&&=`, `??=`) to member targets
+`obj.x ??= y`, `this.x ||= y` don't work. `operators.rs:887` bails with "not supported yet". Only identifier targets work (e.g. `x ??= y`).
+
+### [ ] 5. Nested destructuring
+`const { a: { b } } = obj`, `const [[x, y]] = arr` are skipped with debug logging.
+`statements.rs:683,688,818,824` — nested patterns inside object/array destructuring are unhandled.
+
+### [ ] 6. Async class methods
+`async doSomething() { ... }` inside a class body isn't properly async.
+`classes.rs` sets `is_async` but the method body doesn't emit the Promise wrapping / await plumbing that `lower_function_declaration` does for top-level async functions.
+
+### [ ] 7. `import.meta`
+`import.meta.url`, `import.meta.env` etc. aren't handled. Common in Vite/Bun projects.
+
+### [ ] 8. Generator functions
+`function*` / `yield` not supported. Yield outside a generator context returns `undefined`.
+
+---
+
 ## Design Principles
 
 1. **Correctness over shortcuts** — Implement features correctly for long-term use, not as no-ops
