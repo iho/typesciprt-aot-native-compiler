@@ -9,10 +9,15 @@ use anyhow::{bail, Context, Result};
 use melior::ir::Module;
 use melior::ir::operation::OperationLike;
 
-const LLVM_PREFIX: &str = "/opt/homebrew/opt/llvm";
+fn llvm_prefix() -> String {
+    if let Ok(prefix) = std::env::var("TSCC_LLVM_PREFIX") {
+        return prefix;
+    }
+    "/opt/homebrew/opt/llvm".to_string()
+}
 
 fn llvm_bin(tool: &str) -> String {
-    format!("{LLVM_PREFIX}/bin/{tool}")
+    format!("{}/bin/{tool}", llvm_prefix())
 }
 
 // ── MLIR → LLVM IR ───────────────────────────────────────────────────────────
@@ -111,6 +116,39 @@ pub fn build_runtime() -> Result<PathBuf> {
     Ok(lib)
 }
 
+/// Build ts-runtime with the `napi` feature enabled, returning the static archive path.
+pub fn build_runtime_napi() -> Result<PathBuf> {
+    let exe_path = std::env::current_exe().context("locate tscc executable")?;
+    let target_dir = exe_path
+        .parent()
+        .context("tscc executable has no parent directory")?;
+    let workspace_root = target_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .context("cannot determine workspace root from executable path")?;
+
+    let is_release = target_dir.file_name().map_or(false, |n| n == "release");
+    let mut args = vec!["build", "-p", "ts-runtime", "--features", "napi"];
+    if is_release {
+        args.push("--release");
+    }
+    let status = Command::new("cargo")
+        .args(&args)
+        .current_dir(workspace_root)
+        .status()
+        .context("spawn `cargo build -p ts-runtime --features napi`")?;
+
+    if !status.success() {
+        bail!("`cargo build -p ts-runtime --features napi` failed");
+    }
+
+    let lib = target_dir.join("libts_runtime.a");
+    if !lib.exists() {
+        bail!("expected {} but it was not produced", lib.display());
+    }
+    Ok(lib)
+}
+
 // ── Object file → native binary ───────────────────────────────────────────────
 
 /// Link the object files using `clang` (which drives `lld`/`ld`).
@@ -140,6 +178,42 @@ pub fn link_binary(objs: &[&Path], out: &Path) -> Result<()> {
 
     if !status.success() {
         bail!("clang linker exited with {status}");
+    }
+    Ok(())
+}
+
+/// Link object files into a Node.js native addon (`.node` dynamic library).
+///
+/// The resulting file can be loaded in Node.js via `require('./output.node')`.
+pub fn link_node_addon(objs: &[&Path], out: &Path) -> Result<()> {
+    let mut cmd = Command::new(llvm_bin("clang"));
+    for obj in objs {
+        cmd.arg(obj);
+    }
+    cmd.arg("-o").arg(out);
+
+    if cfg!(target_os = "macos") {
+        // macOS: build a dynamic library; resolve napi symbols at load time from Node.js.
+        cmd.args([
+            "-dynamiclib",
+            "-undefined", "dynamic_lookup",
+            "-liconv",
+            "-lc++",
+            "-framework", "CoreFoundation",
+            "-framework", "Security",
+        ]);
+    } else {
+        // Linux: build a shared library; napi symbols come from the node process image.
+        cmd.args([
+            "-shared",
+            "-fPIC",
+        ]);
+    }
+
+    let status = cmd.status().context("spawn clang (node addon linker)")?;
+
+    if !status.success() {
+        bail!("clang node addon linker exited with {status}");
     }
     Ok(())
 }

@@ -7,7 +7,7 @@ use super::array::{ts_arr_new, ts_arr_get, ts_arr_push};
 
 static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
-pub(super) fn get_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn get_runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()

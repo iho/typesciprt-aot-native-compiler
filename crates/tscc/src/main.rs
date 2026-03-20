@@ -56,6 +56,11 @@ struct Cli {
     /// Use this to link C/Rust FFI libraries called via `declare function`.
     #[arg(long = "link-lib", value_name = "PATH")]
     link_libs: Vec<PathBuf>,
+
+    /// Compile to a Node.js native addon (.node file) instead of a standalone binary.
+    /// Export functions are exposed as module exports loadable via require('./output.node').
+    #[arg(long)]
+    emit_node_addon: bool,
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -90,7 +95,8 @@ fn main() -> Result<()> {
 
     // ── 3. Lower AST → MLIR ───────────────────────────────────────────────
 
-    let cg      = CodegenContext::new();
+    let mut cg  = CodegenContext::new();
+    cg.addon_mode = cli.emit_node_addon;
     let mut module  = lower_program(&cg, &program, &file_name)
         .context("AST → MLIR lowering failed")?;
 
@@ -118,7 +124,11 @@ fn main() -> Result<()> {
     let ll_path  = out_dir.join(format!("{}.ll",  stem.to_string_lossy()));
     let obj_path = out_dir.join(format!("{}.o",   stem.to_string_lossy()));
     let bin_path = cli.output.clone().unwrap_or_else(|| {
-        out_dir.join(format!("{}.exe", stem.to_string_lossy()))
+        if cli.emit_node_addon {
+            out_dir.join(format!("{}.node", stem.to_string_lossy()))
+        } else {
+            out_dir.join(format!("{}.exe", stem.to_string_lossy()))
+        }
     });
 
     emit::mlir_to_llvm_ir(&module, &ll_path)
@@ -136,16 +146,26 @@ fn main() -> Result<()> {
         .context("LLVM IR → object compilation failed")?;
 
     // Build the Rust runtime (ts-runtime crate) and get the static archive.
-    let runtime_obj = emit::build_runtime().context("runtime build failed")?;
+    let runtime_obj = if cli.emit_node_addon {
+        emit::build_runtime_napi().context("runtime (napi) build failed")?
+    } else {
+        emit::build_runtime().context("runtime build failed")?
+    };
 
-    // ── 7. Link → native binary ───────────────────────────────────────────
+    // ── 7. Link → native binary or node addon ─────────────────────────────
 
     info!("linking → {}", bin_path.display());
     let mut link_inputs: Vec<&std::path::Path> = vec![&obj_path, &runtime_obj];
     let extra_libs: Vec<&std::path::Path> = cli.link_libs.iter().map(|p| p.as_path()).collect();
     link_inputs.extend_from_slice(&extra_libs);
-    emit::link_binary(&link_inputs, &bin_path)
-        .context("linking failed")?;
+
+    if cli.emit_node_addon {
+        emit::link_node_addon(&link_inputs, &bin_path)
+            .context("linking node addon failed")?;
+    } else {
+        emit::link_binary(&link_inputs, &bin_path)
+            .context("linking failed")?;
+    }
 
     println!("✓  compiled to {}", bin_path.display());
     Ok(())

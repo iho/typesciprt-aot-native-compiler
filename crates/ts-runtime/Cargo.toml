@@ -17,6 +17,7 @@ crate-type = ["staticlib", "rlib"]
 
 [features]
 dhat-heap = ["dhat"]
+napi = []
 
 [dependencies]
 dhat = { version = "0.3", optional = true }
@@ -35,3 +36,5 @@ hmac    = "0.12"
 hex     = "0.4"
 rand    = "0.8"
 uuid    = { version = "1", features = ["v4"] }
+pbkdf2  = { version = "0.12", features = ["simple"] }
+scrypt  = "0.11"

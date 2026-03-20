@@ -490,6 +490,8 @@ pub fn lower_program<'c>(
         cell_vars: std::collections::HashSet::new(),
         cell_captures: std::collections::HashSet::new(),
         pending_label: None,
+        addon_mode: cg.addon_mode,
+        napi_exports: Vec::new(),
     };
 
     // Emit external runtime declarations (e.g. __ts_console_log_i32).
@@ -534,7 +536,9 @@ pub fn lower_program<'c>(
                             ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
                                 Some(s.local.name.to_string())
                             }
-                            _ => None,
+                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                                Some(s.local.name.to_string())
+                            }
                         }
                     }).collect()
                 } else {
@@ -556,13 +560,31 @@ pub fn lower_program<'c>(
     for stmt in &program.body {
         if let Statement::ImportDeclaration(import) = stmt {
             if let Some(specs) = &import.specifiers {
+                let src = import.source.value.as_str();
                 for spec in specs {
-                    if let ImportDeclarationSpecifier::ImportSpecifier(s) = spec {
-                        let alias = s.local.name.to_string();
-                        let original = s.imported.name().to_string();
-                        if alias != original {
-                            lowerer.module_global_aliases.insert(alias, original);
+                    match spec {
+                        ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                            let alias = s.local.name.to_string();
+                            let original = s.imported.name().to_string();
+                            if alias != original {
+                                lowerer.module_global_aliases.insert(alias, original);
+                            }
                         }
+                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                            // `import * as X from 'mod'` — map the local name X to the
+                            // module's default-export global (the bare module name).
+                            let local = s.local.name.to_string();
+                            let bare = if src.starts_with("node:") {
+                                src["node:".len()..].to_string()
+                            } else {
+                                // For bare specifiers use the last path segment.
+                                src.rsplit('/').next().unwrap_or(src).to_string()
+                            };
+                            if local != bare {
+                                lowerer.module_global_aliases.insert(local, bare);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -599,12 +621,29 @@ pub fn lower_program<'c>(
             }
             Statement::ExportNamedDeclaration(export) => {
                 if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
+                    // In addon mode, record every exported function for __napi_init.
+                    if lowerer.addon_mode {
+                        if let Some(id) = &func.id {
+                            let fn_name = id.name.to_string();
+                            let sig = lowerer.funcs.get(&fn_name).cloned();
+                            let arity = sig.map_or(0, |s| s.param_types.len());
+                            lowerer.napi_exports.push((fn_name, arity));
+                        }
+                    }
                     lowerer.lower_function_declaration(func)?;
                 }
             }
             Statement::ExportDefaultDeclaration(export) => {
                 use oxc_ast::ast::ExportDefaultDeclarationKind;
                 if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration {
+                    if lowerer.addon_mode {
+                        if let Some(id) = &func.id {
+                            let fn_name = id.name.to_string();
+                            let sig = lowerer.funcs.get(&fn_name).cloned();
+                            let arity = sig.map_or(0, |s| s.param_types.len());
+                            lowerer.napi_exports.push((fn_name, arity));
+                        }
+                    }
                     lowerer.lower_function_declaration(func)?;
                 }
             }
@@ -615,8 +654,14 @@ pub fn lower_program<'c>(
     // Pass 2c – lower module-level const arrow/function declarations as hoisted functions.
     lowerer.lower_module_const_functions(program)?;
 
-    // Pass 3 – lower the implicit `main` (non-function statements).
-    lowerer.lower_main_function(program)?;
+    // Pass 3 – generate entry point.
+    if lowerer.addon_mode {
+        // Addon mode: generate __napi_init() instead of main().
+        lowerer.lower_napi_init_function(program)?;
+    } else {
+        // Normal mode: generate the implicit main().
+        lowerer.lower_main_function(program)?;
+    }
 
     Ok(module)
 }
@@ -691,6 +736,12 @@ struct Lowerer<'c, 'm> {
     /// When a `LabeledStatement` wraps a loop/switch, this holds the label name so the
     /// loop-lowering code can attach it to the `inner_loops` entry it creates.
     pending_label: Option<String>,
+    /// Whether we are compiling in Node.js addon mode.
+    /// When true, `__napi_init()` is generated instead of `main()`.
+    addon_mode: bool,
+    /// Collected (fn_name, arity) pairs for each `export function` in the main program.
+    /// Populated during Pass 2b; consumed by `lower_napi_init_function`.
+    napi_exports: Vec<(String, usize)>,
 }
 
 impl<'c, 'm> Lowerer<'c, 'm> {
@@ -1498,8 +1549,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Node.js crypto module
         add_func("ts_crypto_random_uuid",         &[], &[i64_type]);
         add_func("ts_crypto_random_bytes_hex",    &[i64_type], &[i64_type]);
+        add_func("ts_crypto_random_bytes",        &[i64_type], &[i64_type]);
         add_func("ts_crypto_hash_sync",           &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_crypto_hmac_sync",           &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_crypto_pbkdf2_sync",         &[i64_type, i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_crypto_scrypt_sync",         &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_crypto_timing_safe_equal",   &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_crypto_random_fill_sync",    &[i64_type], &[i64_type]);
 
         // Node.js events module (EventEmitter)
         add_func("ts_event_emitter_new",          &[], &[i64_type]);
@@ -1528,6 +1584,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_process_versions",           &[], &[i64_type]);
         add_func("ts_process_hrtime",             &[], &[i64_type]);
         add_func("ts_process_uptime",             &[], &[i64_type]);
+
+        // Node.js http module
+        add_func("ts_http_server_listen",         &[i64_type, i64_type], &[i64_type]);
+
+        // Node-API export registration (used in --emit-node-addon mode).
+        add_func("ts_napi_register_export", &[ptr_type, ptr_type, i32_type], &[]);
 
         // Mark all runtime-declared functions as emitted so that `declare function`
         // in shim files doesn't try to re-declare them (which causes MLIR symbol redefinition).

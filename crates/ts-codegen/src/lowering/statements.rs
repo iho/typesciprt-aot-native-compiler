@@ -92,6 +92,131 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         Ok(())
     }
 
+    // ── Node-API init function ────────────────────────────────────────────
+
+    /// Generate `__napi_init()` — the addon entry point called by `napi_register_module_v1`.
+    ///
+    /// This function:
+    ///   1. Calls all module init functions (same as `main()`).
+    ///   2. Runs all non-function top-level statements (module-level code).
+    ///   3. Calls `ts_napi_register_export(name_ptr, fn_ptr, arity)` for every
+    ///      `export function` collected during Pass 2b.
+    pub(super) fn lower_napi_init_function(&mut self, program: &Program<'_>) -> Result<()> {
+        let i32_type = self.i32_type();
+        let i64_type = self.i64_type();
+        let ptr_type = self.llvm_ptr_type();
+
+        let fn_type = FunctionType::new(self.ctx, &[], &[]);
+        let region = Region::new();
+        let entry = region.append_block(Block::new(&[]));
+        let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
+        let mut current_block = entry;
+
+        // Call module init functions.
+        for init_fn_name in self.module_init_fns.clone().iter() {
+            current_block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, init_fn_name),
+                &[], &[], self.loc,
+            ));
+        }
+
+        // Compute cell vars and run top-level statements (same as main).
+        let saved_cell_vars = std::mem::replace(
+            &mut self.cell_vars,
+            crate::lowering::expressions::compute_cell_vars_for_body(&program.body),
+        );
+        let saved_cell_captures = std::mem::replace(
+            &mut self.cell_captures,
+            std::collections::HashSet::new(),
+        );
+
+        for stmt in &program.body {
+            if matches!(stmt, Statement::FunctionDeclaration(_)) {
+                continue;
+            }
+            let (_, nb) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
+            current_block = nb;
+        }
+
+        // Release scope variables.
+        for (_, v) in &scope {
+            let v_i64 = self.ensure_i64(*v, current_block)?;
+            current_block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[v_i64], &[], self.loc,
+            ));
+        }
+
+        self.cell_vars = saved_cell_vars;
+        self.cell_captures = saved_cell_captures;
+
+        // Register each exported function with the napi bridge.
+        let exports = self.napi_exports.clone();
+        for (fn_name, arity) in &exports {
+            // Get a pointer to the compiled function via func.constant + unrealized_conversion_cast.
+            let sig = self.funcs.get(fn_name).cloned();
+            let n_params = sig.map_or(*arity, |s| s.param_types.len());
+            let param_types: Vec<melior::ir::Type<'c>> = vec![i64_type; n_params];
+            let func_type_attr: melior::ir::Type<'c> = FunctionType::new(
+                self.ctx, &param_types, &[i64_type],
+            ).into();
+            let fn_ref: Value<'c, '_> = current_block.append_operation(
+                melior::ir::operation::OperationBuilder::new("func.constant", self.loc)
+                    .add_attributes(&[(
+                        melior::ir::Identifier::new(self.ctx, "value"),
+                        FlatSymbolRefAttribute::new(self.ctx, fn_name).into(),
+                    )])
+                    .add_results(&[func_type_attr])
+                    .build()?,
+            ).result(0)?.into();
+            let fn_ptr: Value<'c, '_> = current_block.append_operation(
+                melior::ir::operation::OperationBuilder::new("builtin.unrealized_conversion_cast", self.loc)
+                    .add_operands(&[fn_ref])
+                    .add_results(&[ptr_type])
+                    .build()?,
+            ).result(0)?.into();
+
+            // Build the name C-string pointer.
+            let name_ptr = self.get_string_ptr(fn_name, current_block)?;
+
+            // Emit the arity as i32.
+            let arity_val: Value<'c, '_> = current_block.append_operation(
+                arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(i32_type, n_params as i64).into(),
+                    self.loc,
+                )
+            ).result(0)?.into();
+
+            current_block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_napi_register_export"),
+                &[name_ptr, fn_ptr, arity_val],
+                &[],
+                self.loc,
+            ));
+        }
+
+        // Return void.
+        current_block.append_operation(func::r#return(&[], self.loc));
+
+        let op = func::func(
+            self.ctx,
+            StringAttribute::new(self.ctx, "__napi_init"),
+            TypeAttribute::new(fn_type.into()),
+            region,
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "public").into(),
+            )],
+            self.loc,
+        );
+        self.module.body().append_operation(op);
+        Ok(())
+    }
+
     // ── Class constructor TsFunction helper ──────────────────────────────
 
     /// Emit code that creates the constructor TsFunction for a named class in `block`.

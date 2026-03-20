@@ -36,19 +36,21 @@ jobs:
       - name: Install LLVM (Linux)
         if: runner.os == 'Linux'
         run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
-          echo "MLIR_SYS_180_PREFIX=/usr/lib/llvm-18" >> $GITHUB_ENV
-          echo "LLVM_SYS_180_PREFIX=/usr/lib/llvm-18" >> $GITHUB_ENV
-          echo "TABLEGEN_180_PREFIX=/usr/lib/llvm-18" >> $GITHUB_ENV
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          echo "MLIR_SYS_210_PREFIX=/usr/lib/llvm-21" >> $GITHUB_ENV
+          echo "LLVM_SYS_210_PREFIX=/usr/lib/llvm-21" >> $GITHUB_ENV
+          echo "TABLEGEN_210_PREFIX=/usr/lib/llvm-21" >> $GITHUB_ENV
+          echo "TSCC_LLVM_PREFIX=/usr/lib/llvm-21" >> $GITHUB_ENV
 
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm@18
-          LLVM_PREFIX=$(brew --prefix llvm@18)
-          echo "MLIR_SYS_180_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
-          echo "LLVM_SYS_180_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
-          echo "TABLEGEN_180_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
+          brew install llvm@21
+          LLVM_PREFIX=$(brew --prefix llvm@21)
+          echo "MLIR_SYS_210_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
+          echo "LLVM_SYS_210_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
+          echo "TABLEGEN_210_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
+          echo "TSCC_LLVM_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
 
       - name: Build
         run: cargo build -p tscc

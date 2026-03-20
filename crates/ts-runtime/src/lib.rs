@@ -35,6 +35,9 @@ pub mod string;
 pub mod value;
 pub mod node;
 
+#[cfg(feature = "napi")]
+pub mod napi_bridge;
+
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 

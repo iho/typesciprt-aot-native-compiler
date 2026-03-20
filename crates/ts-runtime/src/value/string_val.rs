@@ -95,6 +95,11 @@ pub unsafe extern "C" fn ts_val_length(val: TsVal) -> TsVal {
                 let s = &*(val.as_ptr() as *const TsString);
                 return TsVal::from_i32(s.inner.chars().count() as i32);
             }
+            17 => {
+                // TsBuffer
+                let b = &*(val.as_ptr() as *const crate::node::buffer::TsBuffer);
+                return TsVal::from_i32(b.data.len() as i32);
+            }
             _ => {}
         }
     }

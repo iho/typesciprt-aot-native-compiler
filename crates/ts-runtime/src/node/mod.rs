@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod events;
 pub mod buffer;
 pub mod process_ext;
+pub mod http;
 
 pub use events::HEAP_TAG_EVENT_EMITTER;
 pub use buffer::HEAP_TAG_BUFFER;

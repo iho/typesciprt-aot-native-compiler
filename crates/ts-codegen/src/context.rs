@@ -5,6 +5,9 @@ use melior::{dialect::DialectRegistry, Context};
 /// Owns the MLIR `Context` and is kept alive for the duration of codegen.
 pub struct CodegenContext {
     pub mlir: Context,
+    /// When true, compile in Node.js addon mode: generate `__napi_init()` instead of `main()`,
+    /// and register `export function` declarations with `ts_napi_register_export`.
+    pub addon_mode: bool,
 }
 
 impl CodegenContext {
@@ -22,7 +25,7 @@ impl CodegenContext {
         // incrementally add support for new nodes without crashing.
         ctx.set_allow_unregistered_dialects(true);
 
-        Self { mlir: ctx }
+        Self { mlir: ctx, addon_mode: false }
     }
 }
 

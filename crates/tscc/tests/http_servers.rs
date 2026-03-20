@@ -300,3 +300,63 @@ fn nest_unmodified_not_found() {
     let (code, _) = curl(&url, &[]);
     assert_eq!(code, 404, "expected 404, got {code}");
 }
+
+// ── node:http built-in module ─────────────────────────────────────────────────
+
+const NODE_HTTP_PORT: u16 = 19001;
+
+fn start_node_http() -> (ServerGuard, PathBuf) {
+    let src  = repo_root().join("examples/node_http_server.ts");
+    let dest = repo_root().join("examples/node_http_fixture.ts");
+    let source = std::fs::read_to_string(&src).unwrap();
+    let patched = source.replace(
+        &format!("const PORT = {NODE_HTTP_PORT};"),
+        &format!("const PORT = {NODE_HTTP_PORT};"),
+    );
+    std::fs::write(&dest, patched).unwrap();
+    let out = repo_root().join("target/test-node-http");
+    compile_server(&dest, &out);
+    let child = Command::new(&out).spawn().expect("server binary failed to spawn");
+    wait_for_port(NODE_HTTP_PORT);
+    (ServerGuard(child), out)
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn node_http_get_root() {
+    let (_guard, _) = start_node_http();
+    let url = format!("http://127.0.0.1:{NODE_HTTP_PORT}/");
+    let (code, body) = curl(&url, &[]);
+    assert_eq!(code, 200, "expected 200, got {code}");
+    assert_eq!(body.trim(), "Hello from node:http!");
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn node_http_get_hello() {
+    let (_guard, _) = start_node_http();
+    let url = format!("http://127.0.0.1:{NODE_HTTP_PORT}/hello");
+    let (code, body) = curl(&url, &[]);
+    assert_eq!(code, 200, "expected 200, got {code}");
+    assert_eq!(body.trim(), "Hello World");
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn node_http_post_echo() {
+    let (_guard, _) = start_node_http();
+    let url = format!("http://127.0.0.1:{NODE_HTTP_PORT}/echo");
+    let (code, body) = curl(&url, &["-X", "POST", "-d", "hello world"]);
+    assert_eq!(code, 200, "expected 200, got {code}");
+    assert_eq!(body.trim(), "Echo: hello world");
+}
+
+#[test]
+#[ignore = "requires LLVM; run with --include-ignored"]
+fn node_http_not_found() {
+    let (_guard, _) = start_node_http();
+    let url = format!("http://127.0.0.1:{NODE_HTTP_PORT}/no-such-route");
+    let (code, body) = curl(&url, &[]);
+    assert_eq!(code, 404, "expected 404, got {code}");
+    assert_eq!(body.trim(), "Not Found");
+}
