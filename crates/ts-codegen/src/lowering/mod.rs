@@ -69,7 +69,11 @@ struct FuncSig<'c> {
 #[derive(Clone)]
 struct ClassSig {
     constructor_name: String,
+    /// Number of MLIR params the constructor takes.
+    constructor_arity: usize,
     methods:  HashMap<String, String>,                  // instance method name → mangled
+    /// Arity of each instance method (number of MLIR params including `self`).
+    method_arity: HashMap<String, usize>,
     statics:  HashMap<String, String>,                  // static method name → mangled
     getters:  std::collections::HashSet<String>,        // property names with getters
     setters:  std::collections::HashSet<String>,        // property names with setters
@@ -91,8 +95,24 @@ fn load_import_static(path: &std::path::Path) -> Option<oxc_ast::ast::Program<'s
 
 /// Resolve a relative import source string to an actual `.ts` file path.
 /// Tries `<src>.ts`, then `<src>/index.ts` for directory-style imports.
+/// Walk up from `from_dir` looking for a `shims/<package>.ts` file.
+fn find_npm_shim(package_name: &str, from_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = from_dir.to_path_buf();
+    loop {
+        let shim = dir.join("shims").join(format!("{}.ts", package_name));
+        if shim.exists() { return Some(shim); }
+        if !dir.pop() { break; }
+    }
+    None
+}
+
 fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if !src.starts_with("./") && !src.starts_with("../") { return None; }
+    // Bare specifiers (npm package names): look for shims walking up the directory tree.
+    if !src.starts_with("./") && !src.starts_with("../") {
+        if src.starts_with("node:") { return None; }
+        // Simple package name (no path separator after optional @scope/)
+        return find_npm_shim(src, base_dir);
+    }
     let joined = base_dir.join(src);
     // Normalize away `.` components in the path.
     let mut p = std::path::PathBuf::new();
@@ -114,8 +134,17 @@ fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::pa
         return Some(ts);
     }
     if p.extension().map_or(false, |e| e != "ts") {
+        // First try appending .ts (handles multi-part names like "bind.decorator" → "bind.decorator.ts").
+        let mut appended = p.clone().into_os_string();
+        appended.push(".ts");
+        let appended_path = std::path::PathBuf::from(appended);
+        if appended_path.exists() { return Some(appended_path); }
+        // Then try replacing the last extension ("bind.decorator" → "bind.ts").
         let ts = p.with_extension("ts");
         if ts.exists() { return Some(ts); }
+        // Also try directory index.
+        let idx = p.join("index.ts");
+        if idx.exists() { return Some(idx); }
     }
     Some(p)
 }
@@ -885,7 +914,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // v1.0: template literals, array/string methods, spread
         add_func("ts_val_to_string",   &[i64_type], &[i64_type]);
         add_func("ts_val_length",      &[i64_type], &[i64_type]);
-        add_func("ts_arr_push",        &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_arr_push",        &[i64_type, i64_type], &[]);
         add_func("ts_arr_pop",         &[i64_type], &[i64_type]);
         add_func("ts_arr_unshift",     &[i64_type, i64_type], &[i64_type]);
         add_func("ts_arr_shift",       &[i64_type], &[i64_type]);
@@ -1083,6 +1112,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_process_exit",        &[i32_type], &[]);
         add_func("ts_process_argv",        &[], &[i64_type]);
         add_func("ts_process_env",         &[], &[i64_type]);
+        add_func("ts_process_pid",         &[], &[i64_type]);
 
         // Additional builtins
         add_func("ts_promise_reject",       &[i64_type], &[i64_type]);
@@ -1156,6 +1186,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_reflect_get_metadata_keys",  &[i64_type, i64_type], &[i64_type]);
         add_func("ts_reflect_get_own_metadata_keys", &[i64_type, i64_type], &[i64_type]);
         add_func("ts_reflect_delete_metadata",    &[i64_type, i64_type, i64_type], &[i64_type]);
+        add_func("ts_reflect_get_prototype_of",              &[i64_type], &[i64_type]);
+        add_func("ts_reflect_get_own_property_descriptor",   &[i64_type, i64_type], &[i64_type]);
 
         // Object introspection
         add_func("ts_obj_get_own_property_names", &[i64_type], &[i64_type]);
@@ -1426,9 +1458,26 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let class_name = id.name.to_string();
 
             let mut methods: HashMap<String, String> = HashMap::new();
+            let mut method_arity: HashMap<String, usize> = HashMap::new();
             let mut statics: HashMap<String, String> = HashMap::new();
             let mut getters: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut setters: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            // Collect constructor arity (number of MLIR params the constructor will take).
+            let builtin_error_names = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError"];
+            let parent_name_for_arity = class.super_class.as_ref().and_then(|e| {
+                if let Expression::Identifier(id) = e { Some(id.name.as_str()) } else { None }
+            });
+            let ctor_elem = class.body.body.iter().find(|e| {
+                matches!(e, ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor && m.value.body.is_some())
+            });
+            let constructor_arity = match ctor_elem {
+                Some(ClassElement::MethodDefinition(m)) => m.value.params.items.len(),
+                _ => {
+                    // No explicit constructor: implicit error param if parent is builtin Error.
+                    if parent_name_for_arity.map(|n| builtin_error_names.contains(&n)).unwrap_or(false) { 1 } else { 0 }
+                }
+            };
 
             for element in &class.body.body {
                 let ClassElement::MethodDefinition(method) = element else { continue };
@@ -1459,6 +1508,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                     (MethodDefinitionKind::Method, false) => {
                         let mangled = format!("__class_{}_{}", class_name, name);
+                        // arity = 1 (self) + positional params + (1 if rest param)
+                        let rest = if method.value.params.rest.is_some() { 1 } else { 0 };
+                        let arity = 1 + method.value.params.items.len() + rest;
+                        method_arity.insert(name.clone(), arity);
                         methods.insert(name, mangled);
                     }
                     _ => {}
@@ -1484,7 +1537,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
             own_members.push((class_name.clone(), ClassSig {
                 constructor_name: format!("__class_{}_constructor", class_name),
+                constructor_arity,
                 methods,
+                method_arity,
                 statics,
                 getters,
                 setters,
@@ -1499,6 +1554,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Some(parent_sig) = self.classes.get(&parent_name).cloned() {
                     for (n, m) in &parent_sig.methods {
                         sig.methods.entry(n.clone()).or_insert_with(|| m.clone());
+                    }
+                    for (n, a) in &parent_sig.method_arity {
+                        sig.method_arity.entry(n.clone()).or_insert(*a);
                     }
                     for n in &parent_sig.getters {
                         if !sig.getters.contains(n) { sig.getters.insert(n.clone()); }
@@ -1516,6 +1574,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
     pub fn lower_function_declaration(&mut self, func: &Function<'_>) -> Result<()> {
         let Some(id) = &func.id else { return Ok(()) };
+        // Skip TypeScript overload signatures (declarations without a body).
+        if func.body.is_none() { return Ok(()); }
         let name = id.name.to_string();
         let i32_type = self.i32_type();
         let i64_type = self.i64_type();
@@ -1919,6 +1979,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         rest_param_name: Option<&str>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
         is_async_override: Option<bool>,
+        is_expr_body: bool,
     ) -> Result<()> {
         let i64_type = self.i64_type();
         let i32_type = self.i32_type();
@@ -2033,6 +2094,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.is_async = is_async;
         if let Some(body) = body {
             for stmt in &body.statements {
+                // For expression-body arrows (=> expr), the single ExpressionStatement
+                // IS the return value. Do NOT release it; preserve the owned reference.
+                if is_expr_body {
+                    if let oxc_ast::ast::Statement::ExpressionStatement(es) = stmt {
+                        let (val_opt, nb) = self.lower_expression(&es.expression, current_block, &region, &mut scope)?;
+                        current_block = nb;
+                        if let Some(v) = val_opt {
+                            result_value = self.ensure_i64(v, current_block)?;
+                        }
+                        continue;
+                    }
+                }
                 let (val, next) = self.lower_statement(stmt, current_block, &region, &mut scope, &[])?;
                 current_block = next;
                 if let Some(v) = val { result_value = v; }

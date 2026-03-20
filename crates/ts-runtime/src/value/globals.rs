@@ -16,6 +16,18 @@ fn globals_map() -> &'static RwLock<HashMap<String, TsVal>> {
 #[no_mangle]
 pub unsafe extern "C" fn ts_set_module_global(name_ptr: *const i8, val: TsVal) {
     let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+    // Debug: log all module global stores with pointer info.
+    if val.is_ptr() {
+        let ptr = val.as_ptr();
+        let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
+        let header = ptr.sub(header_size) as *const crate::alloc::ArcHeader;
+        let rc = (*header).ref_count.load(std::sync::atomic::Ordering::SeqCst);
+        if rc == 0 || rc == 0xDEAD_BEEF_DEAD_BEEFu64 || rc > 0x100_0000 {
+            eprintln!("ts_set_module_global: storing freed/corrupted value for key '{}' ptr={:p} rc={:#x}", name, ptr, rc);
+            std::process::abort();
+        }
+        eprintln!("DBG set_global '{}' ptr={:p} rc={} tag={}", name, ptr, rc, (*header).tag);
+    }
     ts_retain_val(val);
     let mut map = globals_map().write().unwrap();
     if let Some(old) = map.insert(name, val) {
@@ -53,6 +65,12 @@ pub unsafe extern "C" fn ts_process_argv() -> TsVal {
         ts_release_val(s);
     }
     arr
+}
+
+/// process.pid — returns the current process ID as a NaN-boxed integer.
+#[no_mangle]
+pub unsafe extern "C" fn ts_process_pid() -> TsVal {
+    TsVal::from_i32(std::process::id() as i32)
 }
 
 /// process.env — returns a TsObject mapping env var names to their string values.

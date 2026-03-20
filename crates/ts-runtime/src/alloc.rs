@@ -44,6 +44,13 @@ pub unsafe extern "C" fn ts_retain(ptr: *mut u8) {
     if ptr.is_null() { return; }
     let header_size = std::mem::size_of::<ArcHeader>();
     let header_ptr = unsafe { ptr.sub(header_size) } as *mut ArcHeader;
+    let cur_rc = unsafe { (*header_ptr).ref_count.load(Ordering::SeqCst) };
+    if cur_rc == 0 || cur_rc == 0xDEAD_BEEF_DEAD_BEEFu64 || cur_rc > 0x100_0000 {
+        eprintln!("ts_retain: retaining freed/corrupted object at ptr={:p} rc={:#x}", ptr, cur_rc);
+        let bt = std::backtrace::Backtrace::capture();
+        eprintln!("{}", bt);
+        std::process::abort();
+    }
     unsafe {
         (*header_ptr).ref_count.fetch_add(1, Ordering::SeqCst);
     }
@@ -59,7 +66,16 @@ pub unsafe extern "C" fn ts_release(ptr: *mut u8, destructor: Option<unsafe exte
     let old_rc = unsafe {
         (*header_ptr).ref_count.fetch_sub(1, Ordering::SeqCst)
     };
-    
+
+    if old_rc == 0 || old_rc == 0xDEAD_BEEF_DEAD_BEEFu64 || old_rc > 0x100_0000 {
+        // Double-free detected: refcount was already 0 or poisoned (use-after-free).
+        eprintln!("ts_release: double-free/use-after-free detected at ptr={:p} old_rc={:#x}", ptr, old_rc);
+        // Print a backtrace for debugging.
+        let bt = std::backtrace::Backtrace::capture();
+        eprintln!("{}", bt);
+        std::process::abort();
+    }
+
     if old_rc == 1 {
         // Refcount reached zero.
         if let Some(dtor) = destructor {
@@ -68,6 +84,8 @@ pub unsafe extern "C" fn ts_release(ptr: *mut u8, destructor: Option<unsafe exte
         let size = unsafe { (*header_ptr).size };
         let total_size = header_size + size;
         let layout = Layout::from_size_align(total_size, 8).expect("invalid layout");
+        // Poison the refcount to catch use-after-free (0xDEAD_BEEF_DEAD_BEEF).
+        unsafe { (*header_ptr).ref_count.store(0xDEAD_BEEF_DEAD_BEEFu64, Ordering::SeqCst); }
         unsafe { dealloc(header_ptr as *mut u8, layout) };
     }
 }

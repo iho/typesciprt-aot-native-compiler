@@ -95,14 +95,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         let val = val_opt
                             .ok_or_else(|| anyhow::anyhow!("array element produced no value"))?;
                         let val_i64 = self.ensure_i64(val, block)?;
-                        // push returns new length — discard it
-                        let _len: Value<'c, 'b> = block.append_operation(func::call(
+                        block.append_operation(func::call(
                             self.ctx,
                             FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
                             &[arr_val, val_i64],
-                            &[i64_type],
+                            &[],
                             self.loc,
-                        )).result(0)?.into();
+                        ));
                         block.append_operation(func::call(
                             self.ctx,
                             FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),

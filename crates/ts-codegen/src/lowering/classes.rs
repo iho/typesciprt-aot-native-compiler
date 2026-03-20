@@ -30,9 +30,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Expression::Identifier(id) = e { Some(id.name.to_string()) } else { None }
             });
             let mut methods: HashMap<String, String> = HashMap::new();
+            let mut method_arity: HashMap<String, usize> = HashMap::new();
             let mut statics: HashMap<String, String> = HashMap::new();
             let mut getters: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut setters: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let builtin_error_names = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError"];
+            let ctor_elem = class.body.body.iter().find(|e| {
+                matches!(e, ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor && m.value.body.is_some())
+            });
+            let constructor_arity = match ctor_elem {
+                Some(ClassElement::MethodDefinition(m)) => m.value.params.items.len(),
+                _ => {
+                    if parent.as_deref().map(|n| builtin_error_names.contains(&n)).unwrap_or(false) { 1 } else { 0 }
+                }
+            };
             for elem in &class.body.body {
                 let ClassElement::MethodDefinition(method) = elem else { continue };
                 if method.value.body.is_none() { continue; }
@@ -46,7 +57,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     (MethodDefinitionKind::Get, false) => { getters.insert(mname); }
                     (MethodDefinitionKind::Set, false) => { setters.insert(mname); }
                     (MethodDefinitionKind::Method, true) => { statics.insert(mname.clone(), format!("__class_{}_{}", class_name, mname)); }
-                    (MethodDefinitionKind::Method, false) => { methods.insert(mname.clone(), format!("__class_{}_{}", class_name, mname)); }
+                    (MethodDefinitionKind::Method, false) => {
+                        let rest = if method.value.params.rest.is_some() { 1 } else { 0 };
+                        let arity = 1 + method.value.params.items.len() + rest;
+                        method_arity.insert(mname.clone(), arity);
+                        methods.insert(mname.clone(), format!("__class_{}_{}", class_name, mname));
+                    }
                     _ => {}
                 }
             }
@@ -54,6 +70,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let parent_sig = parent.as_ref().and_then(|p| self.classes.get(p)).cloned();
             if let Some(psig) = parent_sig {
                 for (k, v) in &psig.methods { methods.entry(k.clone()).or_insert_with(|| v.clone()); }
+                for (k, v) in &psig.method_arity { method_arity.entry(k.clone()).or_insert(*v); }
                 for (k, v) in &psig.statics { statics.entry(k.clone()).or_insert_with(|| v.clone()); }
                 for k in &psig.getters { getters.insert(k.clone()); }
                 for k in &psig.setters { setters.insert(k.clone()); }
@@ -70,7 +87,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
             self.classes.insert(class_name.to_string(), ClassSig {
                 constructor_name: format!("__class_{}_constructor", class_name),
+                constructor_arity,
                 methods,
+                method_arity,
                 statics,
                 getters,
                 setters,
@@ -95,13 +114,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             };
             let Some(mname) = mname_opt else { continue };
             let func_name = format!("__class_{}_{}", class_name, mname);
+            let has_rest = method.value.params.rest.is_some();
             let n_params = method.value.params.items.len();
-            let all_params = 1 + n_params; // +1 for `this`
+            let all_params = 1 + n_params + if has_rest { 1 } else { 0 }; // +1 for `this`, +1 for rest array
             if !self.funcs.contains_key(&func_name) {
                 self.funcs.insert(func_name, FuncSig {
                     param_types: vec![i64_type; all_params],
                     return_type: Some(i64_type),
-                    has_rest: method.value.params.rest.is_some(),
+                    has_rest,
                     has_this_param: false,
                 });
             }
@@ -360,6 +380,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
 
+            // If the parent constructor expects more args than we collected, pad with UNDEFINED.
+            let parent_arity = parent_name.as_deref()
+                .and_then(|n| self.classes.get(n))
+                .map(|sig| sig.constructor_arity)
+                .unwrap_or(0);
+            while call_args.len() < parent_arity {
+                let undef: Value<'_, '_> = current.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                    self.loc,
+                )).result(0)?.into();
+                call_args.push(undef);
+            }
+
             current.append_operation(func::call(
                 self.ctx,
                 FlatSymbolRefAttribute::new(self.ctx, parent_ctor),
@@ -448,11 +482,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let method_name = key_id.name.to_string();
             let func_name = format!("__class_{}_{}", class_name, method_name);
             let n_params = method.value.params.items.len();
+            let has_rest = method.value.params.rest.is_some();
+            let all_mlir_params = 1 + n_params + if has_rest { 1 } else { 0 }; // +1 for `this`
             // arity for TsFunction does NOT include `this` (which is the first MLIR param)
             let arity = n_params as i64;
             let func_type_val = melior::ir::r#type::FunctionType::new(
                 self.ctx,
-                &vec![i64_type; 1 + n_params], // +1 for `this`
+                &vec![i64_type; all_mlir_params],
                 &[i64_type],
             ).into();
             let fn_ref: Value<'_, '_> = current.append_operation(
@@ -597,8 +633,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let func_name = format!("__class_{}_{}", class_name, name);
         let i64_type  = self.i64_type();
 
+        let has_rest = method.value.params.rest.is_some();
         let n_params = method.value.params.items.len();
-        let all_params = 1 + n_params;
+        let all_params = 1 + n_params + if has_rest { 1 } else { 0 };
         let param_specs: Vec<(melior::ir::Type<'c>, Location<'c>)> =
             (0..all_params).map(|_| (i64_type, self.loc)).collect();
         let func_type = FunctionType::new(self.ctx, &vec![i64_type; all_params], &[i64_type]);
@@ -617,9 +654,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 param_names.insert(id.name.to_string());
             }
         }
+        // Bind rest parameter: it receives the last MLIR argument (a pre-built TsArray).
         if let Some(rest) = &method.value.params.rest {
             if let BindingPattern::BindingIdentifier(id) = &rest.rest.argument {
-                param_names.insert(id.name.to_string());
+                let rest_arg_idx = 1 + n_params; // after `this` + regular params
+                let rest_val: Value<'_, '_> = entry.argument(rest_arg_idx)?.into();
+                let rname = id.name.to_string();
+                scope.insert(rname.clone(), rest_val);
+                param_names.insert(rname);
             }
         }
         let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
@@ -694,7 +736,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.funcs.insert(func_name, FuncSig {
             param_types: vec![i64_type; all_params],
             return_type: Some(i64_type),
-            has_rest: false,
+            has_rest,
             has_this_param: false,
         });
         Ok(())

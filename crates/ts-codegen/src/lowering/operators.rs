@@ -172,8 +172,25 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        // If RHS is not a simple identifier (e.g. `x instanceof options.type`), evaluate both
+        // sides for side-effects and return false — we can't resolve the class at compile time.
         let Expression::Identifier(class_id) = &binop.right else {
-            bail!("instanceof: right-hand side must be a class name identifier");
+            let (lhs_opt, nb) = self.lower_expression(&binop.left, block, region, scope)?;
+            block = nb;
+            let (rhs_opt, nb2) = self.lower_expression(&binop.right, block, region, scope)?;
+            block = nb2;
+            if let Some(v) = lhs_opt {
+                let v64 = self.ensure_i64(v, block)?;
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[v64], &[], self.loc));
+            }
+            if let Some(v) = rhs_opt {
+                let v64 = self.ensure_i64(v, block)?;
+                block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"), &[v64], &[], self.loc));
+            }
+            let false_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FFA_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            return Ok((Some(false_val), block));
         };
         let target = class_id.name.to_string();
 

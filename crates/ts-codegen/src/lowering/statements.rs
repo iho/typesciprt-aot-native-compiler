@@ -33,13 +33,19 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         ));
 
         // Call module init functions for imported files (initialize imported const values).
-        for init_fn_name in self.module_init_fns.clone() {
+        for (init_idx, init_fn_name) in self.module_init_fns.clone().iter().enumerate() {
+            let idx_val = current_block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(self.i32_type(), init_idx as i64).into(), self.loc,
+            )).result(0)?.into();
             current_block.append_operation(func::call(
                 self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, &init_fn_name),
-                &[],
-                &[],
-                self.loc,
+                FlatSymbolRefAttribute::new(self.ctx, "__ts_console_log_i32"),
+                &[idx_val], &[], self.loc,
+            ));
+            current_block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, init_fn_name),
+                &[], &[], self.loc,
             ));
         }
 
@@ -173,7 +179,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             arrow.params.items.iter().collect();
                         let rest_name = arrow.params.rest.as_ref()
                             .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument { Some(id.name.as_str()) } else { None });
-                        self.lower_named_function(&name, &params, rest_name, Some(&arrow.body), None)?;
+                        self.lower_named_function(&name, &params, rest_name, Some(&arrow.body), None, arrow.expression)?;
                     }
                     Expression::FunctionExpression(func_expr) => {
                         let params: Vec<&oxc_ast::ast::FormalParameter<'_>> =
@@ -181,7 +187,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         let rest_name = func_expr.params.rest.as_ref()
                             .and_then(|r| if let BindingPattern::BindingIdentifier(id) = &r.rest.argument { Some(id.name.as_str()) } else { None });
                         let body = func_expr.body.as_deref();
-                        self.lower_named_function(&name, &params, rest_name, body, None)?;
+                        self.lower_named_function(&name, &params, rest_name, body, None, false)?;
                     }
                     _ => {} // alias or non-function const — skip
                 }

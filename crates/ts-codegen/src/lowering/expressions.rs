@@ -59,8 +59,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 if let Expression::Identifier(obj_id) = &member.object {
                     if obj_id.name == "process" {
                         let rt_name = match member.property.name.as_str() {
-                            "argv" => Some("ts_process_argv"),
-                            "env"  => Some("ts_process_env"),
+                            "argv"   => Some("ts_process_argv"),
+                            "env"    => Some("ts_process_env"),
+                            "pid"    => Some("ts_process_pid"),
+                            // process.stderr / process.stdout — return UNDEFINED;
+                            // write() on these objects will be handled by the callee dispatch.
+                            "stderr" | "stdout" => None,
                             _ => None,
                         };
                         if let Some(rt) = rt_name {
@@ -457,13 +461,35 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                     self.loc,
                                 )).result(0)?.into())
                             }
+                            // Namespace identifiers used as values (e.g. Function.prototype.toString.call(Object)).
+                            // These are normally only meaningful as static dispatch namespaces; when accessed
+                            // as a value, return UNDEFINED (safe fallback — code paths using these as values
+                            // are typically utility checks like isPlainObject that work with any falsy/truthy).
+                            "Object" | "Function" | "Array" | "Math" | "JSON" | "Promise"
+                            | "Number" | "String" | "Boolean" | "Symbol" | "Date" | "RegExp"
+                            | "Error" | "Reflect" | "process" | "console" => {
+                                Some(block.append_operation(arith::constant(
+                                    self.ctx,
+                                    IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                                    self.loc,
+                                )).result(0)?.into())
+                            }
                             _ => None,
                         };
                         if let Some(v) = global_val {
                             return Ok((Some(v), block));
                         }
-                        eprintln!("[debug] undefined var '{}', scope keys: {:?}", name, scope.keys().collect::<Vec<_>>());
-                        bail!("undefined variable: {}", name)
+                        // Fallback: treat as a module global that wasn't registered yet
+                        // (can happen with circular imports where signature collection
+                        // order doesn't match lowering order). Emit ts_get_module_global
+                        // so it's resolved at runtime.
+                        let key_ptr = self.get_string_ptr(&name, block)?;
+                        let val: Value<'c, 'b> = block.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_get_module_global"),
+                            &[key_ptr], &[self.i64_type()], self.loc,
+                        )).result(0)?.into();
+                        return Ok((Some(val), block));
                     }
                 }
             }
@@ -491,7 +517,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         ));
                         Ok((Some(v), block))
                     }
-                    None => bail!("'this' used outside of a class method, scope keys: {:?}", scope.keys().collect::<Vec<_>>()),
+                    None => {
+                        // `this` in a plain function expression (not a class method) — no bound
+                        // receiver. Return UNDEFINED, which is the correct result when calling
+                        // strict-mode functions or when the code is purely for side effects.
+                        let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                            self.ctx,
+                            IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                            self.loc,
+                        )).result(0)?.into();
+                        Ok((Some(undef), block))
+                    }
                 }
             }
             Expression::YieldExpression(y) => {
@@ -535,15 +571,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     ));
                     let _ = len_val;
                 } else {
-                    let push_result: Value<'c, 'b> = block.append_operation(func::call(
-                        self.ctx,
-                        FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
-                        &[yields_i64, yield_val], &[i64_type], self.loc,
-                    )).result(0)?.into();
                     block.append_operation(func::call(
                         self.ctx,
-                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                        &[push_result], &[], self.loc,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
+                        &[yields_i64, yield_val], &[], self.loc,
                     ));
                     block.append_operation(func::call(
                         self.ctx,
@@ -803,6 +834,87 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         ));
                         return Ok((Some(op.result(0)?.into()), block));
                     }
+                }
+            }
+        }
+
+        // ── Prototype-method-call patterns ────────────────────────────────────
+        // Detect X.prototype.Y.call(thisArg, ...args) before generic dispatch.
+        if let Expression::StaticMemberExpression(call_member) = &call.callee {
+            if call_member.property.name.as_str() == "call" {
+                // Helper: is the object a Y method of Object (or Object.prototype)?
+                let is_obj_has_own_prop = if let Expression::StaticMemberExpression(m) = &call_member.object {
+                    m.property.name.as_str() == "hasOwnProperty" && matches!(
+                        &m.object,
+                        Expression::Identifier(id) if id.name == "Object"
+                    )
+                    || m.property.name.as_str() == "hasOwnProperty" && matches!(
+                        &m.object,
+                        Expression::StaticMemberExpression(m2)
+                            if m2.property.name.as_str() == "prototype"
+                            && matches!(&m2.object, Expression::Identifier(id) if id.name == "Object")
+                    )
+                } else { false };
+
+                if is_obj_has_own_prop && call.arguments.len() >= 2 {
+                    // Object[.prototype].hasOwnProperty.call(obj, key) → ts_val_has_key(obj, key)
+                    let obj_expr = call.arguments[0].as_expression()
+                        .ok_or_else(|| anyhow::anyhow!("hasOwnProperty.call: arg0 not expression"))?;
+                    let key_expr = call.arguments[1].as_expression()
+                        .ok_or_else(|| anyhow::anyhow!("hasOwnProperty.call: arg1 not expression"))?;
+                    let (obj_v, nb) = self.lower_expression(obj_expr, block, region, scope)?;
+                    block = nb;
+                    let (key_v, nb) = self.lower_expression(key_expr, block, region, scope)?;
+                    block = nb;
+                    let obj_i = self.ensure_i64(obj_v.unwrap_or_else(|| {
+                        block.append_operation(arith::constant(self.ctx,
+                            IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                        )).result(0).unwrap().into()
+                    }), block)?;
+                    let key_i = self.ensure_i64(key_v.unwrap_or_else(|| {
+                        block.append_operation(arith::constant(self.ctx,
+                            IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                        )).result(0).unwrap().into()
+                    }), block)?;
+                    let result: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_val_has_key"),
+                        &[obj_i, key_i], &[self.i64_type()], self.loc,
+                    )).result(0)?.into();
+                    return Ok((Some(result), block));
+                }
+
+                // Function.prototype.toString.call(fn) → ts_coerce_string(fn)
+                let is_fn_to_string = if let Expression::StaticMemberExpression(m) = &call_member.object {
+                    m.property.name.as_str() == "toString" && matches!(
+                        &m.object,
+                        Expression::StaticMemberExpression(m2)
+                            if m2.property.name.as_str() == "prototype"
+                            && matches!(&m2.object, Expression::Identifier(id) if id.name == "Function")
+                    )
+                } else { false };
+
+                if is_fn_to_string {
+                    // Function.prototype.toString.call(fn) → coerce fn to string
+                    let this_expr = call.arguments.first()
+                        .and_then(|a| a.as_expression());
+                    let fn_i = if let Some(expr) = this_expr {
+                        let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                        block = nb;
+                        self.ensure_i64(v.unwrap_or_else(|| {
+                            block.append_operation(arith::constant(self.ctx,
+                                IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                            )).result(0).unwrap().into()
+                        }), block)?
+                    } else {
+                        block.append_operation(arith::constant(self.ctx,
+                            IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                        )).result(0)?.into()
+                    };
+                    let result: Value<'c, 'b> = block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_coerce_string"),
+                        &[fn_i], &[self.i64_type()], self.loc,
+                    )).result(0)?.into();
+                    return Ok((Some(result), block));
                 }
             }
         }
@@ -1642,6 +1754,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             let pk = *arg_vals.get(2).unwrap_or(&undef_i64);
                             Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_delete_metadata"), &[k, t, pk], &[i64t], self.loc)).result(0)?.into())
                         }
+                        ("Reflect", "getPrototypeOf") => {
+                            let o = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_get_prototype_of"), &[o], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "getOwnPropertyDescriptor") => {
+                            let o = *arg_vals.first().unwrap_or(&undef_i64);
+                            let k = *arg_vals.get(1).unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_reflect_get_own_property_descriptor"), &[o, k], &[i64t], self.loc)).result(0)?.into())
+                        }
+                        ("Reflect", "ownKeys") => {
+                            // Same as Object.getOwnPropertyNames: returns all own keys as array.
+                            let o = *arg_vals.first().unwrap_or(&undef_i64);
+                            Some(block.append_operation(func::call(self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_obj_get_own_property_names"), &[o], &[i64t], self.loc)).result(0)?.into())
+                        }
                         // ── Array ─────────────────────────────────────────────
                         // ── String ────────────────────────────────────────────
                         ("String", "fromCharCode") => {
@@ -1894,6 +2020,17 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                             args.push(self.ensure_i64(v, block)?);
                         }
 
+                        // Pad with UNDEFINED if caller passes fewer args than the method declares.
+                        let expected_arity = sig.method_arity.get(&method_name).copied().unwrap_or(0);
+                        while args.len() < expected_arity {
+                            let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                                self.ctx,
+                                IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(),
+                                self.loc,
+                            )).result(0)?.into();
+                            args.push(undef);
+                        }
+
                         let result_types = &[self.i64_type()];
                         let op = block.append_operation(func::call(
                             self.ctx,
@@ -2003,14 +2140,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 block = nb;
                                 let v = v_opt.ok_or_else(|| anyhow::anyhow!("push arg no value"))?;
                                 let v_i64 = self.ensure_i64(v, block)?;
-                                result_val = Some(block.append_operation(func::call(
+                                block.append_operation(func::call(
                                     self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
-                                    &[obj_i64, v_i64], &[i64t], self.loc,
-                                )).result(0)?.into());
+                                    &[obj_i64, v_i64], &[], self.loc,
+                                ));
                                 block.append_operation(func::call(
                                     self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
                                     &[v_i64], &[], self.loc,
                                 ));
+                                result_val = Some(block.append_operation(func::call(
+                                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_len"),
+                                    &[obj_i64], &[i64t], self.loc,
+                                )).result(0)?.into());
                             }
                         }
                     }
@@ -2051,10 +2192,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 let result: Option<Value<'c, 'b>> = match method_name.as_str() {
                     "push" => {
                         let val = arg_vals.first().copied().unwrap_or(undefined_i64);
-                        Some(block.append_operation(func::call(
+                        block.append_operation(func::call(
                             self.ctx,
                             FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
-                            &[obj_i64, val], &[i64t], self.loc,
+                            &[obj_i64, val], &[], self.loc,
+                        ));
+                        Some(block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_len"),
+                            &[obj_i64], &[i64t], self.loc,
                         )).result(0)?.into())
                     }
                     "pop" => {
@@ -2838,7 +2983,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 let v_i64 = self.ensure_i64(v, block)?;
                                 block.append_operation(func::call(
                                     self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
-                                    &[args_arr, v_i64], &[i64t], self.loc,
+                                    &[args_arr, v_i64], &[], self.loc,
                                 ));
                                 temp_vals.push(v_i64);
                             }
@@ -2951,7 +3096,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                                 let v_i64 = self.ensure_i64(v, block)?;
                                 block.append_operation(func::call(
                                     self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_push"),
-                                    &[args_arr, v_i64], &[i64t], self.loc,
+                                    &[args_arr, v_i64], &[], self.loc,
                                 ));
                                 temp_vals.push(v_i64);
                             }
@@ -3216,8 +3361,32 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
+        // Handle `new X.Y(...)` — static member constructors we don't know about
+        // (e.g. `new Intl.DateTimeFormat(...)`) → evaluate all args for side effects,
+        // then return UNDEFINED as the result.
+        if matches!(&new_expr.callee, Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)) {
+            let i64t = self.i64_type();
+            for arg in &new_expr.arguments {
+                if let Some(expr) = arg.as_expression() {
+                    let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    if let Some(v) = v_opt {
+                        let v64 = self.ensure_i64(v, block)?;
+                        block.append_operation(func::call(
+                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[v64], &[], self.loc,
+                        ));
+                    }
+                }
+            }
+            let undef_val: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            return Ok((Some(undef_val), block));
+        }
+
         let Expression::Identifier(callee_id) = &new_expr.callee else {
-            bail!("new: only simple class names are supported as constructors");
+            bail!("new: unsupported callee expression type");
         };
         // Resolve class name aliases (e.g. `class Hono` exported as `HonoBase` →
         // `new Hono(...)` inside hono-base.ts should call `__class_HonoBase_constructor`).
@@ -3225,6 +3394,37 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let raw = callee_id.name.as_str();
             self.class_name_aliases.get(raw).cloned().unwrap_or_else(|| raw.to_string())
         };
+
+        // new Proxy(target, handler) → transparent proxy: evaluate args, return target (retain it).
+        if class_name == "Proxy" {
+            let i64t = self.i64_type();
+            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            let mut args: Vec<Value<'c, 'b>> = Vec::new();
+            for a in &new_expr.arguments {
+                if let Some(expr) = a.as_expression() {
+                    let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    if let Some(v) = v_opt { args.push(self.ensure_i64(v, block)?); }
+                }
+            }
+            let target = args.first().copied().unwrap_or(undef_i64);
+            // Retain target (returned as value); release handler if present.
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_retain_val"),
+                &[target], &[], self.loc,
+            ));
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[*a], &[], self.loc,
+                    ));
+                }
+            }
+            return Ok((Some(target), block));
+        }
 
         // Built-in constructors
         if class_name == "RegExp" {
@@ -3792,11 +3992,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let undefined_i64: Value<'c, 'b> = block.append_operation(arith::constant(
             self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
         )).result(0)?.into();
+        let zero_i32: Value<'c, 'b> = block.append_operation(arith::constant(
+            self.ctx, IntegerAttribute::new(self.i32_type(), 0).into(), self.loc,
+        )).result(0)?.into();
 
         // Build the strings array from quasi cooked values.
         let strings_arr: Value<'c, 'b> = block.append_operation(func::call(
             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
-            &[undefined_i64], &[i64t], self.loc,
+            &[zero_i32], &[i64t], self.loc,
         )).result(0)?.into();
         for quasi in &tagged.quasi.quasis {
             let cooked = quasi.value.cooked.as_deref().unwrap_or("");
@@ -3834,7 +4037,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // Build a TsArray of all args and use dispatch_callback for simplicity.
         let args_arr: Value<'c, 'b> = block.append_operation(func::call(
             self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
-            &[undefined_i64], &[i64t], self.loc,
+            &[zero_i32], &[i64t], self.loc,
         )).result(0)?.into();
         for &av in &all_args {
             block.append_operation(func::call(

@@ -144,6 +144,39 @@ pub unsafe extern "C" fn ts_reflect_get_own_metadata_keys(
     ts_reflect_get_metadata_keys(target, prop_key)
 }
 
+/// `Reflect.getPrototypeOf(obj)` — returns UNDEFINED in our flat model.
+/// All methods are stored directly on instances; there is no separate prototype object.
+/// Any `while (proto = Reflect.getPrototypeOf(proto))` loop terminates immediately.
+#[no_mangle]
+pub unsafe extern "C" fn ts_reflect_get_prototype_of(_obj: TsVal) -> TsVal {
+    UNDEFINED
+}
+
+/// `Reflect.getOwnPropertyDescriptor(obj, key)` → descriptor object or UNDEFINED.
+/// Descriptor shape: `{value: V, writable: true, enumerable: true, configurable: true}`.
+#[no_mangle]
+pub unsafe extern "C" fn ts_reflect_get_own_property_descriptor(obj: TsVal, key: TsVal) -> TsVal {
+    let val = super::object::ts_val_get_key(obj, key);
+    if val.is_undefined() {
+        return UNDEFINED;
+    }
+    let desc = super::object::ts_obj_new();
+    let value_key = ts_string_new(b"value\0".as_ptr() as *const i8);
+    super::object::ts_obj_set_val_key(desc, value_key, val);
+    ts_release_val(value_key);
+    ts_release_val(val);
+    let writable_key = ts_string_new(b"writable\0".as_ptr() as *const i8);
+    super::object::ts_obj_set_val_key(desc, writable_key, super::TRUE);
+    ts_release_val(writable_key);
+    let enum_key = ts_string_new(b"enumerable\0".as_ptr() as *const i8);
+    super::object::ts_obj_set_val_key(desc, enum_key, super::TRUE);
+    ts_release_val(enum_key);
+    let conf_key = ts_string_new(b"configurable\0".as_ptr() as *const i8);
+    super::object::ts_obj_set_val_key(desc, conf_key, super::TRUE);
+    ts_release_val(conf_key);
+    desc
+}
+
 /// `Reflect.deleteMetadata(metadataKey, target[, propertyKey])` → boolean TsVal
 #[no_mangle]
 pub unsafe extern "C" fn ts_reflect_delete_metadata(

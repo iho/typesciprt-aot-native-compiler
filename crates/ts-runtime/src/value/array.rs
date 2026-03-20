@@ -142,8 +142,7 @@ pub unsafe extern "C" fn ts_normalize_iterable(val: TsVal) -> TsVal {
             let mut bytes = c.to_string().into_bytes();
             bytes.push(0u8);
             let sv = super::string_val::ts_string_new(bytes.as_ptr() as *const i8);
-            let len = ts_arr_push(arr, sv);
-            ts_release_val(len);
+            ts_arr_push(arr, sv);
             ts_release_val(sv);
         }
         return arr;
@@ -177,8 +176,7 @@ pub unsafe extern "C" fn ts_normalize_iterable(val: TsVal) -> TsVal {
                 }
                 let value = super::object::ts_obj_get(item, value_key);
                 ts_release_val(item);
-                let len = ts_arr_push(result, value);
-                ts_release_val(len);
+                ts_arr_push(result, value);
                 ts_release_val(value);
             }
             ts_release_val(iterator);
@@ -189,16 +187,14 @@ pub unsafe extern "C" fn ts_normalize_iterable(val: TsVal) -> TsVal {
     ts_arr_new(0)
 }
 
-/// Append `val` to the end of `arr`. Returns the new length.
+/// Append `val` to the end of `arr`.
 #[no_mangle]
-pub unsafe extern "C" fn ts_arr_push(arr_val: TsVal, val: TsVal) -> TsVal {
+pub unsafe extern "C" fn ts_arr_push(arr_val: TsVal, val: TsVal) {
     if arr_val.is_ptr() && heap_tag(arr_val) == 1 {
         let arr = &mut *(arr_val.as_ptr() as *mut TsArray);
         ts_retain_val(val);
         arr.elements.push(val);
-        return TsVal::from_i32(arr.elements.len() as i32);
     }
-    TsVal::from_i32(0)
 }
 
 /// Remove and return the last element (or `undefined`).

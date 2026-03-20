@@ -173,6 +173,132 @@ Implement `fetch(url, options?)` using tokio + hyper client.
 
 ---
 
+---
+
+## NestJS Full Support Plan
+
+### Strategy
+
+Use **real `@nestjs/common` decorators** from the submodule + a **native bootstrap** that replaces `@nestjs/core`. The `@nestjs/core` injector machinery (`scanner.ts`, `injector.ts`, `container.ts`) requires `Proxy`, prototype-chain walking, `Object.create(proto)`, and 5+ npm packages — too complex to compile directly. The decorator layer is almost compilable today.
+
+### Phase 1 — Fix Reflect API gaps *(~3-4 days)*
+
+The metadata scanner uses `Reflect.getPrototypeOf` to walk prototype chains and `Reflect.getOwnPropertyDescriptor` to inspect methods. Both are unimplemented.
+
+**1a. `Reflect.getPrototypeOf(obj)`**
+- Add `("Reflect", "getPrototypeOf")` dispatch in `expressions.rs`
+- Add `ts_reflect_get_prototype_of(val: i64) -> i64` in `ts-runtime/src/value/reflect.rs`
+- For user class instances, return a stable per-class "prototype sentinel" TsObject (stored on the class function itself as `__proto__`)
+- Terminate the chain: sentinel's prototype is UNDEFINED
+- Fixes the `while (proto = Reflect.getPrototypeOf(proto)) && proto !== Object.prototype` loop
+
+**1b. `Reflect.getOwnPropertyDescriptor(proto, key)`**
+- Add dispatch + `ts_reflect_get_own_property_descriptor(obj: i64, key: i64) -> i64` runtime
+- Returns `{value: fn, writable: true, enumerable: true, configurable: true}` for existing properties, UNDEFINED otherwise
+
+**1c. `Object.prototype.hasOwnProperty.call(obj, key)` pattern**
+- Detect this 4-level call chain in the call dispatch in `expressions.rs`
+- Emit `ts_val_has_key(obj, key)` directly (already exists in runtime)
+
+### Phase 2 — `emitDecoratorMetadata` (`design:paramtypes`) *(~1 week)*
+
+The real NestJS DI resolves constructor dependencies by reading `Reflect.getMetadata('design:paramtypes', ServiceClass)`. TypeScript with `emitDecoratorMetadata: true` emits this automatically; the compiler currently emits nothing.
+
+In `lower_class_declaration_with_name` (classes.rs):
+- For each decorated class, inspect constructor parameter `TSTypeAnnotation` nodes in the OXC AST
+- For each type annotation that names a known class (look up in `classes` map), resolve it to the constructor `TsFunction` value
+- Build a `TsArray` of those constructor values
+- Emit `Reflect.defineMetadata('design:paramtypes', array, class_ctor)` before applying class decorators
+
+Simple cases first: named class types as constructor params. Skip interfaces and primitive types (`string` → `String`, `number` → `Number`).
+
+### Phase 3 — Parameter decorators *(~4-5 days)*
+
+`@Inject(token)` is a `ParameterDecorator` — called as `decorator(targetClass, propertyKey, parameterIndex)`. Currently unimplemented.
+
+In `lower_class_constructor` (classes.rs):
+- After emitting the constructor body, for each `FormalParameter` that has `.decorators`, emit calls: `decorator(class_ctor, undefined, param_index)`
+- For method parameters (decorated with `@Body()`, `@Param()`, `@Query()`): emit `decorator(class_prototype, method_name_string, param_index)`
+
+### Phase 4 — `this.constructor` and `.name` *(~2 days)*
+
+Used by `HttpException.initName()` and error formatting.
+
+In `lower_class_constructor` (classes.rs):
+- After `ts_obj_new`, emit:
+  - `ts_obj_set(this, "__class_name__", ts_string_new("ClassName"))`
+  - `ts_obj_set(this, "__class_ctor__", class_ctor_fn_val)`
+
+In `StaticMemberExpression` handler (expressions.rs):
+- When property is `constructor` on a TsObject → return `__class_ctor__`
+- When property is `name` on something from `constructor` → return `__class_name__`
+
+### Phase 5 — `process.*` event emitter stubs *(~1-2 days)*
+
+`NestApplicationContext.enableShutdownHooks()` calls `process.on('SIGTERM', fn)`.
+
+Add to `globals.rs` in ts-runtime:
+- `ts_process_on(signal: i64, fn: i64)` — registers a signal handler or stub
+- `ts_process_once(signal: i64, fn: i64)` — same, one-shot
+- `ts_process_remove_listener(signal: i64, fn: i64)` — no-op
+- `ts_process_kill(pid: i64, signal: i64)` — stub
+- `ts_process_abort()` — calls `std::process::abort()`
+- `process.pid` → `ts_process_pid()` returns i32
+
+Wire in `expressions.rs` under the existing `process.*` dispatch.
+
+### Phase 6 — ES `Proxy` *(~1-2 weeks)*
+
+`NestFactory.create()` wraps the app in `new Proxy(target, { get, set })`. Without this, `NestFactory` is broken.
+
+New heap type `TsProxy` (tag 16):
+1. Add `TsProxy { target: TsVal, handler: TsVal }` struct in `ts-runtime/src/value/proxy.rs`
+2. Register destructor in `ts_release_val`
+3. `ts_proxy_new(target: i64, handler: i64) -> i64`
+4. In `ts_val_get_key(obj, key)`: if `obj` is `TsProxy`, call `handler.get(target, key, proxy)` trap
+5. In `ts_obj_set(obj, key, val)`: if `obj` is `TsProxy`, call `handler.set(target, key, val, proxy)` trap
+6. Wire `new Proxy(target, handler)` in `lower_new_expression` (expressions.rs)
+7. Declare all functions in `declare_runtime_funcs` (mod.rs)
+
+### Phase 7 — npm package shims *(~3-4 days)*
+
+The compiler resolves only `.ts` files. Add an import alias table in `ts-codegen/src/lowering/mod.rs` that maps bare specifiers to local shim paths.
+
+Shims needed for `@nestjs/common`:
+
+| Package | Used for | Shim |
+|---|---|---|
+| `uid` | `mixin()` unique IDs | `function uid(n) { return Math.random().toString(36).slice(2, 2+n) }` |
+| `iterare` | Set/Map iteration chains | Thin wrapper class converting to array then using native array methods |
+| `path-to-regexp` | Versioned route matching | Not needed for minimal server |
+| `perf_hooks` | `performance.now()` | Already exists as global |
+| `util` | `util.inspect` in logger | Stub: `inspect = JSON.stringify` |
+| `os` | `os.platform()` | Returns `'linux'` or `'darwin'` |
+
+Implementation: Add a `shim_paths: HashMap<&str, PathBuf>` table in `process_import_recursive`. Before trying to load a file, check if the specifier matches a known package name and redirect to the shim.
+
+### Phase 8 — `Object.create(proto)` support *(~1 week)*
+
+The real NestJS injector creates instances via `Object.create(metatype.prototype)` + `metatype.apply(instance, args)`. This is a fundamental mismatch with the compiler's model.
+
+**Option A (simpler):** In the native bootstrap, call `new ClassName(...args)` directly — avoids the issue entirely, already what `nest-native.ts` does.
+
+**Option B (complete):** Add `ts_obj_create_with_proto(proto: i64) -> i64` and `Function.prototype.apply(thisArg, argsArray)` dispatch. Enables the two-phase injector path.
+
+### Milestones
+
+| Milestone | What it enables | Effort |
+|---|---|---|
+| **M1** | Phase 1 (Reflect API) + Phase 7 (shims) | ~1 week | Real `@nestjs/common` decorator imports compile |
+| **M2** | + Phase 2 (paramtypes) + Phase 3 (param decorators) | +1 week | DI metadata fully populated without `@Inject()` everywhere |
+| **M3** | + Phase 4 (constructor.name) + Phase 5 (process.on) | +3 days | `HttpException` works; shutdown hooks work |
+| **M4** | + Phase 6 (Proxy) | +1-2 weeks | `NestFactory.create()` works; real `@nestjs/core` DI |
+| **M5** | + Phase 8 (Object.create) | +1 week | Fully real `@nestjs/core` injector path |
+
+**Recommended path:** After M2, the real `@nestjs/common` decorators work with the existing native bootstrap (`nest-native.ts`). M4/M5 are needed only to compile `NestFactory.create()` unmodified.
+
+---
+
 ## Design Principles
 
 1. **Correctness over shortcuts** — Implement features correctly for long-term use, not as no-ops
