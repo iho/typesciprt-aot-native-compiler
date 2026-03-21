@@ -2523,32 +2523,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             // intermediate field could be a user-class instance. Skip builtin dispatch for
             // ambiguous method names that are commonly user-defined AND the chain root is `this`.
             // This preserves `url.searchParams.get()` (root = url, not this) as builtin.
-            fn chain_root_is_this(expr: &Expression) -> bool {
-                match expr {
-                    Expression::ThisExpression(_) => true,
-                    Expression::StaticMemberExpression(m) => chain_root_is_this(&m.object),
-                    Expression::ComputedMemberExpression(m) => chain_root_is_this(&m.object),
-                    _ => false,
-                }
-            }
-            let receiver_is_chained_this = matches!(&member.object,
-                Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_))
-                && chain_root_is_this(&member.object);
-            // HOF-ambiguous: array/callback methods that are often user-defined on class instances.
-            // When the chain root is `this` (e.g. `this.repo.find()`), skip builtin dispatch so
-            // user-defined `find()` on a class field is called dynamically.
-            // Container methods (get/set/has/delete/etc.) are NOT in this list — `this.map.get()`
-            // should still use ts_map_get because class fields holding Maps/Sets are common.
-            let is_hof_ambiguous = matches!(method_name.as_str(),
-                "find" | "findIndex" | "findLast" | "findLastIndex" | "some" | "every" |
-                "map" | "filter" | "forEach" | "reduce" | "reduceRight" | "flatMap" | "flat" |
-                "toSorted" | "toReversed" | "with" |
-                "match" | "matchAll" | "test" | "exec" |
-                "then" | "catch" | "finally" |
-                "includes" | "hasOwnProperty" | "sort"
-            );
-            let receiver_is_user_class = receiver_is_user_class_identifier
-                || (receiver_is_chained_this && is_hof_ambiguous);
+            // When the receiver is `this.FIELD`, check if FIELD is a known user-class instance
+            // (from constructor parameter property type annotations). If so, skip builtin dispatch
+            // so user-defined methods on the field are called dynamically.
+            // This correctly handles `this.repo.find()` (repo: Repo) without breaking
+            // `this.routes.forEach(cb)` (routes: array, no type annotation → uses builtin).
+            let receiver_is_this_field_user_class = if let Expression::StaticMemberExpression(inner) = &member.object {
+                if matches!(&inner.object, Expression::ThisExpression(_)) {
+                    let field_name = inner.property.name.as_str();
+                    self.current_class.as_ref().and_then(|cn| self.classes.get(cn.as_str())).map(|sig| {
+                        sig.field_class_types.get(field_name)
+                            .map(|class_type| self.classes.contains_key(class_type.as_str()))
+                            .unwrap_or(false)
+                    }).unwrap_or(false)
+                } else { false }
+            } else { false };
+            let receiver_is_user_class = receiver_is_user_class_identifier || receiver_is_this_field_user_class;
             let n_call_args = call.arguments.len();
             let is_builtin = !receiver_is_user_class && (
                 // "add" is a container op only with 1 arg (Set.add/WeakSet.add);

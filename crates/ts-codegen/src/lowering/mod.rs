@@ -80,6 +80,11 @@ struct ClassSig {
     getters:  std::collections::HashSet<String>,        // property names with getters
     setters:  std::collections::HashSet<String>,        // property names with setters
     static_fields: std::collections::HashSet<String>,  // static property names (stored as module globals)
+    /// Fields that hold user-class instances: field_name → class_name.
+    /// Populated from constructor parameter properties with class type annotations.
+    /// Used to avoid dispatching HOF methods (find/filter/etc.) to array builtins
+    /// when the receiver is `this.field` and the field holds a user-class instance.
+    field_class_types: HashMap<String, String>,
     parent:   Option<String>,
 }
 
@@ -2644,6 +2649,36 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             };
 
+            // Collect field_class_types: constructor parameter properties with class type annotations.
+            // e.g. `constructor(private repo: Repo)` → field_class_types["repo"] = "Repo"
+            let mut field_class_types: HashMap<String, String> = HashMap::new();
+            if let Some(ClassElement::MethodDefinition(ctor)) = ctor_elem {
+                for param in &ctor.value.params.items {
+                    // Only parameter properties (private/public/protected/readonly)
+                    if param.accessibility.is_none() && !param.readonly { continue; }
+                    let field_name = match &param.pattern {
+                        BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                        _ => continue,
+                    };
+                    // Extract the class name from TSTypeAnnotation → TSTypeReference
+                    if let Some(ann) = &param.type_annotation {
+                        if let oxc_ast::ast::TSType::TSTypeReference(tref) = &ann.type_annotation {
+                            if let oxc_ast::ast::TSTypeName::IdentifierReference(id) = &tref.type_name {
+                                let type_name = id.name.to_string();
+                                // Only record if it's a known user class (not a primitive/builtin)
+                                let primitives = ["string", "number", "boolean", "any", "void",
+                                                  "never", "unknown", "object", "null", "undefined",
+                                                  "String", "Number", "Boolean", "Function",
+                                                  "Array", "Map", "Set", "Promise", "Date"];
+                                if !primitives.contains(&type_name.as_str()) {
+                                    field_class_types.insert(field_name, type_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             for element in &class.body.body {
                 let ClassElement::MethodDefinition(method) = element else { continue };
                 if method.kind == MethodDefinitionKind::Constructor { continue; }
@@ -2711,6 +2746,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 getters,
                 setters,
                 static_fields,
+                field_class_types,
                 parent,
             }));
         }
@@ -2736,6 +2772,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     }
                     for n in &parent_sig.setters {
                         if !sig.setters.contains(n) { sig.setters.insert(n.clone()); }
+                    }
+                    for (n, t) in &parent_sig.field_class_types {
+                        sig.field_class_types.entry(n.clone()).or_insert_with(|| t.clone());
                     }
                 }
             }

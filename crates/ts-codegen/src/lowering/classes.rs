@@ -45,6 +45,32 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if parent.as_deref().map(|n| builtin_error_names.contains(&n)).unwrap_or(false) { 1 } else { 0 }
                 }
             };
+
+            // Collect field_class_types from constructor parameter properties.
+            let mut field_class_types: HashMap<String, String> = HashMap::new();
+            if let Some(ClassElement::MethodDefinition(ctor)) = ctor_elem {
+                let primitives = ["string", "number", "boolean", "any", "void", "never",
+                                  "unknown", "object", "null", "undefined",
+                                  "String", "Number", "Boolean", "Function",
+                                  "Array", "Map", "Set", "Promise", "Date"];
+                for param in &ctor.value.params.items {
+                    if param.accessibility.is_none() && !param.readonly { continue; }
+                    let field_name = match &param.pattern {
+                        BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                        _ => continue,
+                    };
+                    if let Some(ann) = &param.type_annotation {
+                        if let oxc_ast::ast::TSType::TSTypeReference(tref) = &ann.type_annotation {
+                            if let oxc_ast::ast::TSTypeName::IdentifierReference(id) = &tref.type_name {
+                                let type_name = id.name.to_string();
+                                if !primitives.contains(&type_name.as_str()) {
+                                    field_class_types.insert(field_name, type_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             for elem in &class.body.body {
                 let ClassElement::MethodDefinition(method) = elem else { continue };
                 if method.value.body.is_none() { continue; }
@@ -77,6 +103,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 for (k, v) in &psig.statics { statics.entry(k.clone()).or_insert_with(|| v.clone()); }
                 for k in &psig.getters { getters.insert(k.clone()); }
                 for k in &psig.setters { setters.insert(k.clone()); }
+                for (k, v) in &psig.field_class_types { field_class_types.entry(k.clone()).or_insert_with(|| v.clone()); }
             }
             let mut static_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
             for elem in &class.body.body {
@@ -98,6 +125,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 getters,
                 setters,
                 static_fields,
+                field_class_types,
                 parent,
             });
         }
