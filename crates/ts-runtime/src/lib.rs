@@ -34,6 +34,7 @@ pub mod exceptions;
 pub mod string;
 pub mod value;
 pub mod node;
+pub mod napi;
 
 #[cfg(feature = "napi")]
 pub mod napi_bridge;

@@ -167,6 +167,18 @@ pub struct TsFunction {
     pub env: TsVal,
 }
 
+/// A native N-API function registered by a `.node` addon (tag = 18).
+/// When dispatch_callback encounters this tag it calls the napi_callback.
+/// `callback` is stored as a raw code pointer (same as TsFunction::fn_ptr).
+pub struct TsNapiFunction {
+    pub callback: *const u8,           // napi_callback fn ptr
+    pub data: *mut std::ffi::c_void,
+    pub env: *mut crate::napi::NapiEnv,
+}
+// SAFETY: the callback fn_ptr is code-read-only; data lifetime is managed by the addon.
+unsafe impl Send for TsNapiFunction {}
+unsafe impl Sync for TsNapiFunction {}
+
 /// Heap-allocated TypeScript Promise.
 /// The inner value lives in an `OnceLock`; a `Notify` wakes any blockers.
 pub struct TsPromise {
@@ -408,6 +420,7 @@ pub unsafe extern "C" fn ts_release_val(val: TsVal) {
             15 => Some(weakref::ts_weakref_destructor as unsafe extern "C" fn(*mut u8)),
             16 => Some(crate::node::events::ts_event_emitter_destructor as unsafe extern "C" fn(*mut u8)),
             17 => Some(crate::node::buffer::ts_buffer_destructor as unsafe extern "C" fn(*mut u8)),
+            18 => Some(crate::napi::ts_napi_function_destructor as unsafe extern "C" fn(*mut u8)),
             _ => None,
         };
 

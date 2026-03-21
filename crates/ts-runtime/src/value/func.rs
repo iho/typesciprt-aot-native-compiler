@@ -120,8 +120,19 @@ unsafe fn make_rest_array(args: &[TsVal], start: usize) -> TsVal {
 /// Internal: call a TsFunction value with up to 4 TsVal arguments.
 /// If the function is a closure (env ≠ UNDEFINED), passes env as the first arg.
 /// If has_rest=1, args from index arity-1 are bundled into a TsArray for the last param.
+/// Public alias used by the napi module for napi_call_function.
+pub(crate) unsafe fn dispatch_callback_pub(fn_val: TsVal, args: &[TsVal]) -> TsVal {
+    dispatch_callback(fn_val, args)
+}
+
 pub(super) unsafe fn dispatch_callback(fn_val: TsVal, args: &[TsVal]) -> TsVal {
-    if !fn_val.is_ptr() || heap_tag(fn_val) != 4 { return UNDEFINED; }
+    if !fn_val.is_ptr() { return UNDEFINED; }
+    let tag = heap_tag(fn_val);
+    // Tag 18 = TsNapiFunction: dispatch through N-API callback protocol.
+    if tag == 18 {
+        return crate::napi::dispatch_napi_function(fn_val, args);
+    }
+    if tag != 4 { return UNDEFINED; }
     let func = &*(fn_val.as_ptr() as *const TsFunction);
     let is_closure = !func.env.is_undefined();
     let env = func.env;
