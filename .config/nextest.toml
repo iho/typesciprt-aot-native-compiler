@@ -1,0 +1,4 @@
+[profile.default]
+# LLVM codegen has global state; HTTP tests use fixed ports.
+# Tests must run serially to avoid races.
+test-threads = 1
