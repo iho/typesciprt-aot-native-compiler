@@ -45,12 +45,14 @@ jobs:
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm@21
+          brew install llvm@21 zstd
           LLVM_PREFIX=$(brew --prefix llvm@21)
           echo "MLIR_SYS_210_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
           echo "LLVM_SYS_210_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
           echo "TABLEGEN_210_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
           echo "TSCC_LLVM_PREFIX=$LLVM_PREFIX" >> $GITHUB_ENV
+          # zstd is a transitive LLVM dep; add Homebrew lib to the linker search path
+          echo "LIBRARY_PATH=$(brew --prefix)/lib:${LIBRARY_PATH:-}" >> $GITHUB_ENV
 
       - name: Build
         run: cargo build -p tscc
