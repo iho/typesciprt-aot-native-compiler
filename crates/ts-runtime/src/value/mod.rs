@@ -261,6 +261,7 @@ pub mod container;
 pub mod reflect;
 pub mod date;
 pub mod weakref;
+pub mod fiber;
 
 // ── Re-exports from submodules ────────────────────────────────────────────────
 

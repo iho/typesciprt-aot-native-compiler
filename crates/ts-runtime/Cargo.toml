@@ -39,4 +39,6 @@ uuid    = { version = "1", features = ["v4"] }
 pbkdf2  = { version = "0.12", features = ["simple"] }
 scrypt  = "0.11"
 flate2  = "1"
-libc    = "0.2"
+libc         = "0.2"
+corosensei   = "0.2"
+tikv-jemallocator = "0.6"

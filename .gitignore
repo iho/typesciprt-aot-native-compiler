@@ -12,3 +12,5 @@ target
 .claude/
 examples/node_modules/
 examples/package-lock.json
+benchmarks/node_modules/
+

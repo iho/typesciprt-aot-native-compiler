@@ -503,6 +503,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         &[],
                         self.loc,
                     ));
+                    // ARC: ts_obj_set retains val_i64 internally; release our owned ref.
+                    current.append_operation(func::call(
+                        self.ctx,
+                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[val_i64],
+                        &[],
+                        self.loc,
+                    ));
                 }
             }
         }

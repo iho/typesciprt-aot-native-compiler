@@ -110,6 +110,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 &[],
                 self.loc,
             ));
+            // ARC: ts_obj_set retains name_val; release our owned ref.
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[name_val],
+                &[],
+                self.loc,
+            ));
         }
 
         scope.insert(name, obj_val);

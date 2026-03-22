@@ -7,6 +7,20 @@
 //! needs it (e.g. `__ts_console_log_i32`).  Future async TS features will
 //! schedule tasks onto this executor via `ts_runtime()`.
 
+// ── Global allocator: jemalloc (better memory-return-to-OS behavior) ─────────
+// jemalloc returns freed pages to the OS more aggressively than system malloc,
+// preventing the RSS fragmentation seen under high request rates.
+// dirty_decay_ms:0 + muzzy_decay_ms:0 = immediately purge freed pages back
+// to the OS, keeping RSS close to actual live heap size.
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(feature = "dhat-heap"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+
 // ── Heap profiling (opt-in via `--features dhat-heap`) ───────────────────────
 // Build:  cargo build -p ts-runtime --features dhat-heap
 // Dumps:  dhat-heap.json on process exit (Ctrl+C).

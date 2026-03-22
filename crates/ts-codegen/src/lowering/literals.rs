@@ -372,6 +372,11 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     &[],
                     self.loc,
                 ));
+                // ARC: ts_obj_set/define_getter/setter retains val internally; release our owned ref.
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[val_i64], &[], self.loc,
+                ));
             } else {
                 // Computed key: { [expr]: val }
                 use oxc_ast::ast::PropertyKey as PK;
@@ -438,9 +443,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         &[],
                         self.loc,
                     ));
+                    // ARC: ts_obj_set_val_key retains val internally; release key and val.
                     block.append_operation(func::call(
                         self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
                         &[key_i64], &[], self.loc,
+                    ));
+                    block.append_operation(func::call(
+                        self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                        &[val_i64], &[], self.loc,
                     ));
                 }
             }

@@ -173,27 +173,47 @@ pub unsafe extern "C" fn ts_promise_resolve(val: TsVal) -> TsVal {
 /// Await a Promise, consuming the argument and returning an owned result.
 ///
 /// - Non-Promise values: passed through as-is (ownership transferred).
-/// - Promise values: blocks until resolved, releases the Promise, returns the resolved value
-///   (caller receives ownership of the result).
+/// - Promise values: if called from a fiber context, yields the fiber (non-blocking);
+///   otherwise falls back to blocking Condvar wait.
+///   Releases the Promise, returns the resolved value (caller owns result).
 ///
 /// Callers must NOT release `val` after this call — ownership is consumed.
 #[no_mangle]
 pub unsafe extern "C" fn ts_promise_await(val: TsVal) -> TsVal {
     if !val.is_ptr() {
-        // Scalar (undefined/null/bool/i32/f64): no heap refcount — pass through.
         return val;
     }
     let ptr = val.as_ptr();
     let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
     let header = ptr.sub(header_size) as *const crate::alloc::ArcHeader;
     if (*header).tag != TAG_PROMISE_ALLOC {
-        // Non-Promise heap object: pass ownership through without retain/release.
         return val;
     }
     let promise = &*(ptr as *const TsPromise);
+
+    // Fast path: already resolved — no suspension needed.
+    if let Some(&v) = promise.resolved.get() {
+        ts_retain_val(v);
+        ts_release_val(val);
+        return v;
+    }
+
+    // Fiber path: yield the current fiber back to the Tokio event loop.
+    // The fiber will be resumed once the promise resolves.
+    if super::fiber::in_fiber() {
+        ts_retain_val(val); // extra retain to keep promise alive while suspended
+        let raw = super::fiber::fiber_yield(val.0);
+        let result = TsVal(raw);
+        ts_retain_val(result);
+        ts_release_val(val); // release the extra retain added above
+        ts_release_val(val); // release the caller's original owned reference (consume)
+        return result;
+    }
+
+    // Fallback: blocking Condvar wait for non-fiber contexts (background tasks, etc.)
     let result = block_until_resolved(promise.resolved.clone(), promise.blocking_notify.clone());
     ts_retain_val(result);
-    ts_release_val(val); // releases the Promise
+    ts_release_val(val);
     result
 }
 
