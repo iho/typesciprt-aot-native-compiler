@@ -17,7 +17,8 @@ function buildStartupMessage(user: string, database: string): Buffer {
   buf.writeUInt32BE(196608, 4); // protocol version 3.0
   let o = 8;
   for (const p of params) {
-    for (let i = 0; i < p.length; i++) buf.writeUInt8(p.charCodeAt(i), o++);
+    buf.write(p, o);
+    o += p.length;
     buf.writeUInt8(0, o++);
   }
   buf.writeUInt8(0, o); // trailing null — end of params list
@@ -30,7 +31,7 @@ function buildPasswordMessage(password: string): Buffer {
   const buf = Buffer.alloc(size);
   buf.writeUInt8(0x70, 0); // 'p'
   buf.writeUInt32BE(4 + password.length + 1, 1);
-  for (let i = 0; i < password.length; i++) buf.writeUInt8(password.charCodeAt(i), 5 + i);
+  buf.write(password, 5);
   buf.writeUInt8(0, 5 + password.length);
   return buf;
 }
@@ -41,7 +42,7 @@ function buildSimpleQuery(sql: string): Buffer {
   const buf = Buffer.alloc(size);
   buf.writeUInt8(0x51, 0); // 'Q'
   buf.writeUInt32BE(4 + sql.length + 1, 1); // length includes itself
-  for (let i = 0; i < sql.length; i++) buf.writeUInt8(sql.charCodeAt(i), 5 + i);
+  buf.write(sql, 5);
   buf.writeUInt8(0, 5 + sql.length);
   return buf;
 }
@@ -76,9 +77,7 @@ function parseNextMsg(buf: Buffer): [PgMsg, Buffer] | null {
 function readCString(buf: Buffer, offset: number): [string, number] {
   let end = offset;
   while (end < buf.length && buf.readUInt8(end) !== 0) end++;
-  let s = '';
-  for (let i = offset; i < end; i++) s += String.fromCharCode(buf.readUInt8(i));
-  return [s, end + 1];
+  return [buf.toString('utf8', offset, end), end + 1];
 }
 
 // ── QueryResult ───────────────────────────────────────────────────────────────
@@ -208,9 +207,7 @@ export class Client {
           if (valLen === -1) {
             row[cols[i]] = null;
           } else {
-            let s = '';
-            for (let j = 0; j < valLen; j++) s += String.fromCharCode(msg.payload.readUInt8(o + j));
-            row[cols[i]] = s;
+            row[cols[i]] = msg.payload.toString('utf8', o, o + valLen);
             o += valLen;
           }
         }

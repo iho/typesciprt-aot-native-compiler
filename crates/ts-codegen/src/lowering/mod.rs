@@ -1057,10 +1057,10 @@ fn process_import_recursive<'c, 'm>(
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
-        // Register exported names so import aliases work
-        for name in &cjs_exports.functions {
-            lowerer.module_global_names.insert(name.clone());
-        }
+        // Register non-function value exports as module globals (e.g. exports.VERSION = '1.0.0').
+        // Function exports are emitted as MLIR functions by lower_cjs_module and registered in
+        // lowerer.funcs — they must NOT go into module_global_names, because that would cause
+        // ts_get_module_global lookups (returning UNDEFINED) instead of direct MLIR calls.
         for name in &cjs_exports.values {
             lowerer.module_global_names.insert(name.clone());
         }
@@ -1242,6 +1242,9 @@ pub fn lower_program<'c>(
         class_name_aliases: HashMap::new(),
         cell_vars: std::collections::HashSet::new(),
         cell_captures: std::collections::HashSet::new(),
+        scalar_vars: std::collections::HashSet::new(),
+        non_escaping_allocs: std::collections::HashSet::new(),
+        arena_alloc_next: false,
         pending_label: None,
         addon_mode: cg.addon_mode,
         napi_exports: Vec::new(),
@@ -1507,6 +1510,22 @@ struct Lowerer<'c, 'm> {
     cell_vars: std::collections::HashSet<String>,
     /// Variables captured from an outer scope that are cells (set when entering a closure body).
     cell_captures: std::collections::HashSet<String>,
+    /// Local `const` variables in the current function that are provably scalar (TAG_INT, TAG_BOOL,
+    /// TAG_NULL, TAG_UNDEFINED).  `ts_retain_val`/`ts_release_val` calls on these are elided since
+    /// both are no-ops for non-pointer values — we just skip the call overhead (~3–5 ns each).
+    /// Saved/restored around each nested function body (same pattern as `cell_vars`).
+    scalar_vars: std::collections::HashSet<String>,
+    /// Local `const x = {}` / `const x = []` declarations in the current function body that
+    /// are provably non-escaping (never returned, never passed as an argument to unknown functions,
+    /// never stored into heap objects, never captured by closures).  These can be allocated on
+    /// the fiber bump arena rather than the heap, eliminating ARC overhead entirely.
+    /// Saved/restored around each nested function body (same pattern as `scalar_vars`).
+    non_escaping_allocs: std::collections::HashSet<String>,
+    /// Set to `true` immediately before lowering the initializer of a non-escaping variable
+    /// declaration, so `lower_object_expression`/`lower_array_expression` know to emit
+    /// `ts_obj_new_arena`/`ts_arr_new_arena` instead of `ts_obj_new`/`ts_arr_new`.
+    /// Reset to `false` after the initializer is lowered.
+    arena_alloc_next: bool,
     /// When a `LabeledStatement` wraps a loop/switch, this holds the label name so the
     /// loop-lowering code can attach it to the `inner_loops` entry it creates.
     pending_label: Option<String>,
@@ -1524,6 +1543,21 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     #[inline]
     pub(crate) fn is_cell_var(&self, name: &str) -> bool {
         self.cell_vars.contains(name) || self.cell_captures.contains(name)
+    }
+
+    /// Returns true if the expression's result is provably a scalar NaN-box value
+    /// (TAG_INT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED) — never a heap pointer.
+    /// When true, `ts_retain_val`/`ts_release_val` are no-ops and their call overhead
+    /// can be elided.  Also checks `scalar_vars` for known-scalar identifiers.
+    pub(crate) fn expr_result_is_scalar(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::Identifier(id) => {
+                let n = id.name.as_str();
+                n == "undefined" || n == "NaN" || n == "Infinity"
+                    || self.scalar_vars.contains(n)
+            }
+            _ => expr_is_definitely_scalar(expr),
+        }
     }
 
     /// Read the actual value from a cell pointer.
@@ -1895,10 +1929,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_release_val", &[i64_type], &[]);
         
         add_func("ts_obj_new", &[], &[i64_type]);
+        add_func("ts_obj_new_arena", &[], &[i64_type]);
         add_func("ts_obj_get", &[i64_type, ptr_type], &[i64_type]);
         add_func("ts_obj_set", &[i64_type, ptr_type, i64_type], &[]);
-        
+
         add_func("ts_arr_new", &[i32_type], &[i64_type]);
+        add_func("ts_arr_new_arena", &[i32_type], &[i64_type]);
         add_func("ts_arr_get", &[i64_type, i32_type], &[i64_type]);
         add_func("ts_arr_set", &[i64_type, i32_type, i64_type], &[]);
         add_func("ts_arr_len", &[i64_type], &[i64_type]);
@@ -2366,6 +2402,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_buffer_alloc_unsafe",        &[i64_type], &[i64_type]);
         add_func("ts_buffer_concat",              &[i64_type, i64_type], &[i64_type]);
         add_func("ts_buffer_to_string",           &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_buffer_to_string_range",     &[i64_type, i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_buffer_length",              &[i64_type], &[i64_type]);
         add_func("ts_buffer_slice",               &[i64_type, i64_type, i64_type], &[i64_type]);
         add_func("ts_buffer_get_byte",            &[i64_type, i64_type], &[i64_type]);
@@ -2953,6 +2990,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names.clone());
         let saved_cell_vars = std::mem::replace(&mut self.cell_vars, std::collections::HashSet::new());
         let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+        // scalar_vars / non_escaping_allocs will be populated after we know the body; save empty for now
+        let saved_scalar_vars = std::mem::replace(&mut self.scalar_vars, std::collections::HashSet::new());
+        let saved_non_escaping = std::mem::replace(&mut self.non_escaping_allocs, std::collections::HashSet::new());
+        // (populated below once body is confirmed)
         self.fn_return_type = return_type;
         self.is_async = func.r#async;
 
@@ -2977,6 +3018,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.current_fn_params = saved_fn_params;
             self.cell_vars = saved_cell_vars;
             self.cell_captures = saved_cell_captures;
+            self.scalar_vars = saved_scalar_vars;
+            self.non_escaping_allocs = saved_non_escaping;
             self.funcs.insert(emit_name.to_string(), FuncSig {
                 param_types: vec![i64_type; n_params],
                 return_type: Some(return_type),
@@ -2987,9 +3030,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             return Ok(());
         };
 
-        // Compute cell vars for mutable captures
+        // Compute cell vars for mutable captures, then scalar vars (excluding cell vars),
+        // then non-escaping allocs (excluding cell vars and scalar vars).
+        eprintln!("[arena] lower_fn_decl_impl '{}' body.stmts={}", emit_name, body.statements.len());
         let cell_vars_set = crate::lowering::expressions::compute_cell_vars_for_body(&body.statements);
         self.cell_vars = cell_vars_set;
+        let mut sv = crate::lowering::expressions::compute_scalar_vars_for_body(&body.statements);
+        sv.retain(|v| !self.cell_vars.contains(v));
+        let mut nea = crate::lowering::expressions::compute_non_escaping_allocs(&body.statements);
+        nea.retain(|v| !self.cell_vars.contains(v));
+        if !nea.is_empty() {
+            eprintln!("[arena] fn '{}' non_escaping_allocs: {:?}", emit_name, nea);
+        }
+        self.non_escaping_allocs = nea;
+        // Parameters with scalar TypeScript type annotations are also scalar.
+        for param in &func.params.items {
+            if let BindingPattern::BindingIdentifier(id) = &param.pattern {
+                if let Some(ann) = &param.type_annotation {
+                    if crate::lowering::ts_type_is_scalar(&ann.type_annotation) {
+                        sv.insert(id.name.to_string());
+                    }
+                }
+            }
+        }
+        self.scalar_vars = sv;
 
         let mut result_val: Value<'_, '_> = entry.append_operation(arith::constant(
             self.ctx, IntegerAttribute::new(return_type, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
@@ -3037,6 +3101,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.current_fn_params = saved_fn_params;
         self.cell_vars = saved_cell_vars;
         self.cell_captures = saved_cell_captures;
+        self.scalar_vars = saved_scalar_vars;
+        self.non_escaping_allocs = saved_non_escaping;
         self.funcs.insert(emit_name.to_string(), FuncSig {
             param_types: vec![i64_type; n_params],
             return_type: Some(return_type),
@@ -3258,11 +3324,25 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         if let Some(body) = &func.body {
             // Compute cell_vars: local variables mutated in nested closures (need heap cell boxing).
-            let saved_cell_vars = std::mem::replace(
-                &mut self.cell_vars,
-                crate::lowering::expressions::compute_cell_vars_for_body(&body.statements),
-            );
+            let cell_vars_impl = crate::lowering::expressions::compute_cell_vars_for_body(&body.statements);
+            let saved_cell_vars = std::mem::replace(&mut self.cell_vars, cell_vars_impl);
             let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+            let mut sv_impl = crate::lowering::expressions::compute_scalar_vars_for_body(&body.statements);
+            sv_impl.retain(|v| !self.cell_vars.contains(v));
+            // Parameters with scalar TypeScript type annotations are also scalar.
+            for param in &func.params.items {
+                if let BindingPattern::BindingIdentifier(id) = &param.pattern {
+                    if let Some(ann) = &param.type_annotation {
+                        if crate::lowering::ts_type_is_scalar(&ann.type_annotation) {
+                            sv_impl.insert(id.name.to_string());
+                        }
+                    }
+                }
+            }
+            let saved_scalar_vars_impl = std::mem::replace(&mut self.scalar_vars, sv_impl);
+            let mut nea_impl = crate::lowering::expressions::compute_non_escaping_allocs(&body.statements);
+            nea_impl.retain(|v| !self.cell_vars.contains(v));
+            let saved_non_escaping_impl = std::mem::replace(&mut self.non_escaping_allocs, nea_impl);
 
             // Pre-seed ALL local bindings (vars + inner function names) as undefined.
             let undef_placeholder: Value<'_, '_> = current_block.append_operation(arith::constant(
@@ -3362,14 +3442,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
             self.cell_vars = saved_cell_vars;
             self.cell_captures = saved_cell_captures;
+            self.scalar_vars = saved_scalar_vars_impl;
+            self.non_escaping_allocs = saved_non_escaping_impl;
         }
-        // ARC: release scope variables before final return (skip parameters —
-        // they are "borrowed" from the caller; the call site's post-call
-        // ts_release_val balances the pre-call ts_retain_val).
-        // For generators, skip __generator_yields — we're returning it (transfer ownership).
+        // ARC: release scope variables before final return (skip parameters,
+        // scalar vars, and generator yields array).
         for (name, v) in &scope {
             if self.current_fn_params.contains(name) { continue; }
             if func.generator && name == "__generator_yields" { continue; }
+            if self.scalar_vars.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
@@ -3603,5 +3684,68 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         );
         self.module.body().append_operation(op);
         Ok(())
+    }
+}
+
+// ── ARC elision helpers ───────────────────────────────────────────────────────
+
+/// Returns true if a TypeScript type annotation is provably always scalar
+/// (number, boolean, null, undefined, void, never, numeric/boolean literal types).
+/// Used to classify function parameters as scalar without needing body analysis.
+pub(super) fn ts_type_is_scalar(ty: &oxc_ast::ast::TSType<'_>) -> bool {
+    use oxc_ast::ast::{TSType, TSLiteral};
+    match ty {
+        TSType::TSNumberKeyword(_)
+        | TSType::TSBooleanKeyword(_)
+        | TSType::TSNullKeyword(_)
+        | TSType::TSUndefinedKeyword(_)
+        | TSType::TSVoidKeyword(_)
+        | TSType::TSNeverKeyword(_)
+        | TSType::TSBigIntKeyword(_) => true,
+        // Numeric/boolean literal types (e.g. `0 | 1`, `true | false`)
+        TSType::TSLiteralType(lit) => matches!(
+            lit.literal,
+            TSLiteral::NumericLiteral(_) | TSLiteral::BooleanLiteral(_)
+        ),
+        _ => false,
+    }
+}
+
+/// Returns true if the expression's result is provably a scalar NaN-box value
+/// (TAG_INT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED) regardless of runtime inputs —
+/// i.e., the result can never be a heap pointer.  Used to elide `ts_retain_val`
+/// / `ts_release_val` call overhead (~3–5 ns per call on ARM64).
+///
+/// Conservative: returns `false` when unsure.  Does NOT check `scalar_vars`;
+/// use `Lowerer::expr_result_is_scalar` for that.
+pub(super) fn expr_is_definitely_scalar(expr: &Expression) -> bool {
+    use oxc_ast::ast::{BinaryOperator as B, UnaryOperator as U};
+    match expr {
+        Expression::NumericLiteral(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) => true,
+        Expression::Identifier(id) => matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity"),
+        Expression::UnaryExpression(un) => matches!(
+            un.operator,
+            U::UnaryNegation | U::UnaryPlus | U::BitwiseNot | U::LogicalNot
+        ),
+        Expression::BinaryExpression(bin) => match bin.operator {
+            // Comparisons always return boolean (scalar).
+            B::LessThan | B::GreaterThan | B::LessEqualThan | B::GreaterEqualThan
+            | B::Equality | B::Inequality | B::StrictEquality | B::StrictInequality
+            | B::Instanceof | B::In => true,
+            // Numeric arithmetic (not Addition which may string-concat) always returns number.
+            B::Subtraction | B::Multiplication | B::Division | B::Remainder | B::Exponential => true,
+            // Bitwise ops always return integer (scalar).
+            B::BitwiseOR | B::BitwiseAnd | B::BitwiseXOR
+            | B::ShiftLeft | B::ShiftRight | B::ShiftRightZeroFill => true,
+            // Addition is scalar only when both operands are scalar (no string concat possible).
+            B::Addition => expr_is_definitely_scalar(&bin.left) && expr_is_definitely_scalar(&bin.right),
+            _ => false,
+        },
+        // TS wrappers are transparent.
+        Expression::TSAsExpression(e)           => expr_is_definitely_scalar(&e.expression),
+        Expression::TSNonNullExpression(e)      => expr_is_definitely_scalar(&e.expression),
+        Expression::TSSatisfiesExpression(e)    => expr_is_definitely_scalar(&e.expression),
+        Expression::TSTypeAssertion(e)          => expr_is_definitely_scalar(&e.expression),
+        _ => false,
     }
 }

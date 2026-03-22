@@ -4,6 +4,7 @@ declare function ts_buffer_alloc(size: number, fill: number): any;
 declare function ts_buffer_alloc_unsafe(size: number): any;
 declare function ts_buffer_concat(list: any[], totalLength: number): any;
 declare function ts_buffer_to_string(buf: any, encoding: string): string;
+declare function ts_buffer_to_string_range(buf: any, encoding: string, start: number, end: number): string;
 declare function ts_buffer_length(buf: any): number;
 declare function ts_buffer_slice(buf: any, start: number, end: number): any;
 declare function ts_buffer_get_byte(buf: any, index: number): number;
@@ -53,9 +54,10 @@ export class Buffer {
   static _fromRaw(raw: any): Buffer { return new Buffer(raw); }
 
   toString(encoding?: string, start?: number, end?: number): string {
-    const sliced = (start !== undefined || end !== undefined)
-      ? ts_buffer_slice(this._buf, start ?? 0, end ?? this.length) : this._buf;
-    return ts_buffer_to_string(sliced, encoding || 'utf8');
+    if (start !== undefined || end !== undefined) {
+      return ts_buffer_to_string_range(this._buf, encoding || 'utf8', start ?? 0, end ?? this.length);
+    }
+    return ts_buffer_to_string(this._buf, encoding || 'utf8');
   }
   get length(): number { return ts_buffer_length(this._buf); }
   get byteLength(): number { return ts_buffer_length(this._buf); }

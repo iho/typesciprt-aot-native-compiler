@@ -1,16 +1,16 @@
 //! Module-level global variables, process built-ins, and CJS module registry.
 
 use std::sync::{OnceLock, RwLock, Mutex};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use super::{TsVal, UNDEFINED, ts_retain_val, ts_release_val};
 use super::string_val::ts_string_new;
 use super::object::{ts_obj_new, ts_obj_set_val_key};
 use super::array::{ts_arr_new, ts_arr_push};
 
-static MODULE_GLOBALS: OnceLock<RwLock<HashMap<String, TsVal>>> = OnceLock::new();
+static MODULE_GLOBALS: OnceLock<RwLock<FxHashMap<String, TsVal>>> = OnceLock::new();
 
-fn globals_map() -> &'static RwLock<HashMap<String, TsVal>> {
-    MODULE_GLOBALS.get_or_init(|| RwLock::new(HashMap::new()))
+fn globals_map() -> &'static RwLock<FxHashMap<String, TsVal>> {
+    MODULE_GLOBALS.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
 #[no_mangle]
@@ -21,7 +21,8 @@ pub unsafe extern "C" fn ts_set_module_global(name_ptr: *const i8, val: TsVal) {
         let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
         let header = ptr.sub(header_size) as *const crate::alloc::ArcHeader;
         let rc = (*header).ref_count.load(std::sync::atomic::Ordering::Relaxed);
-        if rc == 0 || rc == 0xDEAD_BEEFu32 || rc > 0x100_0000 {
+        let is_sentinel = rc == crate::alloc::IMMORTAL_RC || rc == crate::alloc::ARENA_RC;
+        if rc == 0 || rc == 0xDEAD_BEEFu32 || (rc > 0x100_0000 && !is_sentinel) {
             eprintln!("ts_set_module_global: storing freed/corrupted value for key '{}' ptr={:p} rc={:#x}", name, ptr, rc);
             std::process::abort();
         }
@@ -93,10 +94,10 @@ pub unsafe extern "C" fn ts_process_env() -> TsVal {
 
 /// Global registry mapping CJS module specifier → namespace TsObject.
 /// Used by `require()` to return the exported namespace of a loaded CJS module.
-static CJS_REGISTRY: OnceLock<Mutex<HashMap<String, TsVal>>> = OnceLock::new();
+static CJS_REGISTRY: OnceLock<Mutex<FxHashMap<String, TsVal>>> = OnceLock::new();
 
-fn cjs_registry() -> &'static Mutex<HashMap<String, TsVal>> {
-    CJS_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+fn cjs_registry() -> &'static Mutex<FxHashMap<String, TsVal>> {
+    CJS_REGISTRY.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
 /// Extract a Rust String from a TsString value (heap tag 2).

@@ -47,6 +47,23 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             crate::lowering::expressions::compute_cell_vars_for_body(&program.body),
         );
         let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+        let saved_scalar_vars = std::mem::replace(
+            &mut self.scalar_vars,
+            {
+                let mut sv = crate::lowering::expressions::compute_scalar_vars_for_body(&program.body);
+                // Cell vars are TsArrays (heap) — never scalar regardless of their init.
+                sv.retain(|v| !self.cell_vars.contains(v));
+                sv
+            },
+        );
+        let saved_non_escaping = std::mem::replace(
+            &mut self.non_escaping_allocs,
+            {
+                let mut nea = crate::lowering::expressions::compute_non_escaping_allocs(&program.body);
+                nea.retain(|v| !self.cell_vars.contains(v));
+                nea
+            },
+        );
 
         for stmt in &program.body {
             // Function declarations are emitted separately; skip here.
@@ -61,7 +78,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         // ARC: Release all variables in the main scope before returning.
-        for (_, v) in &scope {
+        // Skip scalar vars — ts_release_val is a no-op for non-pointers; elide the call cost.
+        for (name, v) in &scope {
+            if self.scalar_vars.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
@@ -74,6 +93,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         self.cell_vars = saved_cell_vars;
         self.cell_captures = saved_cell_captures;
+        self.scalar_vars = saved_scalar_vars;
+        self.non_escaping_allocs = saved_non_escaping;
 
         self.terminate_with_return(current_block, result_value)?;
 
@@ -130,6 +151,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             &mut self.cell_captures,
             std::collections::HashSet::new(),
         );
+        let saved_scalar_vars_cjs = std::mem::replace(
+            &mut self.scalar_vars,
+            {
+                let mut sv = crate::lowering::expressions::compute_scalar_vars_for_body(&program.body);
+                sv.retain(|v| !self.cell_vars.contains(v));
+                sv
+            },
+        );
+        let saved_non_escaping_cjs = std::mem::replace(
+            &mut self.non_escaping_allocs,
+            {
+                let mut nea = crate::lowering::expressions::compute_non_escaping_allocs(&program.body);
+                nea.retain(|v| !self.cell_vars.contains(v));
+                nea
+            },
+        );
 
         for stmt in &program.body {
             if matches!(stmt, Statement::FunctionDeclaration(_)) {
@@ -139,8 +176,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             current_block = nb;
         }
 
-        // Release scope variables.
-        for (_, v) in &scope {
+        // Release scope variables (skip scalar vars — ts_release_val is a no-op for non-pointers).
+        for (name, v) in &scope {
+            if self.scalar_vars.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
@@ -151,6 +189,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         self.cell_vars = saved_cell_vars;
         self.cell_captures = saved_cell_captures;
+        self.scalar_vars = saved_scalar_vars_cjs;
+        self.non_escaping_allocs = saved_non_escaping_cjs;
 
         // Register each exported function with the napi bridge.
         let exports = self.napi_exports.clone();
@@ -328,15 +368,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 let (val_opt, nb) = self.lower_expression(&es.expression, block, region, scope)?;
                 if let Some(val) = val_opt {
                     let val_i64 = self.ensure_i64(val, nb)?;
-                    nb.append_operation(func::call(
-                        self.ctx,
-                        FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                        &[val_i64],
-                        &[],
-                        self.loc,
-                    ));
-                    // Return the (released) value so main() can use it as exit code.
-                    // For integers ts_release_val is a no-op, so the SSA value remains valid.
+                    // Skip ts_release_val for provably scalar expressions — it's a no-op for
+                    // non-pointer values; eliding the call saves ~3–5 ns per statement.
+                    if !self.expr_result_is_scalar(&es.expression) {
+                        nb.append_operation(func::call(
+                            self.ctx,
+                            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                            &[val_i64],
+                            &[],
+                            self.loc,
+                        ));
+                    }
+                    // Return the value so main() can use it as exit code.
                     return Ok((Some(val_i64), nb));
                 }
                 Ok((None, nb))
@@ -839,6 +882,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                         }
                     }
                     if let Some(init) = &declarator.init {
+                        // If this variable is a non-escaping object/array allocation, signal
+                        // lower_object_expression / lower_array_expression to use the arena variant.
+                        if self.non_escaping_allocs.contains(&name) {
+                            if matches!(init, Expression::ObjectExpression(_) | Expression::ArrayExpression(_)) {
+                                self.arena_alloc_next = true;
+                            }
+                        }
                         // Class expression: `const Foo = class<T> extends Bar<T> { ... }`
                         // Lower as a class declaration with the variable name as the class name.
                         if let Expression::ClassExpression(class_expr) = init {
@@ -975,12 +1025,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         };
 
         // ARC: Release local variables in the current scope before returning.
-        // Skip "__env" (env array is borrowed from the closure caller) and function
-        // parameters (they are borrowed refs; the call site's post-call ts_release_val
-        // balances the pre-call ts_retain_val done by lower_expression).
+        // Skip "__env" (env array is borrowed from the closure caller), function
+        // parameters (borrowed refs; call site owns them), and scalar vars (no-op).
         for (name, v) in scope.iter() {
             if name == "__env" { continue; }
             if self.current_fn_params.contains(name) { continue; }
+            if self.scalar_vars.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, block)?;
             block.append_operation(func::call(
                 self.ctx,

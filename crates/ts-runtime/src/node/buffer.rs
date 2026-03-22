@@ -88,6 +88,24 @@ pub unsafe extern "C" fn ts_buffer_to_string(buf: TsVal, encoding: TsVal) -> TsV
     new_string(&s)
 }
 
+/// `buf.toString(encoding, start, end)` — decode a byte range without allocating an intermediate slice.
+#[no_mangle]
+pub unsafe extern "C" fn ts_buffer_to_string_range(buf: TsVal, encoding: TsVal, start: TsVal, end: TsVal) -> TsVal {
+    if !buf.is_ptr() || heap_tag(buf) != HEAP_TAG_BUFFER { return new_string(""); }
+    let b = &*(buf.as_ptr() as *const TsBuffer);
+    let len = b.data.len();
+    let s = (val_to_i32(start).max(0) as usize).min(len);
+    let e = if end.is_undefined() { len } else { (val_to_i32(end).max(0) as usize).min(len) };
+    let slice = if s <= e { &b.data[s..e] } else { &b.data[0..0] };
+    let enc = val_to_string(encoding).unwrap_or_else(|| "utf8".into()).to_lowercase();
+    let result = match enc.as_str() {
+        "hex"    => hex::encode(slice),
+        "base64" => base64_encode(slice),
+        _        => String::from_utf8_lossy(slice).into_owned(),
+    };
+    new_string(&result)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ts_buffer_length(buf: TsVal) -> TsVal {
     if !buf.is_ptr() || heap_tag(buf) != HEAP_TAG_BUFFER { return TsVal::from_i32(0); }
