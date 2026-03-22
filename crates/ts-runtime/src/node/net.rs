@@ -1,6 +1,6 @@
 //! Node.js `net` module — TCP server and streaming client sockets.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicI32, Ordering}};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,43 +20,39 @@ use super::{new_string, val_to_i32, val_to_string};
 
 enum WriteMsg { Data(Vec<u8>), End, Destroy }
 
-/// Lock-free data queue for pull-mode sockets.
-/// Data arriving from the network is pushed here without acquiring the JS lock.
-/// `ts_socket_read_chunk` blocks on this queue and resolves a Promise when data arrives.
+/// Async data queue for pull-mode sockets.
+///
+/// Data arriving from the network is pushed via `push_data` / `push_eof`
+/// without acquiring the JS lock.  Consumers call `async_pop().await` from a
+/// Tokio async task — no OS thread is blocked while waiting for data.
 struct DataQueue {
-    chunks: Mutex<VecDeque<Vec<u8>>>,
-    cvar: std::sync::Condvar,
-    eof: AtomicBool,
+    tx: tokio::sync::mpsc::UnboundedSender<Option<Vec<u8>>>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Option<Vec<u8>>>>,
 }
 
 impl DataQueue {
     fn new() -> Arc<Self> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Arc::new(DataQueue {
-            chunks: Mutex::new(VecDeque::new()),
-            cvar: std::sync::Condvar::new(),
-            eof: AtomicBool::new(false),
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
         })
     }
 
     fn push_data(&self, data: Vec<u8>) {
-        self.chunks.lock().unwrap().push_back(data);
-        self.cvar.notify_one();
+        let _ = self.tx.send(Some(data));
     }
 
     fn push_eof(&self) {
-        self.eof.store(true, Ordering::Release);
-        self.cvar.notify_all();
+        let _ = self.tx.send(None);
     }
 
-    /// Block until a chunk is available; returns None on EOF/error.
-    fn blocking_pop(&self) -> Option<Vec<u8>> {
-        if self.eof.load(Ordering::Acquire) { return None; }
-        let mut guard = self.chunks.lock().unwrap();
-        loop {
-            if let Some(chunk) = guard.pop_front() { return Some(chunk); }
-            if self.eof.load(Ordering::Acquire) { return None; }
-            guard = self.cvar.wait(guard).unwrap();
-        }
+    /// Await the next data chunk.  Returns `None` on EOF/close.
+    /// Uses a tokio async mutex so no OS thread is blocked while waiting.
+    async fn async_pop(&self) -> Option<Vec<u8>> {
+        let mut rx = self.rx.lock().await;
+        // recv() returns None only when the sender is dropped (channel closed).
+        rx.recv().await.flatten()
     }
 }
 
@@ -262,7 +258,10 @@ pub unsafe extern "C" fn ts_socket_set_pull_mode(handle_id: TsVal) -> TsVal {
 
 /// Read the next available data chunk from the socket's DataQueue.
 /// Returns a Promise<Buffer> that resolves when data arrives, or Promise<null> on EOF.
-/// Releases the JS lock while waiting so other concurrent handlers can run.
+///
+/// Uses a pure async Tokio task — no OS thread is blocked and no JS lock is
+/// acquired.  When data arrives the async task resolves the Promise, waking
+/// any fiber that is awaiting it via the Tokio Notify signal.
 #[no_mangle]
 pub unsafe extern "C" fn ts_socket_read_chunk(handle_id: TsVal) -> TsVal {
     let id = val_to_i32(handle_id);
@@ -285,13 +284,15 @@ pub unsafe extern "C" fn ts_socket_read_chunk(handle_id: TsVal) -> TsVal {
     let n2 = notify.clone();
     let bn2 = blocking_notify.clone();
 
-    get_runtime().spawn_blocking(move || {
-        // Block on the data queue WITHOUT holding the JS lock.
-        // Data is pushed here directly from the async read task — no lock transitions needed.
-        let chunk = data_queue.blocking_pop();
-        let val = match chunk {
-            Some(bytes) => super::buffer::alloc_buffer_pub(bytes),
-            None => NULL,
+    // Spawn a lightweight async task (no OS thread, no JS lock).
+    // When the channel delivers data the task resolves the Promise.
+    get_runtime().spawn(async move {
+        let chunk = data_queue.async_pop().await;
+        let val = unsafe {
+            match chunk {
+                Some(bytes) => super::buffer::alloc_buffer_pub(bytes),
+                None => NULL,
+            }
         };
         resolve_arc(&r2, &n2, &bn2, val);
     });

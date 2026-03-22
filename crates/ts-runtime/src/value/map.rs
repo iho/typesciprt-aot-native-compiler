@@ -16,8 +16,17 @@ pub unsafe extern "C" fn ts_map_destructor(ptr: *mut u8) {
 /// Compare two TsVals for Map key equality (strict same-value semantics).
 pub(super) unsafe fn map_key_eq(a: TsVal, b: TsVal) -> bool {
     if a.0 == b.0 { return true; }
-    // String content equality
     if a.is_ptr() && heap_tag(a) == 2 && b.is_ptr() && heap_tag(b) == 2 {
+        // Interned strings: pointer equality is sufficient — the intern table
+        // guarantees same content ⇒ same pointer.
+        let hdr_size = std::mem::size_of::<crate::alloc::ArcHeader>();
+        let rc_a = (*(( a.as_ptr() as *const u8).sub(hdr_size) as *const crate::alloc::ArcHeader))
+            .ref_count.load(std::sync::atomic::Ordering::Relaxed);
+        let rc_b = (*((b.as_ptr() as *const u8).sub(hdr_size) as *const crate::alloc::ArcHeader))
+            .ref_count.load(std::sync::atomic::Ordering::Relaxed);
+        if rc_a == crate::alloc::IMMORTAL_RC && rc_b == crate::alloc::IMMORTAL_RC {
+            return false; // different interned pointers ⇒ different content
+        }
         let sa = &*(a.as_ptr() as *const TsString);
         let sb = &*(b.as_ptr() as *const TsString);
         return sa.inner == sb.inner;

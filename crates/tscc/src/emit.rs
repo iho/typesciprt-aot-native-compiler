@@ -46,39 +46,41 @@ pub fn mlir_to_llvm_ir(module: &Module<'_>, out: &Path) -> Result<()> {
         bail!("mlir-translate exited with {status}");
     }
 
-    // Internalize all generated functions except the binary entry points.
-    // This prevents user-defined function names (e.g. `connect`, `createConnection`)
-    // from becoming global C symbols that shadow OS syscalls during dynamic linking.
+    // Internalize all generated functions except the binary entry points,
+    // then run the full O2 middle-end optimization pipeline on the generated IR.
+    // This enables: inlining, SROA/mem2reg, loop unrolling, DCE, constant folding.
     let status = Command::new(llvm_bin("opt"))
-        .arg("--passes=internalize")
+        .arg("--passes=internalize,default<O2>")
         .arg("--internalize-public-api-list=main,__napi_init")
         .arg("-S")
         .arg(out)
         .arg("-o")
         .arg(out)
         .status()
-        .context("spawn opt (internalize)")?;
+        .context("spawn opt (internalize+O2)")?;
 
     if !status.success() {
-        bail!("opt (internalize) exited with {status}");
+        bail!("opt (internalize+O2) exited with {status}");
     }
     Ok(())
 }
 
 // ── LLVM IR → object file ─────────────────────────────────────────────────────
 
-/// Use `llc` to compile `.ll` → `.o`.
-pub fn llvm_ir_to_object(ll: &Path, out: &Path, opt: u8) -> Result<()> {
-    let status = Command::new(llvm_bin("llc"))
-        .args(["-filetype=obj", &format!("-O{opt}")])
+/// Use `clang -flto=full` to compile `.ll` → `.o` with embedded LTO bitcode.
+/// This enables the linker to perform cross-module optimization with the runtime library,
+/// inlining hot functions like `ts_retain_val`, `ts_release_val`, `ts_obj_get`, etc.
+pub fn llvm_ir_to_object(ll: &Path, out: &Path, _opt: u8) -> Result<()> {
+    let status = Command::new(llvm_bin("clang"))
+        .args(["-c", "-flto=full", "-O3"])
         .arg(ll)
         .arg("-o")
         .arg(out)
         .status()
-        .context("spawn llc")?;
+        .context("spawn clang (LTO compile)")?;
 
     if !status.success() {
-        bail!("llc exited with {status}");
+        bail!("clang (LTO compile) exited with {status}");
     }
     Ok(())
 }
@@ -174,6 +176,9 @@ pub fn build_runtime_napi() -> Result<PathBuf> {
 /// and libraries that Rust's std/tokio depend on at a lower level.
 pub fn link_binary(objs: &[&Path], out: &Path) -> Result<()> {
     let mut cmd = Command::new(llvm_bin("clang"));
+    // Use full LTO + O3 so the linker can cross-optimize the generated code
+    // with the runtime library (which contains embedded LLVM bitcode).
+    cmd.args(["-flto=full", "-O3"]);
     for obj in objs {
         cmd.arg(obj);
     }
@@ -191,7 +196,7 @@ pub fn link_binary(objs: &[&Path], out: &Path) -> Result<()> {
         ]);
     }
 
-    let status = cmd.status().context("spawn clang (linker)")?;
+    let status = cmd.status().context("spawn clang (LTO linker)")?;
 
     if !status.success() {
         bail!("clang linker exited with {status}");

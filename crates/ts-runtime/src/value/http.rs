@@ -1,17 +1,19 @@
 //! HTTP: Headers, Response, Request, serve, addEventListener.
 
-use super::{TsVal, TsMap, TsObject, TsString, TsResponse, UNDEFINED, NULL, heap_tag, ts_retain_val, ts_release_val};
+use super::{TsVal, TsMap, TsObject, TsString, TsResponse, TsRequest, UNDEFINED, NULL, heap_tag, ts_retain_val, ts_release_val};
 use super::array::{ts_arr_new, ts_arr_push};
 use super::object::{ts_obj_new, ts_obj_get, ts_obj_set};
 use super::map::{ts_map_set, map_key_eq};
 use super::uri::{rust_str_to_val, str_val_to_rust};
-use super::promise::{ts_promise_resolve, ts_promise_await, get_runtime, make_promise_pair, alloc_promise, resolve_arc, acquire_js_lock, release_js_lock};
+use super::promise::{ts_promise_resolve, ts_promise_await, get_runtime, make_promise_pair, alloc_promise, resolve_arc, release_js_lock};
+use super::fiber::JsFiber;
 use super::TsPromise;
 use super::func::dispatch_callback;
 use super::string_val::{ts_string_new, ts_val_to_string};
 use super::json::ts_json_parse;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::unix::io::FromRawFd;
 
 // ── Web API: Headers (tag=7) ──────────────────────────────────────────────────
 
@@ -171,6 +173,27 @@ pub unsafe extern "C" fn ts_headers_get_set_cookie(headers_val: TsVal) -> TsVal 
     result
 }
 
+// ── Node.js HTTP Request (tag=19) ─────────────────────────────────────────────
+
+pub unsafe extern "C" fn ts_node_request_destructor(ptr: *mut u8) {
+    let req = &mut *(ptr as *mut TsRequest);
+    ts_release_val(req.url);
+    ts_release_val(req.method);
+    ts_release_val(req.headers);
+    ts_release_val(req.body);
+    std::ptr::drop_in_place(req as *mut TsRequest);
+}
+
+/// Allocate a TsRequest (tag=19) directly from 4 owned TsVals.
+/// Ownership of all 4 values is transferred into the struct (no extra retain).
+pub unsafe fn ts_node_request_new(url: TsVal, method: TsVal, headers: TsVal, body: TsVal) -> TsVal {
+    let size = std::mem::size_of::<TsRequest>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 19) as *mut TsRequest;
+    if ptr.is_null() { return NULL; }
+    std::ptr::write(ptr, TsRequest { url, method, headers, body });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
 // ── Web API: Response (tag=8) ─────────────────────────────────────────────────
 
 pub unsafe extern "C" fn ts_response_destructor(ptr: *mut u8) {
@@ -279,8 +302,8 @@ pub unsafe extern "C" fn ts_response_ok(resp_val: TsVal) -> TsVal {
     }
 }
 
-/// `response.headers` — return the Headers object (retained).
-/// For TsObject (e.g. Request) falls back to the "headers" property.
+/// `response.headers` / `request.headers` — return the Headers object (retained).
+/// For TsObject falls back to the "headers" property.
 #[no_mangle]
 pub unsafe extern "C" fn ts_response_headers(resp_val: TsVal) -> TsVal {
     if !resp_val.is_ptr() { return NULL; }
@@ -289,6 +312,11 @@ pub unsafe extern "C" fn ts_response_headers(resp_val: TsVal) -> TsVal {
             let resp = &*(resp_val.as_ptr() as *const TsResponse);
             ts_retain_val(resp.headers);
             resp.headers
+        }
+        19 => {
+            let req = &*(resp_val.as_ptr() as *const TsRequest);
+            ts_retain_val(req.headers);
+            req.headers
         }
         0 => ts_obj_get(resp_val, b"headers\0".as_ptr() as *const i8),
         _ => NULL,
@@ -313,8 +341,6 @@ pub(super) unsafe fn build_ts_request_from_parts(
     headers: &[(String, String)],
     body_bytes: bytes::Bytes,
 ) -> TsVal {
-    let url_val = rust_str_to_val(uri.to_string());
-
     // Build TsHeaders (tag=7).
     let ts_hdrs = ts_headers_new(UNDEFINED);
     for (k, v) in headers {
@@ -325,25 +351,16 @@ pub(super) unsafe fn build_ts_request_from_parts(
         ts_release_val(vv);
     }
 
-    // Build init object: { method, headers, body }.
-    let init = ts_obj_new();
+    // Transfer ownership of all 4 values directly into a TsRequest (tag=19).
+    // This avoids creating two intermediate TsObjects (HashMap allocations).
+    let url_val    = rust_str_to_val(uri.to_string());
     let method_val = rust_str_to_val(method.to_string());
-    ts_obj_set(init, b"method\0".as_ptr() as *const i8, method_val);
-    ts_release_val(method_val);
-    ts_obj_set(init, b"headers\0".as_ptr() as *const i8, ts_hdrs);
-    ts_release_val(ts_hdrs);
-    if body_bytes.is_empty() {
-        ts_obj_set(init, b"body\0".as_ptr() as *const i8, NULL);
+    let body_val   = if body_bytes.is_empty() {
+        NULL
     } else {
-        let body_val = rust_str_to_val(String::from_utf8_lossy(&body_bytes).into_owned());
-        ts_obj_set(init, b"body\0".as_ptr() as *const i8, body_val);
-        ts_release_val(body_val);
-    }
-
-    let req = ts_request_new(url_val, init);
-    ts_release_val(url_val);
-    ts_release_val(init);
-    req
+        rust_str_to_val(String::from_utf8_lossy(&body_bytes).into_owned())
+    };
+    ts_node_request_new(url_val, method_val, ts_hdrs, body_val)
 }
 
 /// Convert a TsVal Response (tag=8) into a hyper Response.
@@ -396,102 +413,179 @@ pub(super) unsafe fn ts_response_to_hyper(
     })
 }
 
-/// `serve(port, fetchFn)` — start a hyper HTTP/1.1 server.
-#[no_mangle]
-pub unsafe extern "C" fn ts_serve(port: i32, fetch_fn: TsVal) -> TsVal {
+/// Create a TCP socket with SO_REUSEPORT so multiple worker threads can each
+/// bind to the same port and have the kernel load-balance incoming connections.
+unsafe fn bind_reuseport(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use std::os::unix::io::FromRawFd;
+    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+    if fd < 0 { return Err(std::io::Error::last_os_error()); }
+    let one: libc::c_int = 1;
+    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+        &one as *const _ as *const libc::c_void,
+        std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
+        &one as *const _ as *const libc::c_void,
+        std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    let mut addr: libc::sockaddr_in = std::mem::zeroed();
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port   = port.to_be();
+    addr.sin_addr   = libc::in_addr { s_addr: 0 };
+    if libc::bind(fd, &addr as *const _ as *const libc::sockaddr,
+                  std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t) != 0 {
+        libc::close(fd);
+        return Err(std::io::Error::last_os_error());
+    }
+    if libc::listen(fd, 128) != 0 {
+        libc::close(fd);
+        return Err(std::io::Error::last_os_error());
+    }
+    let std_listener = std::net::TcpListener::from_raw_fd(fd);
+    std_listener.set_nonblocking(true)?;
+    Ok(std_listener)
+}
+
+/// Core accept loop: accept connections from `listener` and dispatch each to a JsFiber.
+async fn serve_accept_loop(
+    listener: tokio::net::TcpListener,
+    fetch_raw: u64,
+    fiber_rx: Option<tokio::sync::mpsc::UnboundedReceiver<super::fiber::JsFiber>>,
+) {
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use http_body_util::BodyExt;
-    use tokio::net::TcpListener;
 
-    // Retain fetch_fn so it lives as long as the server.
-    ts_retain_val(fetch_fn);
-    let fetch_raw = fetch_fn.0; // u64, Copy + Send
+    if let Some(mut rx) = fiber_rx {
+        tokio::task::spawn_local(async move {
+            while let Some(fiber) = rx.recv().await {
+                tokio::task::spawn_local(fiber.run());
+            }
+        });
+    }
 
-    // ts_serve is called from TS code which holds the JS execution lock.
-    // Release it before entering the blocking server loop — per-request
-    // spawn_blocking tasks will re-acquire it around each handler invocation.
-    release_js_lock();
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => { eprintln!("ts_serve: accept error: {e}"); continue; }
+        };
+        let io = TokioIo::new(stream);
 
-    get_runtime().block_on(async move {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .expect("ts_serve: failed to bind port");
+        tokio::task::spawn_local(async move {
+            let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                async move {
+                    let method  = req.method().as_str().to_string();
+                    let path    = req.uri().to_string();
+                    let headers: Vec<(String, String)> = req.headers().iter()
+                        .map(|(k, v)| (
+                            k.as_str().to_string(),
+                            v.to_str().unwrap_or("").to_string(),
+                        ))
+                        .collect();
+                    let host = headers.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("localhost");
+                    let uri = if path.starts_with('/') {
+                        format!("http://{}{}", host, path)
+                    } else {
+                        path
+                    };
+                    let body_bytes = req.into_body()
+                        .collect().await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
 
-        eprintln!("Listening on http://{}", addr);
+                    let fiber = JsFiber::new(move || unsafe {
+                        let fetch_fn = TsVal(fetch_raw);
+                        let ts_req = build_ts_request_from_parts(
+                            &method, &uri, &headers, body_bytes,
+                        );
+                        let result = dispatch_callback(fetch_fn, &[ts_req]);
+                        ts_release_val(ts_req);
+                        let resolved = ts_promise_await(result);
+                        let boxed = Box::new(ts_response_to_hyper(resolved));
+                        Box::into_raw(boxed) as u64
+                    });
 
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => { eprintln!("ts_serve: accept error: {e}"); continue; }
-            };
-            let io = TokioIo::new(stream);
-
-            tokio::task::spawn(async move {
-                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let fetch_raw = fetch_raw;
-                    async move {
-                        // Collect request parts.
-                        let method  = req.method().as_str().to_string();
-                        let path    = req.uri().to_string();
-                        let headers: Vec<(String, String)> = req.headers().iter()
-                            .map(|(k, v)| (
-                                k.as_str().to_string(),
-                                v.to_str().unwrap_or("").to_string(),
-                            ))
-                            .collect();
-                        // Build a full URL so `new URL(req.url)` works in user code.
-                        let host = headers.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-                            .map(|(_, v)| v.as_str())
-                            .unwrap_or("localhost");
-                        let uri = if path.starts_with('/') {
-                            format!("http://{}{}", host, path)
-                        } else {
-                            path
-                        };
-                        let body_bytes = req.into_body()
-                            .collect().await
-                            .map(|c| c.to_bytes())
-                            .unwrap_or_default();
-
-                        // Call TS handler on a blocking thread (not async-safe).
-                        let hyper_resp = get_runtime()
-                            .spawn_blocking(move || unsafe {
-                                acquire_js_lock();
-                                let fetch_fn = TsVal(fetch_raw);
-                                let ts_req = build_ts_request_from_parts(
-                                    &method, &uri, &headers, body_bytes,
-                                );
-                                // Call fetch(request).
-                                let result = dispatch_callback(fetch_fn, &[ts_req]);
-                                ts_release_val(ts_req);
-                                // Await if Promise (consumes result, returns owned resolved value).
-                                let resolved = ts_promise_await(result);
-                                let hyper_resp = ts_response_to_hyper(resolved);
-                                release_js_lock();
-                                hyper_resp
-                            })
-                            .await
-                            .unwrap_or_else(|_| {
-                                hyper::Response::builder()
-                                    .status(500)
-                                    .body(http_body_util::Full::new(bytes::Bytes::new()))
-                                    .unwrap()
-                            });
-
-                        Ok::<_, std::convert::Infallible>(hyper_resp)
-                    }
-                });
-
-                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                    eprintln!("ts_serve: connection error: {e}");
+                    let raw_ptr = fiber.run().await;
+                    let hyper_resp = unsafe {
+                        *Box::from_raw(raw_ptr as *mut hyper::Response<http_body_util::Full<bytes::Bytes>>)
+                    };
+                    Ok::<_, std::convert::Infallible>(hyper_resp)
                 }
             });
-        }
-    });
+
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                let msg = e.to_string();
+                if !msg.contains("connection closed before message") {
+                    eprintln!("ts_serve: connection error: {e}");
+                }
+            }
+        });
+    }
+}
+
+/// `serve(port, fetchFn)` — start a hyper HTTP/1.1 server.
+///
+/// Set `SERVE_WORKERS=N` to run N parallel worker threads, each with its own
+/// event loop and SO_REUSEPORT listener.  The kernel distributes connections
+/// across workers, multiplying throughput by N.  Defaults to 1 worker.
+///
+/// **Thread-safety note**: with N>1 workers, the fetch handler and all module
+/// globals it accesses must be safe for concurrent use (reads are fine; writes
+/// to shared Maps/Objects from multiple workers are not synchronised).
+#[no_mangle]
+pub unsafe extern "C" fn ts_serve(port: i32, fetch_fn: TsVal) -> TsVal {
+    let nworkers: usize = std::env::var("SERVE_WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+
+    // Retain once for the main worker; extra retains for each additional worker.
+    ts_retain_val(fetch_fn);
+    for _ in 1..nworkers { ts_retain_val(fetch_fn); }
+    let fetch_raw = fetch_fn.0;
+
+    // Release the JS execution lock before entering the fiber-based event loop.
+    release_js_lock();
+
+    // Register a channel so external threads (timers, promise callbacks) can
+    // post JsFibers onto the main LocalSet without the global JS lock.
+    let (fiber_tx, fiber_rx) =
+        tokio::sync::mpsc::unbounded_channel::<super::fiber::JsFiber>();
+    super::fiber::register_local_set_tx(fiber_tx);
+
+    let port_u16 = port as u16;
+
+    // Spawn extra worker threads (workers 2..N).  Each gets its own LocalSet
+    // and its own SO_REUSEPORT listener.  No fiber channel needed for extras.
+    for _ in 1..nworkers {
+        std::thread::spawn(move || {
+            let std_listener = unsafe { bind_reuseport(port_u16) }
+                .expect("ts_serve worker: failed to bind port");
+            let local = tokio::task::LocalSet::new();
+            get_runtime().block_on(local.run_until(async move {
+                let listener = tokio::net::TcpListener::from_std(std_listener)
+                    .expect("ts_serve worker: from_std failed");
+                serve_accept_loop(listener, fetch_raw, None).await;
+            }));
+        });
+    }
+
+    // Main worker (worker 1): bind its own listener, carry the fiber channel.
+    let std_listener = bind_reuseport(port_u16)
+        .expect("ts_serve: failed to bind port");
+
+    eprintln!("Listening on http://0.0.0.0:{} ({} worker{})",
+        port_u16, nworkers, if nworkers == 1 { "" } else { "s" });
+
+    let local = tokio::task::LocalSet::new();
+    get_runtime().block_on(local.run_until(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .expect("ts_serve: from_std failed");
+        serve_accept_loop(listener, fetch_raw, Some(fiber_rx)).await;
+    }));
 
     UNDEFINED
 }
@@ -573,6 +667,11 @@ pub unsafe extern "C" fn ts_val_text(val: TsVal) -> TsVal {
                 ts_retain_val(resp.body);
                 resp.body
             }
+            19 => {
+                let req = &*(val.as_ptr() as *const TsRequest);
+                ts_retain_val(req.body);
+                req.body
+            }
             _ => UNDEFINED,
         }
     } else {
@@ -603,6 +702,11 @@ pub unsafe extern "C" fn ts_val_json(val: TsVal) -> TsVal {
                 let resp = &*(val.as_ptr() as *const TsResponse);
                 ts_retain_val(resp.body);
                 resp.body
+            }
+            19 => {
+                let req = &*(val.as_ptr() as *const TsRequest);
+                ts_retain_val(req.body);
+                req.body
             }
             _ => UNDEFINED,
         }

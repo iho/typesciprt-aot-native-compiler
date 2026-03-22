@@ -1,6 +1,81 @@
 //! TsString: heap-allocated TypeScript strings and string methods.
 
 use super::{TsVal, TsString, TsArray, NULL, heap_tag, ts_retain_val, ts_release_val};
+use rustc_hash::FxHashMap;
+use std::sync::{RwLock, OnceLock};
+
+/// Maximum byte length of a string eligible for interning.
+/// Strings beyond this size are unique enough (JSON bodies, large URLs) that
+/// the intern-table lookup cost exceeds the ARC savings.
+const INTERN_MAX_BYTES: usize = 256;
+
+/// Global string intern table.
+///
+/// Uses `RwLock` instead of `Mutex` so concurrent reads (the common path once a
+/// string is already interned) never block each other. In a busy HTTP server
+/// with dozens of JsFibers, repeated property names ("method", "headers", "url",
+/// "content-type", …) are looked up constantly — contention-free reads matter.
+static INTERN_TABLE: OnceLock<RwLock<FxHashMap<String, TsVal>>> = OnceLock::new();
+
+#[inline]
+fn intern_table() -> &'static RwLock<FxHashMap<String, TsVal>> {
+    INTERN_TABLE.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
+/// Allocate a TsString and set its refcount to IMMORTAL_RC so it is never freed.
+unsafe fn alloc_immortal_string(s: String) -> TsVal {
+    let size = std::mem::size_of::<TsString>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 2) as *mut TsString;
+    if ptr.is_null() { return NULL; }
+    // ts_alloc_rc initialises ref_count to 1; override with the immortal sentinel.
+    let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
+    let header = (ptr as *mut u8).sub(header_size) as *mut crate::alloc::ArcHeader;
+    (*header).ref_count.store(crate::alloc::IMMORTAL_RC, std::sync::atomic::Ordering::Relaxed);
+    std::ptr::write(ptr, TsString { inner: s });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// Create a TsString from a Rust `&str`, interning it if `s.len() <= INTERN_MAX_BYTES`.
+///
+/// Interned strings are immortal: `ts_retain_val` and `ts_release_val` are no-ops on them,
+/// eliminating all ARC atomic operations on the hot path for common short strings
+/// (HTTP method names, header names, URL paths, JSON field names, etc.).
+///
+/// Two-phase locking: first acquire a read lock to check for an existing entry
+/// (no contention between concurrent readers), then upgrade to a write lock only
+/// if the string is new (rare). This ensures the hot path — looking up an already-
+/// interned string — is contention-free across all JsFibers.
+///
+/// Returns an owned-semantics TsVal. For immortal strings the caller may still call
+/// `ts_release_val` — it will be a no-op, so existing generated code is unchanged.
+pub unsafe fn ts_string_from_str(s: &str) -> TsVal {
+    if s.len() <= INTERN_MAX_BYTES {
+        let table = intern_table();
+        // Fast path: read lock — no contention between concurrent lookups.
+        {
+            let guard = table.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(&val) = guard.get(s) {
+                return val;
+            }
+        }
+        // Slow path: string not yet interned — take write lock and insert.
+        let mut guard = table.write().unwrap_or_else(|p| p.into_inner());
+        // Re-check after acquiring the write lock (another fiber may have inserted it).
+        if let Some(&val) = guard.get(s) {
+            return val;
+        }
+        let owned = s.to_owned();
+        let val = alloc_immortal_string(owned.clone());
+        guard.insert(owned, val);
+        return val;
+    }
+    // Large string — allocate normally with standard ARC.
+    let size = std::mem::size_of::<TsString>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 2) as *mut TsString;
+    if ptr.is_null() { return NULL; }
+    std::ptr::write(ptr, TsString { inner: s.to_owned() });
+    TsVal::from_ptr(ptr as *mut u8)
+}
 
 pub unsafe extern "C" fn ts_string_destructor(ptr: *mut u8) {
     let s_ptr = ptr as *mut TsString;
@@ -9,32 +84,20 @@ pub unsafe extern "C" fn ts_string_destructor(ptr: *mut u8) {
 
 #[no_mangle]
 pub unsafe extern "C" fn ts_string_new(c_str: *const i8) -> TsVal {
-    let s = std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned();
-    let size = std::mem::size_of::<TsString>();
-    let ptr = crate::alloc::ts_alloc_rc(size, 2) as *mut TsString; // tag 2 = String
-    if ptr.is_null() {
-        return NULL;
-    }
-    std::ptr::write(ptr, TsString { inner: s });
-    TsVal::from_ptr(ptr as *mut u8)
+    let s = std::ffi::CStr::from_ptr(c_str).to_string_lossy();
+    ts_string_from_str(s.as_ref())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ts_string_concat(v1: TsVal, v2: TsVal) -> TsVal {
     let p1 = v1.as_ptr() as *mut TsString;
     let p2 = v2.as_ptr() as *mut TsString;
-
     let s1 = &(*p1).inner;
     let s2 = &(*p2).inner;
-
-    let new_s = format!("{}{}", s1, s2);
-    let size = std::mem::size_of::<TsString>();
-    let ptr = crate::alloc::ts_alloc_rc(size, 2) as *mut TsString;
-    if ptr.is_null() {
-        return NULL;
-    }
-    std::ptr::write(ptr, TsString { inner: new_s });
-    TsVal::from_ptr(ptr as *mut u8)
+    let mut new_s = String::with_capacity(s1.len() + s2.len());
+    new_s.push_str(s1);
+    new_s.push_str(s2);
+    ts_string_from_str(&new_s)
 }
 
 /// Convert any TsVal to a string TsVal. Returns an owned reference.

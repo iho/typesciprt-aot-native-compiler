@@ -5,13 +5,13 @@ use crate::value::{TsVal, UNDEFINED, heap_tag, ts_retain_val, ts_release_val, Ts
 use crate::value::array::{ts_arr_new, ts_arr_push};
 use crate::value::func::{ts_func_call1, ts_func_call2};
 use super::val_to_string;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 pub const HEAP_TAG_EVENT_EMITTER: u8 = 16;
 
 pub struct TsEventEmitter {
-    pub listeners: HashMap<String, Vec<TsVal>>,
-    pub once_listeners: HashMap<String, Vec<TsVal>>,
+    pub listeners: FxHashMap<String, Vec<TsVal>>,
+    pub once_listeners: FxHashMap<String, Vec<TsVal>>,
 }
 
 #[no_mangle]
@@ -27,8 +27,8 @@ pub unsafe extern "C" fn ts_event_emitter_new() -> TsVal {
     let size = std::mem::size_of::<TsEventEmitter>();
     let ptr = ts_alloc_rc(size, HEAP_TAG_EVENT_EMITTER);
     std::ptr::write(ptr as *mut TsEventEmitter, TsEventEmitter {
-        listeners: HashMap::new(),
-        once_listeners: HashMap::new(),
+        listeners: FxHashMap::default(),
+        once_listeners: FxHashMap::default(),
     });
     TsVal::from_ptr(ptr)
 }

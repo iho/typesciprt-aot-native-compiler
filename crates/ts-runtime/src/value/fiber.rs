@@ -5,13 +5,7 @@
 //! its stack back to the Tokio task driving it (`JsFiber::run()`), which then
 //! awaits the promise asynchronously without blocking any OS thread.
 //!
-//! # Before (spawn_blocking + global JS lock)
-//! ```
-//! 50 requests = 50 OS threads competing for 1 Mutex
-//! each await: release lock → Condvar::wait (~100 µs) → acquire lock
-//! ```
-//!
-//! # After (fiber + LocalSet)
+//! # Execution model
 //! ```
 //! 50 requests = 50 fibers on 1 LocalSet thread
 //! each await: stack-switch (~50 ns) → tokio awaits promise → resume
@@ -19,10 +13,52 @@
 //!
 //! Only one fiber runs at a time (cooperative, like a JS event loop), so all
 //! JS values remain single-threaded with no synchronisation needed.
+//!
+//! # Global LocalSet fiber channel
+//!
+//! `register_local_set_tx` / `schedule_fiber` let any thread post a JsFiber
+//! onto the active LocalSet.  The LocalSet drains the channel by spawning each
+//! fiber as a new `spawn_local` task.  Used by promise callbacks (`.then()`,
+//! `.finally()`) and timer callbacks so they run cooperatively instead of
+//! holding the global JS lock on a `spawn_blocking` thread.
 
 use std::cell::{Cell, RefCell};
+use std::sync::OnceLock as StdOnceLock;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use corosensei::stack::DefaultStack;
+
+// ── Global LocalSet fiber channel ────────────────────────────────────────────
+//
+// When `ts_serve` (or any LocalSet-based server) starts, it registers an
+// UnboundedSender here.  Any thread can then call `schedule_fiber()` to post
+// a JsFiber onto the LocalSet without needing the global JS lock.
+
+static LOCAL_FIBER_TX: StdOnceLock<tokio::sync::mpsc::UnboundedSender<JsFiber>> =
+    StdOnceLock::new();
+
+/// Register the LocalSet's fiber intake channel.  Called once from `ts_serve`
+/// before entering the event loop.
+pub fn register_local_set_tx(tx: tokio::sync::mpsc::UnboundedSender<JsFiber>) {
+    // If already set (e.g. server restarted in tests), ignore — the existing
+    // sender may or may not still be valid, but we can't overwrite an OnceLock.
+    let _ = LOCAL_FIBER_TX.set(tx);
+}
+
+/// Returns a clone of the LocalSet sender, or `None` if no LocalSet is active.
+pub fn get_local_set_tx() -> Option<tokio::sync::mpsc::UnboundedSender<JsFiber>> {
+    LOCAL_FIBER_TX.get().cloned()
+}
+
+/// Schedule `fiber` to run on the active LocalSet.  Returns `true` if
+/// successfully queued, `false` if no LocalSet is registered (caller should
+/// fall back to `spawn_blocking` + JS lock).
+pub fn schedule_fiber(fiber: JsFiber) -> bool {
+    if let Some(tx) = LOCAL_FIBER_TX.get() {
+        tx.send(fiber).is_ok()
+    } else {
+        false
+    }
+}
 
 // ── Thread-local suspend handle ───────────────────────────────────────────────
 
@@ -83,6 +119,10 @@ unsafe impl Send for JsFiber {}
 impl JsFiber {
     /// Create a fiber that runs `f()` and returns the result as a raw `u64`
     /// (a TsVal bit-pattern).  `f` executes on the fiber's own stack.
+    ///
+    /// Each fiber automatically gets a 128 KB bump-pointer arena.
+    /// Arena allocations skip ARC entirely; the arena is bulk-freed (with proper
+    /// destructor calls) when the fiber returns.
     pub fn new<F>(f: F) -> Self
     where
         F: FnOnce() -> u64 + Send + 'static,
@@ -93,7 +133,11 @@ impl JsFiber {
             move |yielder: &Yielder<u64, u64>, _initial: u64| -> u64 {
                 // Store the yielder pointer so ts_promise_await can reach it.
                 YIELDER_PTR.with(|p| p.set(yielder as *const _));
+                // Set up a bump-pointer arena for this fiber.
+                unsafe { crate::alloc::arena_enter(); }
                 let result = f();
+                // Destroy and free the arena (runs all pending destructors).
+                unsafe { crate::alloc::arena_exit(); }
                 YIELDER_PTR.with(|p| p.set(std::ptr::null()));
                 result
             },
@@ -132,12 +176,31 @@ impl JsFiber {
 ///
 /// # Safety
 /// Must only be called while a fiber is executing (YIELDER_PTR is non-null).
+///
+/// Saves and restores both `YIELDER_PTR` and `ACTIVE_ARENA` around the yield so
+/// that other fibers which run while this one is suspended get a clean TLS state,
+/// and this fiber sees its own arena/yielder again on resume.
 pub unsafe fn fiber_yield(promise_raw: u64) -> u64 {
-    let ptr = YIELDER_PTR.with(|p| p.get());
-    debug_assert!(!ptr.is_null(), "fiber_yield called outside fiber context");
-    // suspend() saves the current stack frame and returns to resume().
-    // The next resume() call passes back the resolved value as the return.
-    (*ptr).suspend(promise_raw)
+    // These locals live on the fiber's own stack, so they are saved and
+    // restored automatically as part of the coroutine context switch.
+    let yielder_ptr = YIELDER_PTR.with(|p| p.get());
+    let arena_ptr   = crate::alloc::ACTIVE_ARENA.with(|a| {
+        let p = a.get();
+        a.set(std::ptr::null_mut()); // clear so next fiber starts clean
+        p
+    });
+    YIELDER_PTR.with(|p| p.set(std::ptr::null()));
+
+    debug_assert!(!yielder_ptr.is_null(), "fiber_yield called outside fiber context");
+    // suspend() saves the current stack frame and returns to JsFiber::run().
+    // The next resume() call passes back the resolved value.
+    let result = (*yielder_ptr).suspend(promise_raw);
+
+    // Restore this fiber's TLS state after being resumed.
+    YIELDER_PTR.with(|p| p.set(yielder_ptr));
+    crate::alloc::ACTIVE_ARENA.with(|a| a.set(arena_ptr));
+
+    result
 }
 
 /// Returns `true` if the calling code is currently running inside a JsFiber.

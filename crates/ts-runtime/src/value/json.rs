@@ -5,74 +5,102 @@ use super::string_val::{ts_string_new};
 use super::array::{ts_arr_new, ts_arr_set};
 use super::object::{ts_obj_new, ts_obj_set};
 
+thread_local! {
+    /// Reused JSON serialization buffer: avoids per-call allocation and resizing.
+    /// Cleared at the start of each stringify call; capacity is kept across calls.
+    static JSON_BUF: std::cell::UnsafeCell<String> = std::cell::UnsafeCell::new(String::with_capacity(2048));
+}
+
 /// JSON.stringify: convert TsVal to a JSON string TsVal.
 #[no_mangle]
 pub unsafe extern "C" fn ts_json_stringify(val: TsVal) -> TsVal {
-    let s = ts_val_to_json_string(val, 0);
-    let mut bytes = s.into_bytes();
-    bytes.push(0u8);
-    ts_string_new(bytes.as_ptr() as *const i8)
+    let result = JSON_BUF.with(|cell| {
+        let buf = &mut *cell.get();
+        buf.clear();
+        ts_val_write_json(buf, val, 0);
+        // Build the null-terminated C string for ts_string_new.
+        let mut bytes = buf.as_bytes().to_vec();
+        bytes.push(0u8);
+        unsafe { ts_string_new(bytes.as_ptr() as *const i8) }
+    });
+    result
 }
 
-unsafe fn ts_val_to_json_string(val: TsVal, depth: usize) -> String {
-    if depth > 50 { return "null".to_string(); }
-    if val == UNDEFINED { return "null".to_string(); }
-    if val == NULL { return "null".to_string(); }
-    if val == TRUE { return "true".to_string(); }
-    if val == FALSE { return "false".to_string(); }
+/// Write the JSON representation of `val` into `buf`.
+/// Uses a write-into-buffer strategy — no intermediate heap allocations per value.
+unsafe fn ts_val_write_json(buf: &mut String, val: TsVal, depth: usize) {
+    use std::fmt::Write as _;
+    if depth > 50 { buf.push_str("null"); return; }
+    if val == UNDEFINED || val == NULL { buf.push_str("null"); return; }
+    if val == TRUE  { buf.push_str("true");  return; }
+    if val == FALSE { buf.push_str("false"); return; }
     if val.is_int32() {
-        return val.as_i32().to_string();
+        let _ = write!(buf, "{}", val.as_i32());
+        return;
     }
     if val.is_number() {
         let f = val.as_f64();
-        if f.is_infinite() || f.is_nan() { return "null".to_string(); }
+        if f.is_infinite() || f.is_nan() { buf.push_str("null"); return; }
         if f == f.floor() && f.abs() < 1e15 {
-            return format!("{}", f as i64);
+            let _ = write!(buf, "{}", f as i64);
+        } else {
+            let _ = write!(buf, "{}", f);
         }
-        return format!("{}", f);
+        return;
     }
     if val.is_ptr() {
         let tag = heap_tag(val);
         if tag == 2 {
-            // String: JSON-encode it
             let ts_str = &*(val.as_ptr() as *const TsString);
-            let mut escaped = String::with_capacity(ts_str.inner.len() + 2);
+            buf.push('"');
             for ch in ts_str.inner.chars() {
                 match ch {
-                    '\\' => escaped.push_str("\\\\"),
-                    '"'  => escaped.push_str("\\\""),
-                    '\n' => escaped.push_str("\\n"),
-                    '\r' => escaped.push_str("\\r"),
-                    '\t' => escaped.push_str("\\t"),
-                    c    => escaped.push(c),
+                    '\\' => buf.push_str("\\\\"),
+                    '"'  => buf.push_str("\\\""),
+                    '\n' => buf.push_str("\\n"),
+                    '\r' => buf.push_str("\\r"),
+                    '\t' => buf.push_str("\\t"),
+                    c    => buf.push(c),
                 }
             }
-            return format!("\"{}\"", escaped);
+            buf.push('"');
+            return;
         }
         if tag == 1 {
-            // Array
             let arr = &*(val.as_ptr() as *const TsArray);
-            let items: Vec<String> = arr.elements.iter().map(|&v| {
-                if v == UNDEFINED { "null".to_string() }
-                else { ts_val_to_json_string(v, depth + 1) }
-            }).collect();
-            return format!("[{}]", items.join(","));
+            buf.push('[');
+            for (i, &v) in arr.elements.iter().enumerate() {
+                if i > 0 { buf.push(','); }
+                if v == UNDEFINED { buf.push_str("null"); }
+                else { ts_val_write_json(buf, v, depth + 1); }
+            }
+            buf.push(']');
+            return;
         }
         if tag == 0 {
-            // Object
             let obj = &*(val.as_ptr() as *const TsObject);
-            let props: Vec<String> = obj.properties.iter()
-                .filter(|(k, _)| !k.starts_with("__"))
-                .filter_map(|(k, &v)| {
-                    if v == UNDEFINED { return None; }
-                    let escaped_key = k.replace('"', "\\\"");
-                    Some(format!("\"{}\":{}", escaped_key, ts_val_to_json_string(v, depth + 1)))
-                })
-                .collect();
-            return format!("{{{}}}", props.join(","));
+            buf.push('{');
+            let mut first = true;
+            for (k, &v) in &obj.properties {
+                if k.starts_with("__") || v == UNDEFINED { continue; }
+                if !first { buf.push(','); }
+                first = false;
+                buf.push('"');
+                if k.contains('"') {
+                    for ch in k.chars() {
+                        if ch == '"' { buf.push_str("\\\""); } else { buf.push(ch); }
+                    }
+                } else {
+                    buf.push_str(k);
+                }
+                buf.push_str("\":");
+                ts_val_write_json(buf, v, depth + 1);
+            }
+            buf.push('}');
+            return;
         }
     }
-    "null".to_string()
+    buf.push_str("null");
 }
 
 /// JSON.parse: parse JSON string TsVal to a TsVal.

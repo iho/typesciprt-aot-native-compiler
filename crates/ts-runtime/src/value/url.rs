@@ -1,11 +1,11 @@
 //! URL and URLSearchParams.
 
-use super::{TsVal, TsString, TsMap, TsObject, UNDEFINED, NULL, heap_tag, ts_release_val};
+use super::{TsVal, TsString, TsMap, TsObject, TsUrl, UNDEFINED, NULL, heap_tag, ts_release_val};
 use super::array::{ts_arr_new, ts_arr_push};
 use super::object::{ts_obj_new, ts_obj_set};
 use super::map::ts_map_set;
 use super::uri::{rust_str_to_val, percent_encode, percent_decode};
-use super::string_val::ts_val_to_string;
+use super::string_val::{ts_string_new, ts_val_to_string};
 // ── URLSearchParams helpers ───────────────────────────────────────────────────
 
 /// Decode a query-string component: `+` → space, then percent-decode.
@@ -175,65 +175,180 @@ unsafe fn ts_val_to_rust_string(val: TsVal) -> String {
     }
 }
 
-/// `new URL(href, base?)` — parse a URL and return a TsObject with all URL properties.
+/// Destructor for TsUrl (tag=20): release all 12 TsVal fields.
+pub unsafe extern "C" fn ts_url_destructor(ptr: *mut u8) {
+    let u = &mut *(ptr as *mut TsUrl);
+    ts_release_val(u.href);
+    ts_release_val(u.protocol);
+    ts_release_val(u.host);
+    ts_release_val(u.hostname);
+    ts_release_val(u.port);
+    ts_release_val(u.pathname);
+    ts_release_val(u.search);
+    ts_release_val(u.hash);
+    ts_release_val(u.origin);
+    ts_release_val(u.username);
+    ts_release_val(u.password);
+    ts_release_val(u.search_params);
+    std::ptr::drop_in_place(u as *mut TsUrl);
+}
+
+/// Fast-path URL parsing for `http://` and `https://` URLs (no base, no auth, no fragment).
+/// Returns None if the URL doesn't match the fast path — caller falls back to `url::Url::parse`.
+fn try_parse_http_url_fast(s: &str) -> Option<(&str, &str, &str, &str, &str, &str, &str)> {
+    // scheme = "http" or "https" (only)
+    let (scheme, rest) = if let Some(r) = s.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = s.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return None;
+    };
+    // No userinfo allowed in fast path (no '@')
+    if rest.contains('@') { return None; }
+    // Find start of path (or end of authority)
+    let path_start = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..path_start];
+    let path_query_hash = &rest[path_start..];
+    // Split host:port
+    let (hostname, port) = if let Some(colon_pos) = authority.rfind(':') {
+        (&authority[..colon_pos], &authority[colon_pos + 1..])
+    } else {
+        (authority, "")
+    };
+    // Split path, query, hash
+    let (path_query, hash) = if let Some(h) = path_query_hash.find('#') {
+        (&path_query_hash[..h], &path_query_hash[h..])
+    } else {
+        (path_query_hash, "")
+    };
+    let (pathname, search) = if let Some(q) = path_query.find('?') {
+        (&path_query[..q], &path_query[q..])
+    } else {
+        (path_query, "")
+    };
+    Some((scheme, hostname, port, pathname, search, hash, s))
+}
+
+/// `new URL(href, base?)` — parse a URL and return a TsUrl (tag=20) with all URL properties.
+/// Uses a fixed-field struct instead of a TsObject HashMap, eliminating 10 HashMap inserts.
+/// Uses a fast-path parser for plain http:// and https:// URLs.
 #[no_mangle]
-pub unsafe extern "C" fn ts_url_new(href: TsVal, _base: TsVal) -> TsVal {
-    use url::Url;
+pub unsafe extern "C" fn ts_url_new(href: TsVal, base: TsVal) -> TsVal {
     let href_str = ts_val_to_rust_string(href);
 
-    let parsed = match Url::parse(&href_str) {
+    // Only treat base as a URL string if it's actually a TsString (tag=2).
+    let base_str = if base.is_ptr() && heap_tag(base) == 2 {
+        let ts_str = &*(base.as_ptr() as *const TsString);
+        ts_str.inner.clone()
+    } else {
+        String::new()
+    };
+
+    // Fast path for plain http:// / https:// with no base URL.
+    if base_str.is_empty() {
+        if let Some((scheme, hostname, port, pathname, search, hash, href_out)) =
+            try_parse_http_url_fast(&href_str)
+        {
+            // Use static C-string literals to avoid heap alloc for static strings.
+            // Interned strings have IMMORTAL_RC so retain/release are no-ops —
+            // safe to store multiple references to the same immortal TsVal.
+            let protocol_val = if scheme == "https" {
+                ts_string_new(b"https:\0".as_ptr() as *const i8)
+            } else {
+                ts_string_new(b"http:\0".as_ptr() as *const i8)
+            };
+            let empty_val = ts_string_new(b"\0".as_ptr() as *const i8);
+
+            let host = if port.is_empty() {
+                hostname.to_string()
+            } else {
+                format!("{}:{}", hostname, port)
+            };
+            let origin = format!("{}://{}", scheme, host);
+            let query = search.strip_prefix('?').unwrap_or("");
+
+            let size = std::mem::size_of::<TsUrl>();
+            let ptr = crate::alloc::ts_alloc_rc(size, 20) as *mut TsUrl;
+            if ptr.is_null() { return NULL; }
+
+            std::ptr::write(ptr, TsUrl {
+                href:          rust_str_to_val(href_out.to_string()),
+                protocol:      protocol_val,
+                host:          rust_str_to_val(host),
+                hostname:      rust_str_to_val(hostname.to_string()),
+                port:          rust_str_to_val(port.to_string()),
+                pathname:      rust_str_to_val(if pathname.is_empty() { "/".to_string() } else { pathname.to_string() }),
+                search:        if search.is_empty() { empty_val } else { rust_str_to_val(search.to_string()) },
+                hash:          if hash.is_empty() { empty_val } else { rust_str_to_val(hash.to_string()) },
+                origin:        rust_str_to_val(origin),
+                username:      empty_val,
+                password:      empty_val,
+                search_params: parse_query_string(query),
+            });
+            return TsVal::from_ptr(ptr as *mut u8);
+        }
+    }
+
+    // Full parse via the url crate for everything else.
+    use url::Url;
+    let parsed = if base_str.is_empty() {
+        Url::parse(&href_str)
+    } else {
+        Url::parse(&base_str).and_then(|b| b.join(&href_str))
+    };
+
+    let parsed = match parsed {
         Ok(u) => u,
         Err(_) => {
-            // Return an object with just href set and empty others
-            let obj = ts_obj_new();
-            let href_val = rust_str_to_val(href_str);
-            ts_obj_set(obj, b"href\0".as_ptr() as *const i8, href_val);
-            ts_release_val(href_val);
+            // Return an empty TsUrl on parse error
             let empty = rust_str_to_val(String::new());
-            for key in &[b"protocol\0".as_ptr(), b"host\0".as_ptr(), b"hostname\0".as_ptr(),
-                         b"port\0".as_ptr(), b"pathname\0".as_ptr(), b"search\0".as_ptr(),
-                         b"hash\0".as_ptr(), b"origin\0".as_ptr()] {
-                ts_obj_set(obj, *key as *const i8, empty);
-            }
-            ts_release_val(empty);
+            let href_val = rust_str_to_val(href_str);
             let sp = ts_urlsearchparams_new(UNDEFINED);
-            ts_obj_set(obj, b"searchParams\0".as_ptr() as *const i8, sp);
-            ts_release_val(sp);
-            return obj;
+            let size = std::mem::size_of::<TsUrl>();
+            let ptr = crate::alloc::ts_alloc_rc(size, 20) as *mut TsUrl;
+            if ptr.is_null() { ts_release_val(href_val); ts_release_val(empty); ts_release_val(sp); return NULL; }
+            super::ts_retain_val(empty); super::ts_retain_val(empty); super::ts_retain_val(empty);
+            super::ts_retain_val(empty); super::ts_retain_val(empty); super::ts_retain_val(empty);
+            super::ts_retain_val(empty); super::ts_retain_val(empty); super::ts_retain_val(empty);
+            std::ptr::write(ptr, TsUrl {
+                href: href_val, protocol: empty, host: empty,
+                hostname: empty, port: empty, pathname: empty,
+                search: empty, hash: empty, origin: empty,
+                username: empty, password: empty, search_params: sp,
+            });
+            ts_release_val(empty);
+            return TsVal::from_ptr(ptr as *mut u8);
         }
     };
 
-    let obj = ts_obj_new();
-
-    let set_str_prop = |obj: TsVal, key: &[u8], val: String| {
-        let v = rust_str_to_val(val);
-        ts_obj_set(obj, key.as_ptr() as *const i8, v);
-        ts_release_val(v);
+    let host_str = parsed.host_str().unwrap_or("");
+    let port_str = parsed.port().map(|p| p.to_string()).unwrap_or_default();
+    let host = if port_str.is_empty() {
+        host_str.to_string()
+    } else {
+        format!("{}:{}", host_str, port_str)
     };
-
-    set_str_prop(obj, b"href\0",     parsed.as_str().to_string());
-    set_str_prop(obj, b"protocol\0", format!("{}:", parsed.scheme()));
-    set_str_prop(obj, b"host\0",     parsed.host_str().unwrap_or("").to_string()
-        .chars().chain(parsed.port().map(|p| format!(":{}", p)).unwrap_or_default().chars()).collect());
-    set_str_prop(obj, b"hostname\0", parsed.host_str().unwrap_or("").to_string());
-    set_str_prop(obj, b"port\0",     parsed.port().map(|p| p.to_string()).unwrap_or_default());
-    set_str_prop(obj, b"pathname\0", parsed.path().to_string());
-    set_str_prop(obj, b"search\0",   parsed.query().map(|q| format!("?{}", q)).unwrap_or_default());
-    set_str_prop(obj, b"hash\0",     parsed.fragment().map(|f| format!("#{}", f)).unwrap_or_default());
-
-    // origin = scheme + "://" + host
-    let origin = format!("{}://{}{}",
-        parsed.scheme(),
-        parsed.host_str().unwrap_or(""),
-        parsed.port().map(|p| format!(":{}", p)).unwrap_or_default(),
-    );
-    set_str_prop(obj, b"origin\0", origin);
-
-    // searchParams
+    let origin = format!("{}://{}", parsed.scheme(), host);
     let query = parsed.query().unwrap_or("");
-    let sp = parse_query_string(query);
-    ts_obj_set(obj, b"searchParams\0".as_ptr() as *const i8, sp);
-    ts_release_val(sp);
 
-    obj
+    let size = std::mem::size_of::<TsUrl>();
+    let ptr = crate::alloc::ts_alloc_rc(size, 20) as *mut TsUrl;
+    if ptr.is_null() { return NULL; }
+
+    std::ptr::write(ptr, TsUrl {
+        href:          rust_str_to_val(parsed.as_str().to_string()),
+        protocol:      rust_str_to_val(format!("{}:", parsed.scheme())),
+        host:          rust_str_to_val(host),
+        hostname:      rust_str_to_val(host_str.to_string()),
+        port:          rust_str_to_val(port_str),
+        pathname:      rust_str_to_val(parsed.path().to_string()),
+        search:        rust_str_to_val(if query.is_empty() { String::new() } else { format!("?{}", query) }),
+        hash:          rust_str_to_val(parsed.fragment().map(|f| format!("#{}", f)).unwrap_or_default()),
+        origin:        rust_str_to_val(origin),
+        username:      rust_str_to_val(parsed.username().to_string()),
+        password:      rust_str_to_val(parsed.password().unwrap_or("").to_string()),
+        search_params: parse_query_string(query),
+    });
+    TsVal::from_ptr(ptr as *mut u8)
 }

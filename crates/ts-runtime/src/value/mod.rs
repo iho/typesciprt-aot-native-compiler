@@ -120,11 +120,15 @@ impl TsVal {
 
 // ── Heap Objects ──────────────────────────────────────────────────────────────
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// A heap-allocated TypeScript object.
 pub struct TsObject {
-    pub properties: HashMap<String, TsVal>,
+    pub properties: FxHashMap<String, TsVal>,
+    /// Set to `true` when any getter/setter is installed via `Object.defineGetter/Setter`.
+    /// Allows `ts_obj_get`/`ts_obj_set` to skip the `__getter_*`/`__setter_*` lookup
+    /// entirely for the overwhelmingly common case of plain data objects.
+    pub has_accessors: bool,
 }
 
 /// A heap-allocated TypeScript array.
@@ -194,6 +198,32 @@ pub struct TsResponse {
     pub status: u16,
     pub body: TsVal,    // TsString or NULL
     pub headers: TsVal, // TsHeaders (tag=7)
+}
+
+/// TsRequest heap type (tag=19). Compact struct for HTTP Request objects.
+/// Avoids a HashMap allocation by using fixed-offset field access instead.
+pub struct TsRequest {
+    pub url:     TsVal, // TsString: full URL
+    pub method:  TsVal, // TsString: "GET", "POST", etc.
+    pub headers: TsVal, // TsHeaders (tag=7)
+    pub body:    TsVal, // TsString or NULL
+}
+
+/// TsUrl heap type (tag=20). Compact struct for URL objects (replaces TsObject for `new URL()`).
+/// Stores all URL components as TsVals to avoid 10 HashMap inserts per parse.
+pub struct TsUrl {
+    pub href:          TsVal, // TsString
+    pub protocol:      TsVal, // TsString: "https:"
+    pub host:          TsVal, // TsString: "example.com:8080"
+    pub hostname:      TsVal, // TsString: "example.com"
+    pub port:          TsVal, // TsString: "8080" or ""
+    pub pathname:      TsVal, // TsString: "/path"
+    pub search:        TsVal, // TsString: "?key=val" or ""
+    pub hash:          TsVal, // TsString: "#section" or ""
+    pub origin:        TsVal, // TsString: "https://example.com"
+    pub username:      TsVal, // TsString
+    pub password:      TsVal, // TsString
+    pub search_params: TsVal, // TsMap (tag=9): URLSearchParams
 }
 
 /// A heap-allocated JavaScript Symbol (tag=10).
@@ -400,36 +430,57 @@ pub unsafe extern "C" fn ts_retain_val(val: TsVal) {
 
 #[no_mangle]
 pub unsafe extern "C" fn ts_release_val(val: TsVal) {
-    if val.is_ptr() {
-        let ptr = val.as_ptr();
-        let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
-        let header = ptr.sub(header_size) as *mut crate::alloc::ArcHeader;
+    if !val.is_ptr() { return; }
+    let ptr = val.as_ptr();
+    let header_size = std::mem::size_of::<crate::alloc::ArcHeader>();
+    let header = ptr.sub(header_size) as *mut crate::alloc::ArcHeader;
+
+    // Check sentinels before fetch_sub to avoid corrupting them.
+    let pre_rc = (*header).ref_count.load(std::sync::atomic::Ordering::Relaxed);
+    if pre_rc == crate::alloc::IMMORTAL_RC || pre_rc == crate::alloc::ARENA_RC { return; }
+
+    let old_rc = (*header).ref_count.fetch_sub(1, std::sync::atomic::Ordering::Release);
+
+    #[cfg(debug_assertions)]
+    if old_rc == 0 || old_rc == 0xDEAD_BEEFu32 || old_rc > 0x100_0000 {
+        eprintln!("ts_release_val: double-free at ptr={:p} old_rc={:#x}", ptr, old_rc);
+        std::process::abort();
+    }
+
+    if old_rc == 1 {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let tag = (*header).tag;
-
-        let destructor = match tag {
-            0 => Some(object::ts_obj_destructor as unsafe extern "C" fn(*mut u8)),
-            1 => Some(array::ts_arr_destructor as unsafe extern "C" fn(*mut u8)),
-            2 => Some(string_val::ts_string_destructor as unsafe extern "C" fn(*mut u8)),
-            3 => Some(promise::ts_promise_destructor as unsafe extern "C" fn(*mut u8)),
-            4 => Some(func::ts_func_destructor as unsafe extern "C" fn(*mut u8)),
-            5 => Some(map::ts_map_destructor as unsafe extern "C" fn(*mut u8)),
-            6 => Some(regexp::ts_regexp_destructor as unsafe extern "C" fn(*mut u8)),
-            7 => Some(http::ts_headers_destructor as unsafe extern "C" fn(*mut u8)),
-            8 => Some(http::ts_response_destructor as unsafe extern "C" fn(*mut u8)),
-            9  => Some(map::ts_map_destructor as unsafe extern "C" fn(*mut u8)), // URLSearchParams
-            10 => Some(symbol::ts_symbol_destructor as unsafe extern "C" fn(*mut u8)),
-            11 => Some(set::ts_set_destructor as unsafe extern "C" fn(*mut u8)),
-            12 => Some(weak::ts_weakmap_destructor as unsafe extern "C" fn(*mut u8)),
-            13 => Some(weak::ts_weakset_destructor as unsafe extern "C" fn(*mut u8)),
-            14 => Some(date::ts_date_destructor as unsafe extern "C" fn(*mut u8)),
-            15 => Some(weakref::ts_weakref_destructor as unsafe extern "C" fn(*mut u8)),
-            16 => Some(crate::node::events::ts_event_emitter_destructor as unsafe extern "C" fn(*mut u8)),
-            17 => Some(crate::node::buffer::ts_buffer_destructor as unsafe extern "C" fn(*mut u8)),
-            18 => Some(crate::napi::ts_napi_function_destructor as unsafe extern "C" fn(*mut u8)),
-            _ => None,
-        };
-
-        crate::alloc::ts_release(ptr, destructor);
+        let size = (*header).size as usize;
+        // Call the type-specific destructor to release inner references.
+        match tag {
+            0  => object::ts_obj_destructor(ptr),
+            1  => array::ts_arr_destructor(ptr),
+            2  => string_val::ts_string_destructor(ptr),
+            3  => promise::ts_promise_destructor(ptr),
+            4  => func::ts_func_destructor(ptr),
+            5  => map::ts_map_destructor(ptr),
+            6  => regexp::ts_regexp_destructor(ptr),
+            7  => http::ts_headers_destructor(ptr),
+            8  => http::ts_response_destructor(ptr),
+            9  => map::ts_map_destructor(ptr),
+            10 => symbol::ts_symbol_destructor(ptr),
+            11 => set::ts_set_destructor(ptr),
+            12 => weak::ts_weakmap_destructor(ptr),
+            13 => weak::ts_weakset_destructor(ptr),
+            14 => date::ts_date_destructor(ptr),
+            15 => weakref::ts_weakref_destructor(ptr),
+            16 => crate::node::events::ts_event_emitter_destructor(ptr),
+            17 => crate::node::buffer::ts_buffer_destructor(ptr),
+            18 => crate::napi::ts_napi_function_destructor(ptr),
+            19 => http::ts_node_request_destructor(ptr),
+            20 => url::ts_url_destructor(ptr),
+            _  => {}
+        }
+        let total = header_size + size;
+        let layout = std::alloc::Layout::from_size_align(total, 8).expect("layout");
+        #[cfg(debug_assertions)]
+        (*header).ref_count.store(0xDEAD_BEEFu32, std::sync::atomic::Ordering::Relaxed);
+        std::alloc::dealloc(header as *mut u8, layout);
     }
 }
 

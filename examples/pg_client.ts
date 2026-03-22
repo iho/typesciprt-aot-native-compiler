@@ -306,7 +306,7 @@ export class Pool {
 
   private _release(client: Client): void {
     if (this._waiters.length > 0) {
-      const waiter = this._waiters.pop()!;
+      const waiter = this._waiters.shift()!;
       waiter(client);
     } else {
       this._idle.push(client);

@@ -50,13 +50,18 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         // If the array has spread elements, use push-based construction.
         let has_spread = array.elements.iter().any(|e| e.is_spread());
 
+        // Consume the arena_alloc_next flag (reset before any early return).
+        let use_arena = self.arena_alloc_next;
+        self.arena_alloc_next = false;
+
         if has_spread {
             // Allocate empty array, then push/push_all each element.
+            let arr_fn = if use_arena { "ts_arr_new_arena" } else { "ts_arr_new" };
             let zero = self.lower_numeric_literal(0, block)?;
             let arr_val: Value<'c, 'b> = block
                 .append_operation(func::call(
                     self.ctx,
-                    FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                    FlatSymbolRefAttribute::new(self.ctx, arr_fn),
                     &[zero],
                     &[i64_type],
                     self.loc,
@@ -117,13 +122,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         // No spread: pre-allocate by count and use ts_arr_set by index (faster).
+        let arr_fn = if use_arena { "ts_arr_new_arena" } else { "ts_arr_new" };
         let n = array.elements.len();
         let n_val = self.lower_numeric_literal(n as i64, block)?;
 
         let arr_val: Value<'c, 'b> = block
             .append_operation(func::call(
                 self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "ts_arr_new"),
+                FlatSymbolRefAttribute::new(self.ctx, arr_fn),
                 &[n_val],
                 &[i64_type],
                 self.loc,
@@ -305,11 +311,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
         let i64_type = self.i64_type();
 
-        // %obj = func.call @ts_obj_new() : () -> i64
+        // Consume the arena_alloc_next flag.
+        let obj_fn = if self.arena_alloc_next { "ts_obj_new_arena" } else { "ts_obj_new" };
+        self.arena_alloc_next = false;
+
+        // %obj = func.call @ts_obj_new() / @ts_obj_new_arena() : () -> i64
         let obj_val: Value<'c, 'b> = block
             .append_operation(func::call(
                 self.ctx,
-                FlatSymbolRefAttribute::new(self.ctx, "ts_obj_new"),
+                FlatSymbolRefAttribute::new(self.ctx, obj_fn),
                 &[],
                 &[i64_type],
                 self.loc,

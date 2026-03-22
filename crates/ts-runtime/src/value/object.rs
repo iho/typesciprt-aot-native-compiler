@@ -1,6 +1,6 @@
 //! TsObject: heap-allocated TypeScript objects and their operations.
 
-use super::{TsVal, TsObject, TsArray, TsString, TsMap, TsResponse, UNDEFINED, NULL,
+use super::{TsVal, TsObject, TsArray, TsString, TsMap, TsResponse, TsRequest, TsUrl, UNDEFINED, NULL,
             heap_tag, ts_retain_val, ts_release_val};
 use super::string_val::ts_string_new;
 use super::array::{ts_arr_new, ts_arr_set, ts_arr_push};
@@ -24,8 +24,22 @@ pub unsafe extern "C" fn ts_obj_new() -> TsVal {
         return NULL;
     }
     std::ptr::write(ptr, TsObject {
-        properties: std::collections::HashMap::new(),
+        properties: rustc_hash::FxHashMap::default(),
+        has_accessors: false,
     });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
+/// Arena-aware variant: allocates from the current fiber's bump-pointer arena,
+/// falling back to the heap if the arena is full or inactive.
+/// The resulting object's ARC is ARENA_RC — retain/release are no-ops.
+/// The destructor is called by `arena_exit` when the fiber completes.
+#[no_mangle]
+pub unsafe extern "C" fn ts_obj_new_arena() -> TsVal {
+    let size = std::mem::size_of::<TsObject>();
+    let ptr = crate::alloc::ts_alloc_arena(size, 0) as *mut TsObject;
+    if ptr.is_null() { return NULL; }
+    std::ptr::write(ptr, TsObject { properties: rustc_hash::FxHashMap::default(), has_accessors: false });
     TsVal::from_ptr(ptr as *mut u8)
 }
 
@@ -48,43 +62,66 @@ pub unsafe extern "C" fn ts_obj_get(obj_val: TsVal, key_ptr: *const i8) -> TsVal
     let ptr = obj_val.as_ptr();
     if ptr.is_null() || key_ptr.is_null() { return UNDEFINED; }
     let tag = heap_tag(obj_val);
-    let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy().into_owned();
+    // Use to_str() — returns &str borrowing the C string directly, zero allocation.
+    let key = std::ffi::CStr::from_ptr(key_ptr).to_str().unwrap_or_default();
     if tag == 7 {
-        // TsHeaders: __class__ property or nothing else via obj_get
-        if key == "__class__" {
-            return rust_str_to_val("Headers".to_string());
-        }
+        if key == "__class__" { return rust_str_to_val("Headers".to_string()); }
         return UNDEFINED;
     }
     if tag == 8 {
-        // TsResponse: expose body, status, headers, __class__
         let resp = &*(ptr as *const TsResponse);
-        match key.as_str() {
+        match key {
             "__class__" => return rust_str_to_val("Response".to_string()),
-            "body" => { ts_retain_val(resp.body); return resp.body; }
-            "status" => return TsVal::from_i32(resp.status as i32),
+            "body"    => { ts_retain_val(resp.body);    return resp.body; }
+            "status"  => return TsVal::from_i32(resp.status as i32),
             "headers" => { ts_retain_val(resp.headers); return resp.headers; }
-            "ok" => return TsVal::from_bool(resp.status >= 200 && resp.status < 300),
+            "ok"      => return TsVal::from_bool(resp.status >= 200 && resp.status < 300),
             _ => return UNDEFINED,
         }
     }
     if tag == 10 {
-        // TsSymbol: expose .description
-        if key == "description" {
-            return super::symbol::ts_symbol_description(obj_val);
-        }
+        if key == "description" { return super::symbol::ts_symbol_description(obj_val); }
         return UNDEFINED;
     }
-    // Only tag=0 (TsObject) has a properties HashMap. All other heap types return UNDEFINED.
+    if tag == 19 {
+        let req = &*(ptr as *const TsRequest);
+        match key {
+            "url"     => { ts_retain_val(req.url);     return req.url; }
+            "method"  => { ts_retain_val(req.method);  return req.method; }
+            "headers" => { ts_retain_val(req.headers); return req.headers; }
+            "body"    => { ts_retain_val(req.body);    return req.body; }
+            _ => return UNDEFINED,
+        }
+    }
+    if tag == 20 {
+        let u = &*(ptr as *const TsUrl);
+        match key {
+            "href"         => { super::ts_retain_val(u.href);          return u.href; }
+            "protocol"     => { super::ts_retain_val(u.protocol);      return u.protocol; }
+            "host"         => { super::ts_retain_val(u.host);          return u.host; }
+            "hostname"     => { super::ts_retain_val(u.hostname);      return u.hostname; }
+            "port"         => { super::ts_retain_val(u.port);          return u.port; }
+            "pathname"     => { super::ts_retain_val(u.pathname);      return u.pathname; }
+            "search"       => { super::ts_retain_val(u.search);        return u.search; }
+            "hash"         => { super::ts_retain_val(u.hash);          return u.hash; }
+            "origin"       => { super::ts_retain_val(u.origin);        return u.origin; }
+            "username"     => { super::ts_retain_val(u.username);      return u.username; }
+            "password"     => { super::ts_retain_val(u.password);      return u.password; }
+            "searchParams" => { super::ts_retain_val(u.search_params); return u.search_params; }
+            _ => return UNDEFINED,
+        }
+    }
     if tag != 0 { return UNDEFINED; }
     let obj = ptr as *mut TsObject;
-    // Check for getter: __getter_<key>
-    let getter_key = format!("__getter_{}", key);
-    if let Some(&getter_fn) = (&*obj).properties.get(&getter_key) {
-        // Call getter with obj as `this`
-        return super::func::ts_method_call0(getter_fn, obj_val);
+    // Fast path: skip getter check for plain data objects (the common case).
+    if (*obj).has_accessors {
+        let getter_key = format!("__getter_{}", key);
+        if let Some(&getter_fn) = (*obj).properties.get(&getter_key) {
+            return super::func::ts_method_call0(getter_fn, obj_val);
+        }
     }
-    if let Some(&val) = (&*obj).properties.get(&key) {
+    // HashMap<String, TsVal> supports &str lookup via Borrow<str> — no allocation.
+    if let Some(&val) = (*obj).properties.get(key) {
         ts_retain_val(val);
         return val;
     }
@@ -96,20 +133,19 @@ pub unsafe extern "C" fn ts_obj_set(obj_val: TsVal, key_ptr: *const i8, val: TsV
     let ptr = obj_val.as_ptr();
     if !ptr.is_null() && !key_ptr.is_null() {
         let obj = ptr as *mut TsObject;
-        let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy().into_owned();
-        // Check for setter: __setter_<key>
-        let setter_key = format!("__setter_{}", key);
-        if let Some(&setter_fn) = (&*obj).properties.get(&setter_key) {
-            let result = super::func::ts_method_call1(setter_fn, obj_val, val);
-            ts_release_val(result);
-            return;
+        let key = std::ffi::CStr::from_ptr(key_ptr).to_str().unwrap_or_default();
+        // Fast path: skip setter check for plain data objects.
+        if (*obj).has_accessors {
+            let setter_key = format!("__setter_{}", key);
+            if let Some(&setter_fn) = (*obj).properties.get(&setter_key) {
+                let result = super::func::ts_method_call1(setter_fn, obj_val, val);
+                ts_release_val(result);
+                return;
+            }
         }
-        // ARC: retain new value
         ts_retain_val(val);
-        let old_val = (&mut *obj).properties.insert(key, val);
-        if let Some(v) = old_val {
-            ts_release_val(v);
-        }
+        let old_val = (*obj).properties.insert(key.to_owned(), val);
+        if let Some(v) = old_val { ts_release_val(v); }
     }
 }
 
@@ -120,11 +156,12 @@ pub unsafe extern "C" fn ts_obj_define_getter(obj_val: TsVal, key_ptr: *const i8
     if ptr.is_null() || key_ptr.is_null() { return; }
     if heap_tag(obj_val) != 0 { return; }
     let obj = ptr as *mut TsObject;
-    let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy();
+    let key = std::ffi::CStr::from_ptr(key_ptr).to_str().unwrap_or_default();
     let getter_key = format!("__getter_{}", key);
     ts_retain_val(getter_fn);
-    let old = (&mut *obj).properties.insert(getter_key, getter_fn);
+    let old = (*obj).properties.insert(getter_key, getter_fn);
     if let Some(v) = old { ts_release_val(v); }
+    (*obj).has_accessors = true;
 }
 
 /// `Object.defineSetter(obj, key, fn)` — store setter function as `__setter_<key>`.
@@ -134,11 +171,12 @@ pub unsafe extern "C" fn ts_obj_define_setter(obj_val: TsVal, key_ptr: *const i8
     if ptr.is_null() || key_ptr.is_null() { return; }
     if heap_tag(obj_val) != 0 { return; }
     let obj = ptr as *mut TsObject;
-    let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy();
+    let key = std::ffi::CStr::from_ptr(key_ptr).to_str().unwrap_or_default();
     let setter_key = format!("__setter_{}", key);
     ts_retain_val(setter_fn);
-    let old = (&mut *obj).properties.insert(setter_key, setter_fn);
+    let old = (*obj).properties.insert(setter_key, setter_fn);
     if let Some(v) = old { ts_release_val(v); }
+    (*obj).has_accessors = true;
 }
 
 #[no_mangle]
@@ -146,8 +184,8 @@ pub unsafe extern "C" fn ts_obj_delete(obj_val: TsVal, key_ptr: *const i8) -> Ts
     let ptr = obj_val.as_ptr();
     if !ptr.is_null() && !key_ptr.is_null() {
         let obj = ptr as *mut TsObject;
-        let key = std::ffi::CStr::from_ptr(key_ptr).to_string_lossy().into_owned();
-        if let Some(old) = (&mut *obj).properties.remove(&key) {
+        let key = std::ffi::CStr::from_ptr(key_ptr).to_str().unwrap_or_default();
+        if let Some(old) = (*obj).properties.remove(key) {
             ts_release_val(old);
         }
     }

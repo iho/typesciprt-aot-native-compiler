@@ -3032,16 +3032,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Compute cell vars for mutable captures, then scalar vars (excluding cell vars),
         // then non-escaping allocs (excluding cell vars and scalar vars).
-        eprintln!("[arena] lower_fn_decl_impl '{}' body.stmts={}", emit_name, body.statements.len());
         let cell_vars_set = crate::lowering::expressions::compute_cell_vars_for_body(&body.statements);
         self.cell_vars = cell_vars_set;
         let mut sv = crate::lowering::expressions::compute_scalar_vars_for_body(&body.statements);
         sv.retain(|v| !self.cell_vars.contains(v));
         let mut nea = crate::lowering::expressions::compute_non_escaping_allocs(&body.statements);
         nea.retain(|v| !self.cell_vars.contains(v));
-        if !nea.is_empty() {
-            eprintln!("[arena] fn '{}' non_escaping_allocs: {:?}", emit_name, nea);
-        }
         self.non_escaping_allocs = nea;
         // Parameters with scalar TypeScript type annotations are also scalar.
         for param in &func.params.items {
@@ -3446,11 +3442,12 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.non_escaping_allocs = saved_non_escaping_impl;
         }
         // ARC: release scope variables before final return (skip parameters,
-        // scalar vars, and generator yields array).
+        // scalar vars, arena-allocated vars, and generator yields array).
         for (name, v) in &scope {
             if self.current_fn_params.contains(name) { continue; }
             if func.generator && name == "__generator_yields" { continue; }
             if self.scalar_vars.contains(name.as_str()) { continue; }
+            if self.non_escaping_allocs.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
@@ -3648,6 +3645,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         for (name, v) in &scope {
             // Skip borrowed parameter refs — the caller owns them.
             if borrowed_param_names.contains(name.as_str()) { continue; }
+            // Skip scalar vars — retain/release are no-ops for non-pointer values.
+            if self.scalar_vars.contains(name.as_str()) { continue; }
+            // Skip arena-allocated vars — freed in bulk by arena_exit at fiber end.
+            if self.non_escaping_allocs.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),

@@ -12,6 +12,18 @@ pub unsafe extern "C" fn ts_arr_destructor(ptr: *mut u8) {
     std::ptr::drop_in_place(arr_ptr);
 }
 
+/// Arena-aware variant: allocates from the current fiber's bump-pointer arena,
+/// falling back to the heap if the arena is full or inactive.
+#[no_mangle]
+pub unsafe extern "C" fn ts_arr_new_arena(capacity: i32) -> TsVal {
+    let cap = capacity.max(0) as usize;
+    let size = std::mem::size_of::<TsArray>();
+    let ptr = crate::alloc::ts_alloc_arena(size, 1) as *mut TsArray;
+    if ptr.is_null() { return NULL; }
+    std::ptr::write(ptr, TsArray { elements: Vec::with_capacity(cap) });
+    TsVal::from_ptr(ptr as *mut u8)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ts_arr_new(capacity: i32) -> TsVal {
     let size = std::mem::size_of::<TsArray>();

@@ -19,13 +19,9 @@ pub mod dns;
 pub use events::HEAP_TAG_EVENT_EMITTER;
 pub use buffer::HEAP_TAG_BUFFER;
 
-/// Helper: allocate a TsVal string from a Rust &str.
+/// Helper: allocate a TsVal string from a Rust &str (interned if short).
 pub(super) unsafe fn new_string(s: &str) -> crate::value::TsVal {
-    use crate::value::string_val::ts_string_new;
-    let cs = std::ffi::CString::new(s.as_bytes().to_vec()).unwrap_or_else(|_| {
-        std::ffi::CString::new("").unwrap()
-    });
-    ts_string_new(cs.as_ptr())
+    crate::value::string_val::ts_string_from_str(s)
 }
 
 /// Helper: extract Rust String from a TsVal string (tag 2).

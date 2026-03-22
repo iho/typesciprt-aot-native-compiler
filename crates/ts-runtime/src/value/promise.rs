@@ -2,6 +2,7 @@
 
 use super::{TsVal, TsPromise, TsArray, UNDEFINED, NULL, heap_tag, ts_retain_val, ts_release_val};
 use super::array::{ts_arr_new, ts_arr_get, ts_arr_push, ts_arr_set};
+use super::fiber::{JsFiber, schedule_fiber};
 use std::collections::HashMap;
 use std::sync::{Mutex, Condvar, OnceLock as StdOnceLock, atomic::{AtomicI32, Ordering}};
 
@@ -269,31 +270,52 @@ pub unsafe extern "C" fn ts_promise_then(promise: TsVal, callback: TsVal) -> TsV
         return out;
     }
 
-    // Slow path: promise is pending — spawn a task to wait and call the callback later.
+    // Slow path: promise is pending — schedule a task to wait and call the callback later.
     let (resolved2, notify2, blocking_notify2) = make_promise_pair();
     ts_retain_val(promise);
     ts_retain_val(callback);
-    let r2 = resolved2.clone();
-    let n2 = notify2.clone();
-    let bn2 = blocking_notify2.clone();
-    let promise_raw = promise.0;
-    let callback_raw = callback.0;
+    let p_raw  = promise.0;
+    let cb_raw = callback.0;
 
-    get_runtime().spawn_blocking(move || unsafe {
-        acquire_js_lock();
-        let p = TsVal(promise_raw);
-        let cb = TsVal(callback_raw);
-        let resolved_val = borrow_resolved(p);
-        let result = dispatch_callback_pub(cb, &[resolved_val]);
-        ts_release_val(resolved_val);
-        ts_release_val(p);
-        ts_release_val(cb);
-        let final_result = borrow_resolved(result);
-        resolve_arc(&r2, &n2, &bn2, final_result);
-        ts_release_val(final_result);
-        ts_release_val(result);
-        release_js_lock();
-    });
+    if super::fiber::get_local_set_tx().is_some() {
+        // Preferred: cooperative fiber on the LocalSet (no JS lock needed).
+        let r2  = resolved2.clone();
+        let n2  = notify2.clone();
+        let bn2 = blocking_notify2.clone();
+        let fiber = JsFiber::new(move || unsafe {
+            let p  = TsVal(p_raw);
+            let cb = TsVal(cb_raw);
+            let resolved_val  = ts_promise_await(p);
+            let result        = dispatch_callback_pub(cb, &[resolved_val]);
+            ts_release_val(resolved_val);
+            ts_release_val(cb);
+            let final_result  = ts_promise_await(result);
+            resolve_arc(&r2, &n2, &bn2, final_result);
+            UNDEFINED.0
+        });
+        let _ = schedule_fiber(fiber);
+    } else {
+        // Fallback: no LocalSet active — use spawn_blocking + JS lock.
+        let r2  = resolved2.clone();
+        let n2  = notify2.clone();
+        let bn2 = blocking_notify2.clone();
+        get_runtime().spawn_blocking(move || unsafe {
+            acquire_js_lock();
+            let p  = TsVal(p_raw);
+            let cb = TsVal(cb_raw);
+            let resolved_val  = borrow_resolved(p);
+            let result        = dispatch_callback_pub(cb, &[resolved_val]);
+            ts_release_val(resolved_val);
+            ts_release_val(p);
+            ts_release_val(cb);
+            let final_result  = borrow_resolved(result);
+            ts_retain_val(final_result);
+            resolve_arc(&r2, &n2, &bn2, final_result);
+            ts_release_val(final_result);
+            ts_release_val(result);
+            release_js_lock();
+        });
+    }
 
     alloc_promise(TsPromise { resolved: resolved2, notify: notify2, blocking_notify: blocking_notify2 })
 }
@@ -343,22 +365,45 @@ pub unsafe extern "C" fn ts_promise_finally(promise: TsVal, callback: TsVal) -> 
     let r2 = resolved2.clone();
     let n2 = notify2.clone();
     let bn2 = blocking_notify2.clone();
-    let promise_raw = promise.0;
-    let callback_raw = callback.0;
+    let p_raw   = promise.0;
+    let cb_raw  = callback.0;
 
-    get_runtime().spawn_blocking(move || unsafe {
-        acquire_js_lock();
-        let p = TsVal(promise_raw);
-        let cb = TsVal(callback_raw);
-        let val = borrow_resolved(p);
-        let r = dispatch_callback_pub(cb, &[]);
-        ts_release_val(r);
-        ts_release_val(p);
-        ts_release_val(cb);
-        resolve_arc(&r2, &n2, &bn2, val);
-        ts_release_val(val);
-        release_js_lock();
-    });
+    if super::fiber::get_local_set_tx().is_some() {
+        // Preferred: cooperative fiber on the LocalSet.
+        let r2  = resolved2.clone();
+        let n2  = notify2.clone();
+        let bn2 = blocking_notify2.clone();
+        let fiber = JsFiber::new(move || unsafe {
+            let p  = TsVal(p_raw);
+            let cb = TsVal(cb_raw);
+            let val = ts_promise_await(p);
+            let r = dispatch_callback_pub(cb, &[]);
+            ts_release_val(r);
+            ts_release_val(cb);
+            resolve_arc(&r2, &n2, &bn2, val);
+            UNDEFINED.0
+        });
+        let _ = schedule_fiber(fiber);
+    } else {
+        // Fallback: no LocalSet active.
+        let r2  = resolved2.clone();
+        let n2  = notify2.clone();
+        let bn2 = blocking_notify2.clone();
+        get_runtime().spawn_blocking(move || unsafe {
+            acquire_js_lock();
+            let p  = TsVal(p_raw);
+            let cb = TsVal(cb_raw);
+            let val = borrow_resolved(p);
+            let r = dispatch_callback_pub(cb, &[]);
+            ts_release_val(r);
+            ts_release_val(p);
+            ts_release_val(cb);
+            ts_retain_val(val);
+            resolve_arc(&r2, &n2, &bn2, val);
+            ts_release_val(val);
+            release_js_lock();
+        });
+    }
 
     alloc_promise(TsPromise { resolved: resolved2, notify: notify2, blocking_notify: blocking_notify2 })
 }
@@ -581,12 +626,26 @@ fn do_spawn<F: FnOnce() -> u64 + Send + 'static>(f: F) -> TsVal {
     let r2 = resolved.clone();
     let n2 = notify.clone();
     let bn2 = blocking_notify.clone();
-    get_runtime().spawn_blocking(move || {
-        acquire_js_lock();
-        let raw = f();
-        resolve_arc(&r2, &n2, &bn2, TsVal(raw));
-        release_js_lock();
-    });
+
+    if super::fiber::get_local_set_tx().is_some() {
+        // Preferred: cooperative fiber on the LocalSet (no JS lock needed).
+        let fiber = JsFiber::new(move || {
+            let raw = f();
+            resolve_arc(&r2, &n2, &bn2, TsVal(raw));
+            UNDEFINED.0
+        });
+        // schedule_fiber succeeds because we confirmed the LocalSet is active.
+        let _ = schedule_fiber(fiber);
+    } else {
+        // Fallback: no LocalSet — use spawn_blocking + JS lock.
+        get_runtime().spawn_blocking(move || {
+            acquire_js_lock();
+            let raw = f();
+            resolve_arc(&r2, &n2, &bn2, TsVal(raw));
+            release_js_lock();
+        });
+    }
+
     unsafe { alloc_promise(TsPromise { resolved, notify, blocking_notify }) }
 }
 
@@ -660,14 +719,25 @@ pub unsafe extern "C" fn ts_set_timeout(callback: TsVal, delay_ms: TsVal) -> TsV
     let task = get_runtime().spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         cleanup_timer(tid);
-        get_runtime().spawn_blocking(move || unsafe {
-            acquire_js_lock();
+        // Preferred: schedule callback as a cooperative fiber (no JS lock).
+        let fiber = JsFiber::new(move || unsafe {
             let cb = TsVal(cb_raw);
             let result = super::func::dispatch_callback(cb, &[]);
             ts_release_val(result);
             ts_release_val(cb);
-            release_js_lock();
-        }).await.ok();
+            UNDEFINED.0
+        });
+        if !schedule_fiber(fiber) {
+            // Fallback: spawn_blocking + JS lock.
+            get_runtime().spawn_blocking(move || unsafe {
+                acquire_js_lock();
+                let cb = TsVal(cb_raw);
+                let result = super::func::dispatch_callback(cb, &[]);
+                ts_release_val(result);
+                ts_release_val(cb);
+                release_js_lock();
+            }).await.ok();
+        }
     });
     if let Ok(mut map) = timer_handles().lock() {
         map.insert(timer_id, task.abort_handle());
@@ -692,13 +762,21 @@ pub unsafe extern "C" fn ts_set_interval(callback: TsVal, interval_ms: TsVal) ->
         loop {
             interval.tick().await;
             let cb_raw2 = cb_raw;
-            get_runtime().spawn_blocking(move || unsafe {
-                acquire_js_lock();
+            let fiber = JsFiber::new(move || unsafe {
                 let cb = TsVal(cb_raw2);
                 let result = super::func::dispatch_callback(cb, &[]);
                 ts_release_val(result);
-                release_js_lock();
-            }).await.ok();
+                UNDEFINED.0
+            });
+            if !schedule_fiber(fiber) {
+                get_runtime().spawn_blocking(move || unsafe {
+                    acquire_js_lock();
+                    let cb = TsVal(cb_raw2);
+                    let result = super::func::dispatch_callback(cb, &[]);
+                    ts_release_val(result);
+                    release_js_lock();
+                }).await.ok();
+            }
         }
     });
     if let Ok(mut map) = timer_handles().lock() {
@@ -729,16 +807,24 @@ pub unsafe extern "C" fn ts_clear_interval(id: TsVal) -> TsVal {
 pub unsafe extern "C" fn ts_queue_microtask(callback: TsVal) -> TsVal {
     use super::func::dispatch_callback;
     ts_retain_val(callback);
-    get_runtime().spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            unsafe {
-                acquire_js_lock();
-                dispatch_callback(callback, &[]);
-                ts_release_val(callback);
-                release_js_lock();
-            }
-        }).await.ok();
+    let cb_raw = callback.0;
+    let fiber = JsFiber::new(move || unsafe {
+        let cb = TsVal(cb_raw);
+        dispatch_callback(cb, &[]);
+        ts_release_val(cb);
+        UNDEFINED.0
     });
+    if !schedule_fiber(fiber) {
+        get_runtime().spawn(async move {
+            tokio::task::spawn_blocking(move || unsafe {
+                acquire_js_lock();
+                let cb = TsVal(cb_raw);
+                dispatch_callback(cb, &[]);
+                ts_release_val(cb);
+                release_js_lock();
+            }).await.ok();
+        });
+    }
     UNDEFINED
 }
 

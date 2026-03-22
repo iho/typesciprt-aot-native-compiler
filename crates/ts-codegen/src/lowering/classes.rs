@@ -763,11 +763,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.fn_return_type = i64_type;
         self.is_async = method.value.r#async;
         if let Some(body) = &method.value.body {
-            let saved_cell_vars = std::mem::replace(
-                &mut self.cell_vars,
-                crate::lowering::expressions::compute_cell_vars_for_body(&body.statements),
-            );
+            let cell_vars_m = crate::lowering::expressions::compute_cell_vars_for_body(&body.statements);
+            let saved_cell_vars = std::mem::replace(&mut self.cell_vars, cell_vars_m);
             let saved_cell_captures = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+            let mut sv_m = crate::lowering::expressions::compute_scalar_vars_for_body(&body.statements);
+            sv_m.retain(|v| !self.cell_vars.contains(v));
+            let saved_scalar_vars_m = std::mem::replace(&mut self.scalar_vars, sv_m);
+            let mut nea_m = crate::lowering::expressions::compute_non_escaping_allocs(&body.statements);
+            nea_m.retain(|v| !self.cell_vars.contains(v));
+            let saved_non_escaping_m = std::mem::replace(&mut self.non_escaping_allocs, nea_m);
             for stmt in &body.statements {
                 let (val, next) = self.lower_statement(stmt, current, &region, &mut scope, &[])?;
                 current = next;
@@ -775,6 +779,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
             self.cell_vars = saved_cell_vars;
             self.cell_captures = saved_cell_captures;
+            self.scalar_vars = saved_scalar_vars_m;
+            self.non_escaping_allocs = saved_non_escaping_m;
         }
         self.fn_return_type = saved_fn_return_type_cls;
 
@@ -994,11 +1000,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.fn_return_type = i64_type;
         self.is_async = method.value.r#async;
         if let Some(body) = &method.value.body {
-            let saved_cell_vars_s = std::mem::replace(
-                &mut self.cell_vars,
-                crate::lowering::expressions::compute_cell_vars_for_body(&body.statements),
-            );
+            let cell_vars_s = crate::lowering::expressions::compute_cell_vars_for_body(&body.statements);
+            let saved_cell_vars_s = std::mem::replace(&mut self.cell_vars, cell_vars_s);
             let saved_cell_captures_s = std::mem::replace(&mut self.cell_captures, std::collections::HashSet::new());
+            let mut sv_s = crate::lowering::expressions::compute_scalar_vars_for_body(&body.statements);
+            sv_s.retain(|v| !self.cell_vars.contains(v));
+            let saved_scalar_vars_s = std::mem::replace(&mut self.scalar_vars, sv_s);
+            let mut nea_s = crate::lowering::expressions::compute_non_escaping_allocs(&body.statements);
+            nea_s.retain(|v| !self.cell_vars.contains(v));
+            let saved_non_escaping_s = std::mem::replace(&mut self.non_escaping_allocs, nea_s);
             for stmt in &body.statements {
                 let (val, next) = self.lower_statement(stmt, current, &region, &mut scope, &[])?;
                 current = next;
@@ -1006,6 +1016,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
             self.cell_vars = saved_cell_vars_s;
             self.cell_captures = saved_cell_captures_s;
+            self.scalar_vars = saved_scalar_vars_s;
+            self.non_escaping_allocs = saved_non_escaping_s;
         }
         self.fn_return_type = saved_fn_return_type_cls;
 

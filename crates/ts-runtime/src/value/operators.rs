@@ -257,6 +257,18 @@ pub unsafe extern "C" fn ts_typeof(val: TsVal) -> TsVal {
 pub unsafe extern "C" fn ts_val_strict_eq(a: TsVal, b: TsVal) -> i32 {
     if a.0 == b.0 { return 1; }
     if a.is_ptr() && b.is_ptr() && heap_tag(a) == 2 && heap_tag(b) == 2 {
+        // If both strings are interned (IMMORTAL_RC), the intern table guarantees
+        // that equal content → equal pointer. Different pointers means not equal —
+        // skip the string comparison entirely (already excluded by a.0 != b.0).
+        let hdr_size = std::mem::size_of::<crate::alloc::ArcHeader>();
+        let rc_a = (*(( a.as_ptr() as *const u8).sub(hdr_size) as *const crate::alloc::ArcHeader))
+            .ref_count.load(std::sync::atomic::Ordering::Relaxed);
+        let rc_b = (*((b.as_ptr() as *const u8).sub(hdr_size) as *const crate::alloc::ArcHeader))
+            .ref_count.load(std::sync::atomic::Ordering::Relaxed);
+        if rc_a == crate::alloc::IMMORTAL_RC && rc_b == crate::alloc::IMMORTAL_RC {
+            return 0; // different interned pointers ⇒ different content
+        }
+        // At least one string is large (non-interned): fall back to content comparison.
         let sa = &*(a.as_ptr() as *const TsString);
         let sb = &*(b.as_ptr() as *const TsString);
         return if sa.inner == sb.inner { 1 } else { 0 };

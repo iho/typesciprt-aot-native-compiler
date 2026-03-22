@@ -7,11 +7,16 @@
 //! needs it (e.g. `__ts_console_log_i32`).  Future async TS features will
 //! schedule tasks onto this executor via `ts_runtime()`.
 
-// ── Global allocator: jemalloc (better memory-return-to-OS behavior) ─────────
-// jemalloc returns freed pages to the OS more aggressively than system malloc,
-// preventing the RSS fragmentation seen under high request rates.
-// dirty_decay_ms:0 + muzzy_decay_ms:0 = immediately purge freed pages back
-// to the OS, keeping RSS close to actual live heap size.
+// ── Global allocator: jemalloc ────────────────────────────────────────────────
+// jemalloc with throughput-optimised decay settings:
+//   dirty_decay_ms:1000  — keep dirty (freed) pages for 1 s before returning to OS.
+//                          Rapid reuse within one second avoids madvise DONTNEED
+//                          syscalls, reducing allocation latency under high QPS.
+//   muzzy_decay_ms:30000 — keep "muzzy" pages (MADV_FREE on Linux) for 30 s.
+//                          The OS may reclaim them under memory pressure but we
+//                          avoid the page-fault cost if they are touched again.
+//   background_thread:true — dedicated jemalloc background thread for async purging.
+//                          Purging no longer blocks on the allocator hot path.
 #[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -19,7 +24,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(not(feature = "dhat-heap"))]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:30000,background_thread:true\0";
 
 // ── Heap profiling (opt-in via `--features dhat-heap`) ───────────────────────
 // Build:  cargo build -p ts-runtime --features dhat-heap

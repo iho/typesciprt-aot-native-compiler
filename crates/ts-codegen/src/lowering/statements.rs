@@ -176,9 +176,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             current_block = nb;
         }
 
-        // Release scope variables (skip scalar vars — ts_release_val is a no-op for non-pointers).
+        // Release scope variables (skip scalar vars and arena-allocated vars).
         for (name, v) in &scope {
             if self.scalar_vars.contains(name.as_str()) { continue; }
+            if self.non_escaping_allocs.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, current_block)?;
             current_block.append_operation(func::call(
                 self.ctx,
@@ -413,17 +414,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     if let Some(v) = v { last = Some(v); }
                 }
                 
-                // ARC: Release locals.
+                // ARC: Release locals introduced in this block (not present in outer scope).
                 for (k, v) in &inner {
                     if !scope.contains_key(k) {
-                        let v_i64 = self.ensure_i64(*v, cur)?;
-                        cur.append_operation(func::call(
-                            self.ctx,
-                            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                            &[v_i64],
-                            &[],
-                            self.loc,
-                        ));
+                        // Skip scalar vars and arena-allocated vars — no ARC cost.
+                        if !self.scalar_vars.contains(k.as_str())
+                            && !self.non_escaping_allocs.contains(k.as_str())
+                        {
+                            let v_i64 = self.ensure_i64(*v, cur)?;
+                            cur.append_operation(func::call(
+                                self.ctx,
+                                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                                &[v_i64],
+                                &[],
+                                self.loc,
+                            ));
+                        }
                     } else {
                         scope.insert(k.clone(), *v);
                     }
@@ -1026,11 +1032,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // ARC: Release local variables in the current scope before returning.
         // Skip "__env" (env array is borrowed from the closure caller), function
-        // parameters (borrowed refs; call site owns them), and scalar vars (no-op).
+        // parameters (borrowed refs; call site owns them), scalar vars (no-op),
+        // and arena-allocated vars (freed in bulk by arena_exit).
         for (name, v) in scope.iter() {
             if name == "__env" { continue; }
             if self.current_fn_params.contains(name) { continue; }
             if self.scalar_vars.contains(name.as_str()) { continue; }
+            if self.non_escaping_allocs.contains(name.as_str()) { continue; }
             let v_i64 = self.ensure_i64(*v, block)?;
             block.append_operation(func::call(
                 self.ctx,
@@ -1202,13 +1210,32 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         inner_loops.push((Some(loop_header), exit_block, scope_keys.clone(), self.pending_label.take()));
         let (_, body_end) =
             self.lower_statement(&while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
-        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
-            scope_keys.iter().map(|k| {
+        if body_end.terminator().is_none() {
+            let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| {
                 let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
                 self.ensure_i64(v, body_end).unwrap_or(v)
-            }).collect()
-        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
-        self.terminate_with_br(body_end, &loop_header, &body_vals);
+            }).collect();
+            // Break out of the loop if a JS exception was thrown in the body (e.g. from
+            // an async function call that threw without a surrounding try/catch).
+            // ts_check_exception() is a cheap thread-local read; overhead is negligible.
+            let i32_type = self.i32_type();
+            let exc_i32: Value<'c, 'b> = body_end.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_check_exception"),
+                &[], &[i32_type], self.loc,
+            )).result(0)?.into();
+            let zero_i32: Value<'c, 'b> = body_end.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )).result(0)?.into();
+            let is_exc: Value<'c, 'b> = body_end.append_operation(arith::cmpi(
+                self.ctx, arith::CmpiPredicate::Ne, exc_i32, zero_i32, self.loc,
+            )).result(0)?.into();
+            body_end.append_operation(cf::cond_br(
+                self.ctx, is_exc, &exit_block, &loop_header, &body_vals, &body_vals, self.loc,
+            ));
+        }
 
         // After the loop, scope uses exit-block arguments.
         for (i, k) in scope_keys.iter().enumerate() {
@@ -1260,14 +1287,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let (_, body_end) =
             self.lower_statement(&do_while_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
 
-        // After body, jump to cond_block.
-        let body_end_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
-            scope_keys.iter().map(|k| {
+        // After body, check for exception then jump to cond_block (or exit on exception).
+        if body_end.terminator().is_none() {
+            let body_end_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| {
                 let v = *body_scope.get(k).unwrap_or(&body_scope[k]);
                 self.ensure_i64(v, body_end).unwrap_or(v)
-            }).collect()
-        } else { scope_keys.iter().map(|k| body_scope[k]).collect() };
-        self.terminate_with_br(body_end, &cond_block, &body_end_vals);
+            }).collect();
+            let i32_type = self.i32_type();
+            let exc_i32: Value<'c, 'b> = body_end.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_check_exception"),
+                &[], &[i32_type], self.loc,
+            )).result(0)?.into();
+            let zero_i32: Value<'c, 'b> = body_end.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )).result(0)?.into();
+            let is_exc: Value<'c, 'b> = body_end.append_operation(arith::cmpi(
+                self.ctx, arith::CmpiPredicate::Ne, exc_i32, zero_i32, self.loc,
+            )).result(0)?.into();
+            body_end.append_operation(cf::cond_br(
+                self.ctx, is_exc, &exit_block, &cond_block, &body_end_vals, &body_end_vals, self.loc,
+            ));
+        }
 
         // Build scope for cond_block (use cond_block arguments).
         let mut cond_scope = scope.clone();
@@ -1634,14 +1677,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let (_, body_end) =
             self.lower_statement(&for_stmt.body, body_block, region, &mut body_scope, &inner_loops)?;
 
-        // Normal end of body also jumps to the update block.
-        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
-            scope_keys.iter().zip(phi_types.iter()).map(|(k, (ty, _))| {
+        // Normal end of body: check exception then jump to update_block (or exit on exception).
+        if body_end.terminator().is_none() {
+            let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().zip(phi_types.iter()).map(|(k, (ty, _))| {
                 let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
                 self.coerce_val_to_type(v, *ty, body_end).unwrap_or(v)
-            }).collect()
-        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
-        self.terminate_with_br(body_end, &update_block, &body_vals);
+            }).collect();
+            let i32_type = self.i32_type();
+            let exc_i32: Value<'c, 'b> = body_end.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_check_exception"),
+                &[], &[i32_type], self.loc,
+            )).result(0)?.into();
+            let zero_i32: Value<'c, 'b> = body_end.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )).result(0)?.into();
+            let is_exc: Value<'c, 'b> = body_end.append_operation(arith::cmpi(
+                self.ctx, arith::CmpiPredicate::Ne, exc_i32, zero_i32, self.loc,
+            )).result(0)?.into();
+            body_end.append_operation(cf::cond_br(
+                self.ctx, is_exc, &exit_block, &update_block, &body_vals, &body_vals, self.loc,
+            ));
+        }
 
         // Lower update expression inside the update block.
         let mut update_scope = header_scope.clone();
@@ -2081,16 +2140,32 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ));
         }
 
-        // body_vals: coerce types to match phi_types.
-        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
-            scope_keys.iter().enumerate()
+        // body_vals: coerce types to match phi_types, then check exception before looping.
+        if body_end.terminator().is_none() {
+            let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
                 .map(|(i, k)| {
                     let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
                     self.coerce_val_to_type(v, phi_types[i].0, body_end)
                 })
-                .collect::<Result<_>>()?
-        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
-        self.terminate_with_br(body_end, &update_block, &body_vals);
+                .collect::<Result<_>>()?;
+            let i32_type = self.i32_type();
+            let exc_i32: Value<'c, 'b> = body_end.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_check_exception"),
+                &[], &[i32_type], self.loc,
+            )).result(0)?.into();
+            let zero_i32: Value<'c, 'b> = body_end.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )).result(0)?.into();
+            let is_exc: Value<'c, 'b> = body_end.append_operation(arith::cmpi(
+                self.ctx, arith::CmpiPredicate::Ne, exc_i32, zero_i32, self.loc,
+            )).result(0)?.into();
+            body_end.append_operation(cf::cond_br(
+                self.ctx, is_exc, &exit_block, &update_block, &body_vals, &body_vals, self.loc,
+            ));
+        }
 
         // ── Update: increment index ───────────────────────────────────────────
         let mut update_scope = header_scope.clone();
@@ -2265,15 +2340,31 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             ));
         }
 
-        let body_vals: Vec<Value<'c, 'b>> = if body_end.terminator().is_none() {
-            scope_keys.iter().enumerate()
+        if body_end.terminator().is_none() {
+            let body_vals: Vec<Value<'c, 'b>> = scope_keys.iter().enumerate()
                 .map(|(i, k)| {
                     let v = *body_scope.get(k).unwrap_or(&header_scope[k]);
                     self.coerce_val_to_type(v, phi_types[i].0, body_end)
                 })
-                .collect::<Result<_>>()?
-        } else { scope_keys.iter().map(|k| header_scope[k]).collect() };
-        self.terminate_with_br(body_end, &update_block, &body_vals);
+                .collect::<Result<_>>()?;
+            let i32_type = self.i32_type();
+            let exc_i32: Value<'c, 'b> = body_end.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_check_exception"),
+                &[], &[i32_type], self.loc,
+            )).result(0)?.into();
+            let zero_i32: Value<'c, 'b> = body_end.append_operation(arith::constant(
+                self.ctx,
+                IntegerAttribute::new(i32_type, 0).into(),
+                self.loc,
+            )).result(0)?.into();
+            let is_exc: Value<'c, 'b> = body_end.append_operation(arith::cmpi(
+                self.ctx, arith::CmpiPredicate::Ne, exc_i32, zero_i32, self.loc,
+            )).result(0)?.into();
+            body_end.append_operation(cf::cond_br(
+                self.ctx, is_exc, &exit_block, &update_block, &body_vals, &body_vals, self.loc,
+            ));
+        }
 
         let mut update_scope = header_scope.clone();
         for (i, k) in scope_keys.iter().enumerate() {
