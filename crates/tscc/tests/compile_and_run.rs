@@ -909,7 +909,7 @@ fn hono_integration() {
     compile_and_check_http(
         &root.join("examples/hono_integration.ts"),
         &root.join("target/test-hono-integration"),
-        19999,
+        17999,
         |port| {
             let body = http_get(port, "/");
             assert_eq!(body.trim(), "Hello from Hono",

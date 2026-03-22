@@ -482,13 +482,21 @@ fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::pa
         }
     }
     if p.extension().is_none() {
-        // Try file: <path>.ts
+        // TypeScript source takes priority.
         let ts = p.with_extension("ts");
         if ts.exists() { return Some(ts); }
-        // Try directory index: <path>/index.ts
         let idx = p.join("index.ts");
         if idx.exists() { return Some(idx); }
-        // Return the .ts path anyway (will fail gracefully as "not found")
+        // Fall back to JavaScript (CJS packages use .js / /index.js).
+        let js = p.with_extension("js");
+        if js.exists() { return Some(js); }
+        let idx_js = p.join("index.js");
+        if idx_js.exists() { return Some(idx_js); }
+        let mjs = p.with_extension("mjs");
+        if mjs.exists() { return Some(mjs); }
+        let cjs = p.with_extension("cjs");
+        if cjs.exists() { return Some(cjs); }
+        // Nothing found — return the .ts path to produce a clear "not found" warning.
         return Some(ts);
     }
     if p.extension().map_or(false, |e| e != "ts") {
@@ -503,6 +511,11 @@ fn resolve_local_import(src: &str, base_dir: &std::path::Path) -> Option<std::pa
         // Also try directory index.
         let idx = p.join("index.ts");
         if idx.exists() { return Some(idx); }
+        // Fall back to .js variants.
+        let js = p.with_extension("js");
+        if js.exists() { return Some(js); }
+        let idx_js = p.join("index.js");
+        if idx_js.exists() { return Some(idx_js); }
     }
     Some(p)
 }
@@ -682,9 +695,31 @@ fn lower_cjs_module<'c, 'm>(
 ) -> Result<()> {
     use oxc_ast::ast::{Statement, Expression, AssignmentTarget, Declaration};
 
-    // Collect function signatures first (hoisting pass)
-    lowerer.collect_function_signatures(program);
+    // Collect function signatures first (hoisting pass).
+    // For CJS modules we call a restricted version that only processes FunctionDeclaration nodes
+    // (not VariableDeclaration with const-function-expressions). This avoids polluting the global
+    // `self.funcs` namespace with module-internal helpers (e.g. `const parse = (query) => {...}`
+    // in pg-protocol/serializer.js) that would shadow functions of the same name from other modules.
+    lowerer.collect_cjs_function_signatures(program);
     lowerer.collect_class_definitions(program);
+
+    // Temporarily add all module-level const/let/var binding names to module_global_names so that
+    // class methods and closures defined within this module can access them via scope injection.
+    // These names are removed at the end of this function to avoid polluting other modules.
+    let mut temp_module_globals: Vec<String> = Vec::new();
+    for stmt in &program.body {
+        if let Statement::VariableDeclaration(vd) = stmt {
+            for decl in &vd.declarations {
+                if let BindingPattern::BindingIdentifier(id) = &decl.id {
+                    let name = id.name.to_string();
+                    if !lowerer.module_global_names.contains(&name) {
+                        lowerer.module_global_names.insert(name.clone());
+                        temp_module_globals.push(name);
+                    }
+                }
+            }
+        }
+    }
 
     // Step 1: Lower all top-level function declarations (they may be referenced by exports.foo = fnName)
     for stmt in &program.body {
@@ -695,6 +730,16 @@ fn lower_cjs_module<'c, 'm>(
                 }
             }
             _ => {}
+        }
+    }
+
+    // Step 1b: Lower class declarations (CJS modules often export classes like `module.exports = Client`)
+    // Must come after functions but before export processing so emitted_functions contains class names.
+    for stmt in &program.body {
+        if let Statement::ClassDeclaration(class) = stmt {
+            if !class.declare {
+                lowerer.lower_class_declaration(class)?;
+            }
         }
     }
 
@@ -793,7 +838,10 @@ fn lower_cjs_module<'c, 'm>(
                                     lowerer.ctx,
                                     melior::ir::attribute::StringAttribute::new(lowerer.ctx, export_name),
                                     melior::ir::attribute::TypeAttribute::new(func_type.into()),
-                                    region, &[], lowerer.loc,
+                                    region, &[(
+                                        melior::ir::Identifier::new(lowerer.ctx, "sym_visibility"),
+                                        melior::ir::attribute::StringAttribute::new(lowerer.ctx, "private").into(),
+                                    )], lowerer.loc,
                                 );
                                 lowerer.module.body().append_operation(fn_op);
                                 lowerer.emitted_functions.insert(export_name.to_string());
@@ -873,6 +921,11 @@ fn lower_cjs_module<'c, 'm>(
 
     // Emit module init for non-function exports and other module-level code
     lowerer.lower_cjs_module_init(program)?;
+
+    // Remove the temp module globals we added so they don't bleed into other modules.
+    for name in &temp_module_globals {
+        lowerer.module_global_names.remove(name);
+    }
 
     Ok(())
 }
@@ -1638,7 +1691,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, wrapper_name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         );
         self.module.body().append_operation(fn_op);
@@ -1870,6 +1926,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_ge",  &[i64_type, i64_type], &[i32_type]);
 
         add_func("ts_promise_resolve", &[i64_type], &[i64_type]);
+        add_func("ts_promise_new",     &[i64_type], &[i64_type]);
         add_func("ts_promise_await",   &[i64_type], &[i64_type]);
 
         add_func("ts_throw",            &[i64_type], &[]);
@@ -1882,6 +1939,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         add_func("ts_promise_then",     &[i64_type, i64_type], &[i64_type]);
         add_func("ts_promise_catch",    &[i64_type, i64_type], &[i64_type]);
         add_func("ts_promise_finally",  &[i64_type, i64_type], &[i64_type]);
+        add_func("ts_get_promise_constructor", &[], &[i64_type]);
+        add_func("ts_get_buffer_constructor",  &[], &[i64_type]);
         add_func("ts_set_timeout",     &[i64_type, i64_type], &[i64_type]);
         add_func("ts_set_interval",    &[i64_type, i64_type], &[i64_type]);
         add_func("ts_clear_timeout",   &[i64_type], &[i64_type]);
@@ -2519,6 +2578,35 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
     }
 
+    /// Restricted signature collection for CJS modules: only registers top-level `function`
+    /// declarations (not const-function-expressions) to avoid polluting the global namespace.
+    pub(super) fn collect_cjs_function_signatures(&mut self, program: &Program<'_>) {
+        let i64_type = self.i64_type();
+        for stmt in &program.body {
+            if let Statement::FunctionDeclaration(func) = stmt {
+                let Some(id) = &func.id else { continue };
+                if func.body.is_none() { continue; } // skip TS overloads
+                let name = id.name.to_string();
+                if self.funcs.contains_key(&name) { continue; } // first-wins
+                let explicit_rest = func.params.rest.is_some();
+                let implicit_rest = !explicit_rest && func.body.as_ref().map_or(false, |b| {
+                    crate::lowering::expressions::body_uses_arguments(&b.statements)
+                });
+                let has_rest = explicit_rest || implicit_rest;
+                let has_this_param = func.this_param.is_some();
+                let n = func.params.items.len()
+                    + if has_rest { 1 } else { 0 }
+                    + if has_this_param { 1 } else { 0 };
+                self.funcs.insert(name, FuncSig {
+                    param_types: vec![i64_type; n],
+                    return_type: Some(i64_type),
+                    has_rest,
+                    has_this_param,
+                });
+            }
+        }
+    }
+
     /// Helper: scan a `VariableDeclaration` for module-level `const name = arrow/fn/ident`.
     fn collect_const_sigs(&mut self, vd: &oxc_ast::ast::VariableDeclaration<'_>, i64_type: melior::ir::Type<'c>) {
         for decl in &vd.declarations {
@@ -2534,6 +2622,9 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let inner = Self::strip_ts_casts(init);
             match inner {
                 Expression::ArrowFunctionExpression(arrow) => {
+                    // First-wins: don't overwrite a signature already registered by a
+                    // FunctionDeclaration (e.g., from a public API of the same name).
+                    if self.funcs.contains_key(&name) { continue; }
                     let has_rest = arrow.params.rest.is_some();
                     let n = arrow.params.items.len() + if has_rest { 1 } else { 0 };
                     self.funcs.insert(name, FuncSig {
@@ -2544,6 +2635,8 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                     });
                 }
                 Expression::FunctionExpression(func_expr) => {
+                    // First-wins: same policy as FunctionDeclaration.
+                    if self.funcs.contains_key(&name) { continue; }
                     let has_rest = func_expr.params.rest.is_some();
                     let has_this_param = func_expr.this_param.is_some();
                     let n = func_expr.params.items.len()
@@ -2873,7 +2966,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.ctx,
                 StringAttribute::new(self.ctx, emit_name),
                 TypeAttribute::new(func_type.into()),
-                region, &[], self.loc,
+                region, &[(
+                    Identifier::new(self.ctx, "sym_visibility"),
+                    StringAttribute::new(self.ctx, "private").into(),
+                )], self.loc,
             );
             self.module.body().append_operation(fn_op);
             self.fn_return_type = saved_fn_return_type;
@@ -2929,7 +3025,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.ctx,
             StringAttribute::new(self.ctx, emit_name),
             TypeAttribute::new(func_type.into()),
-            region, &[], self.loc,
+            region, &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )], self.loc,
         );
         self.module.body().append_operation(fn_op);
 
@@ -3312,12 +3411,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         self.is_generator = saved_is_generator;
         self.fn_return_type = saved_fn_return_type;
 
+        let private_vis = &[(
+            Identifier::new(self.ctx, "sym_visibility"),
+            StringAttribute::new(self.ctx, "private").into(),
+        )];
         let op = func::func(
             self.ctx,
             StringAttribute::new(self.ctx, &name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            private_vis,
             self.loc,
         );
         self.module.body().append_operation(op);
@@ -3342,6 +3445,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         is_async_override: Option<bool>,
         is_expr_body: bool,
     ) -> Result<()> {
+        // Skip re-emission when multiple imported modules declare the same function name.
+        if !self.emitted_functions.insert(name.to_string()) {
+            return Ok(());
+        }
         let i64_type = self.i64_type();
         let i32_type = self.i32_type();
         let return_type = i64_type;
@@ -3468,16 +3575,15 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         }
 
         if current_block.terminator().is_none() && is_async {
-            let val_i64 = self.ensure_i64(result_value, current_block)?;
+            // Async implicit return: always resolve with UNDEFINED (void return).
+            // Do NOT use result_value — ExpressionStatement already released it.
+            let undef_i64: Value<'_, '_> = current_block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
             let promise: Value<'_, '_> = current_block.append_operation(func::call(
                 self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
-                &[val_i64], &[i64_type], self.loc,
+                &[undef_i64], &[i64_type], self.loc,
             )).result(0)?.into();
-            // ARC: release our owned reference after promise takes ownership.
-            current_block.append_operation(func::call(
-                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                &[val_i64], &[], self.loc,
-            ));
             current_block.append_operation(func::r#return(&[promise], self.loc));
         } else {
             self.terminate_with_return(current_block, result_value)?;
@@ -3489,7 +3595,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         );
         self.module.body().append_operation(op);

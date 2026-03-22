@@ -11,4 +11,4 @@ app.get('/hello/:name', (c) => {
 
 app.get('/json', (c) => c.json({ ok: true, value: 42 }))
 
-serve(19999, async (req) => app.fetch(req))
+serve(17999, async (req) => app.fetch(req))

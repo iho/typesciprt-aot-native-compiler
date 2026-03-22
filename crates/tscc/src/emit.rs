@@ -45,6 +45,23 @@ pub fn mlir_to_llvm_ir(module: &Module<'_>, out: &Path) -> Result<()> {
     if !status.success() {
         bail!("mlir-translate exited with {status}");
     }
+
+    // Internalize all generated functions except the binary entry points.
+    // This prevents user-defined function names (e.g. `connect`, `createConnection`)
+    // from becoming global C symbols that shadow OS syscalls during dynamic linking.
+    let status = Command::new(llvm_bin("opt"))
+        .arg("--passes=internalize")
+        .arg("--internalize-public-api-list=main,__napi_init")
+        .arg("-S")
+        .arg(out)
+        .arg("-o")
+        .arg(out)
+        .status()
+        .context("spawn opt (internalize)")?;
+
+    if !status.success() {
+        bail!("opt (internalize) exited with {status}");
+    }
     Ok(())
 }
 

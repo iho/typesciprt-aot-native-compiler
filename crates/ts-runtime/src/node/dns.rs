@@ -47,9 +47,10 @@ pub unsafe extern "C" fn ts_dns_resolve(hostname_val: TsVal, _rrtype: TsVal) -> 
 #[no_mangle]
 pub unsafe extern "C" fn ts_dns_lookup_async(hostname_val: TsVal) -> TsVal {
     let hostname = val_to_string(hostname_val).unwrap_or_default();
-    let (resolved, notify) = make_promise_pair();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
     let r2 = resolved.clone();
     let n2 = notify.clone();
+    let bn2 = blocking_notify.clone();
     get_runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             match std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:0", hostname)) {
@@ -57,18 +58,19 @@ pub unsafe extern "C" fn ts_dns_lookup_async(hostname_val: TsVal) -> TsVal {
                 Err(_) => String::new(),
             }
         }).await.unwrap_or_default();
-        resolve_arc(&r2, &n2, unsafe { new_string(&result) });
+        resolve_arc(&r2, &n2, &bn2, unsafe { new_string(&result) });
     });
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }
 
 /// Async DNS resolve. Returns Promise<string[]>.
 #[no_mangle]
 pub unsafe extern "C" fn ts_dns_resolve_async(hostname_val: TsVal, _rrtype: TsVal) -> TsVal {
     let hostname = val_to_string(hostname_val).unwrap_or_default();
-    let (resolved, notify) = make_promise_pair();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
     let r2 = resolved.clone();
     let n2 = notify.clone();
+    let bn2 = blocking_notify.clone();
     get_runtime().spawn(async move {
         let ips = tokio::task::spawn_blocking(move || {
             let mut result = Vec::new();
@@ -86,7 +88,7 @@ pub unsafe extern "C" fn ts_dns_resolve_async(hostname_val: TsVal, _rrtype: TsVa
             for ip in &ips { ts_arr_push(a, new_string(ip)); }
             a
         };
-        resolve_arc(&r2, &n2, arr);
+        resolve_arc(&r2, &n2, &bn2, arr);
     });
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }

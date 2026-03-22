@@ -97,10 +97,11 @@ pub unsafe extern "C" fn ts_release(ptr: *mut u8, destructor: Option<unsafe exte
         // Acquire fence: synchronize with all Release decrements from other threads
         // before we run the destructor and dealloc.
         std::sync::atomic::fence(Ordering::Acquire);
+        let tag = unsafe { (*header_ptr).tag };
+        let size = unsafe { (*header_ptr).size } as usize;
         if let Some(dtor) = destructor {
             unsafe { dtor(ptr) };
         }
-        let size = unsafe { (*header_ptr).size } as usize;
         let total_size = header_size + size;
         let layout = Layout::from_size_align(total_size, 8).expect("invalid layout");
         // Poison the refcount to catch use-after-free.

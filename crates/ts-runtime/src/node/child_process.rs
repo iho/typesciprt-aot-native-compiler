@@ -75,9 +75,10 @@ pub unsafe extern "C" fn ts_spawn_sync(cmd_val: TsVal, args_val: TsVal, _options
 #[no_mangle]
 pub unsafe extern "C" fn ts_exec_async(cmd_val: TsVal) -> TsVal {
     let cmd = val_to_string(cmd_val).unwrap_or_default();
-    let (resolved, notify) = make_promise_pair();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
     let r2 = resolved.clone();
     let n2 = notify.clone();
+    let bn2 = blocking_notify.clone();
     get_runtime().spawn(async move {
         let result = tokio::process::Command::new("sh")
             .arg("-c")
@@ -93,7 +94,7 @@ pub unsafe extern "C" fn ts_exec_async(cmd_val: TsVal) -> TsVal {
             }
             Err(e) => build_result_obj("", "", -1, Some(&e.to_string())),
         };
-        resolve_arc(&r2, &n2, obj);
+        resolve_arc(&r2, &n2, &bn2, obj);
     });
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }

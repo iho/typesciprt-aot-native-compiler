@@ -100,6 +100,18 @@ pub unsafe extern "C" fn ts_val_length(val: TsVal) -> TsVal {
                 let b = &*(val.as_ptr() as *const crate::node::buffer::TsBuffer);
                 return TsVal::from_i32(b.data.len() as i32);
             }
+            0 => {
+                // TsObject — might be a Buffer class instance with `_buf` field
+                use crate::value::ts_obj_get;
+                let inner = ts_obj_get(val, b"_buf\0".as_ptr() as *const i8);
+                if inner.is_ptr() && heap_tag(inner) == 17 {
+                    let b = &*(inner.as_ptr() as *const crate::node::buffer::TsBuffer);
+                    let len = b.data.len() as i32;
+                    crate::value::ts_release_val(inner);
+                    return TsVal::from_i32(len);
+                }
+                if inner.is_ptr() { crate::value::ts_release_val(inner); }
+            }
             _ => {}
         }
     }
@@ -194,11 +206,46 @@ pub unsafe extern "C" fn ts_val_includes(obj: TsVal, search: TsVal) -> TsVal {
 }
 
 /// Returns a substring or subarray from `start` to `end`.
-/// Dispatches to array slice for arrays, string slice for strings.
+/// Dispatches to array slice for arrays, string slice for strings, buffer slice for Buffers.
 #[no_mangle]
 pub unsafe extern "C" fn ts_str_slice(s_val: TsVal, start_val: TsVal, end_val: TsVal) -> TsVal {
     if s_val.is_ptr() && heap_tag(s_val) == 1 {
         return super::array::ts_arr_slice_range(s_val, start_val, end_val);
+    }
+    // TsBuffer (raw) — slice directly
+    if s_val.is_ptr() && heap_tag(s_val) == 17 {
+        use crate::node::buffer::{TsBuffer, HEAP_TAG_BUFFER};
+        let b = &*(s_val.as_ptr() as *const TsBuffer);
+        let len = b.data.len() as i32;
+        let norm = |idx: i32| -> usize {
+            if idx < 0 { (len + idx).max(0) as usize } else { (idx as usize).min(b.data.len()) }
+        };
+        let start = if start_val.is_int32() { norm(start_val.as_i32()) } else { 0 };
+        let end = if end_val.is_int32() { norm(end_val.as_i32()) } else { b.data.len() };
+        let sliced = if start <= end { b.data[start..end.min(b.data.len())].to_vec() } else { vec![] };
+        use crate::alloc::ts_alloc_rc;
+        let ptr = ts_alloc_rc(std::mem::size_of::<TsBuffer>(), HEAP_TAG_BUFFER);
+        std::ptr::write(ptr as *mut TsBuffer, TsBuffer { data: sliced });
+        return TsVal::from_ptr(ptr);
+    }
+    // TsObject — might be a Buffer class instance
+    if s_val.is_ptr() && heap_tag(s_val) == 0 {
+        use crate::value::ts_obj_get;
+        let inner = ts_obj_get(s_val, b"_buf\0".as_ptr() as *const i8);
+        let is_buffer = inner.is_ptr() && heap_tag(inner) == 17;
+        // Always release the inner ref — we only needed it to check the tag.
+        if inner.is_ptr() { crate::value::ts_release_val(inner); }
+        if is_buffer {
+            // Call the Buffer instance's `.slice(start, end)` method so the result is
+            // a properly-wrapped Buffer class instance (not a raw TsBuffer).
+            let slice_fn = ts_obj_get(s_val, b"slice\0".as_ptr() as *const i8);
+            if slice_fn.is_ptr() && heap_tag(slice_fn) == 4 {
+                let result = crate::value::func::ts_method_call2(slice_fn, s_val, start_val, end_val);
+                crate::value::ts_release_val(slice_fn);
+                return result;
+            }
+            if slice_fn.is_ptr() { crate::value::ts_release_val(slice_fn); }
+        }
     }
     if s_val.is_ptr() && heap_tag(s_val) == 2 {
         let s = &*(s_val.as_ptr() as *const TsString);

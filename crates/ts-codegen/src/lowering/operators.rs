@@ -366,6 +366,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             _ => bail!("unsupported logical operator: {:?}", logical.operator),
         }
 
+        // Release lhs in rhs_block: when we arrive here, lhs was NOT selected as the result
+        // (falsy for ||, truthy for &&) — release the owned ref we no longer need.
+        rhs_block.append_operation(func::call(
+            self.ctx,
+            FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+            &[lhs_i64],
+            &[],
+            self.loc,
+        ));
+
         let mut rhs_scope = orig_scope.clone();
         let (rhs_opt, nb) = self.lower_expression(&logical.right, rhs_block, region, &mut rhs_scope)?;
         let rhs_block = nb;
@@ -486,24 +496,61 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             .ok_or_else(|| anyhow::anyhow!("conditional ?: no test value"))?;
         let test_i1 = self.ensure_i1(test_val, block)?;
 
-        // For simplicity and matching current eager logical op behavior,
-        // we eagerly evaluate both branches and use `arith::select`.
-        // A true short-circuiting ?: would require a block split like `if/else`.
-        let (cons_val_opt, nb) = self.lower_expression(&cond.consequent, block, region, scope)?;
-        block = nb;
+        let i64t = self.i64_type();
+        let scope_keys: Vec<String> = scope.keys().cloned().collect();
+
+        // Normalise all scope values to i64 before branching (phi-node requirement).
+        for k in &scope_keys {
+            let v64 = self.ensure_i64(scope[k], block).unwrap_or(scope[k]);
+            scope.insert(k.clone(), v64);
+        }
+
+        // merge_block: arg[0] = ternary result (i64), arg[1..] = scope vars (i64 each).
+        let mut merge_types = vec![(i64t, self.loc)];
+        merge_types.extend(scope_keys.iter().map(|_| (i64t, self.loc)));
+        let merge_block = region.append_block(Block::new(&merge_types));
+
+        let then_block = region.append_block(Block::new(&[]));
+        let else_block = region.append_block(Block::new(&[]));
+
+        block.append_operation(cf::cond_br(
+            self.ctx, test_i1, &then_block, &else_block, &[], &[], self.loc,
+        ));
+
+        // Consequent (then) branch — only executed when test is truthy.
+        let mut then_scope = scope.clone();
+        let (cons_val_opt, then_end) =
+            self.lower_expression(&cond.consequent, then_block, region, &mut then_scope)?;
         let cons_val = cons_val_opt
             .ok_or_else(|| anyhow::anyhow!("conditional ?: no consequent value"))?;
-        let (alt_val_opt, nb) = self.lower_expression(&cond.alternate, block, region, scope)?;
-        block = nb;
+        let cons_i64 = self.ensure_i64(cons_val, then_end)?;
+        let mut then_args = vec![cons_i64];
+        for k in &scope_keys {
+            let v = *then_scope.get(k).unwrap_or(&scope[k]);
+            then_args.push(self.ensure_i64(v, then_end).unwrap_or(v));
+        }
+        self.terminate_with_br(then_end, &merge_block, &then_args);
+
+        // Alternate (else) branch — only executed when test is falsy.
+        let mut else_scope = scope.clone();
+        let (alt_val_opt, else_end) =
+            self.lower_expression(&cond.alternate, else_block, region, &mut else_scope)?;
         let alt_val = alt_val_opt
             .ok_or_else(|| anyhow::anyhow!("conditional ?: no alternate value"))?;
+        let alt_i64 = self.ensure_i64(alt_val, else_end)?;
+        let mut else_args = vec![alt_i64];
+        for k in &scope_keys {
+            let v = *else_scope.get(k).unwrap_or(&scope[k]);
+            else_args.push(self.ensure_i64(v, else_end).unwrap_or(v));
+        }
+        self.terminate_with_br(else_end, &merge_block, &else_args);
 
-        // Ensure both branches return i64 (to preserve heap pointers and NaN-boxed values).
-        let cons_i64 = self.ensure_i64(cons_val, block)?;
-        let alt_i64 = self.ensure_i64(alt_val, block)?;
+        // Update scope to use merge-block phi arguments (skip index 0 = result).
+        for (i, k) in scope_keys.iter().enumerate() {
+            scope.insert(k.clone(), merge_block.argument(i + 1)?.into());
+        }
 
-        let op = arith::select(test_i1, cons_i64, alt_i64, self.loc);
-        Ok((Some(block.append_operation(op).result(0)?.into()), block))
+        Ok((Some(merge_block.argument(0)?.into()), merge_block))
     }
 
     // ── Unary expressions ─────────────────────────────────────────────────

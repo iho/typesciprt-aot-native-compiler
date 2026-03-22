@@ -180,10 +180,13 @@ unsafe impl Send for TsNapiFunction {}
 unsafe impl Sync for TsNapiFunction {}
 
 /// Heap-allocated TypeScript Promise.
-/// The inner value lives in an `OnceLock`; a `Notify` wakes any blockers.
+/// - `resolved` / `notify`: wake async awaiters (Tokio Notify, used in `wait_for_promise`).
+/// - `blocking_notify`: wake blocking-thread awaiters via `std::sync::Condvar`
+///   (used in `block_until_resolved` from `spawn_blocking` threads).
 pub struct TsPromise {
-    pub resolved: std::sync::Arc<std::sync::OnceLock<TsVal>>,
-    pub notify:   std::sync::Arc<tokio::sync::Notify>,
+    pub resolved:        std::sync::Arc<std::sync::OnceLock<TsVal>>,
+    pub notify:          std::sync::Arc<tokio::sync::Notify>,
+    pub blocking_notify: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
 /// TsResponse heap type (tag=8).
@@ -314,6 +317,7 @@ pub use promise::{
     ts_promise_resolve, ts_promise_await, ts_promise_destructor,
     ts_promise_race, ts_promise_race_all, ts_promise_all, ts_promise_all_settled, ts_promise_any, ts_promise_reject,
     ts_promise_then, ts_promise_catch, ts_promise_finally,
+    ts_get_promise_constructor,
     ts_sleep,
     ts_set_timeout, ts_set_interval, ts_clear_timeout, ts_clear_interval, ts_queue_microtask,
     ts_async_spawn0, ts_async_spawn1, ts_async_spawn2, ts_async_spawn3, ts_async_spawn4,

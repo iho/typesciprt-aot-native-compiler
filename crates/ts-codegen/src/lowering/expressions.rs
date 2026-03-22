@@ -55,6 +55,28 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 self.lower_expression(&ts_nn.expression, block, region, scope)
             }
             Expression::StaticMemberExpression(member) => {
+                // global.Promise → ts_get_promise_constructor(); global.Buffer → ts_get_buffer_constructor()
+                if let Expression::Identifier(obj_id) = &member.object {
+                    if obj_id.name == "global" || obj_id.name == "globalThis" {
+                        let rt_name = match member.property.name.as_str() {
+                            "Promise" => Some("ts_get_promise_constructor"),
+                            "Buffer"  => Some("ts_get_buffer_constructor"),
+                            _ => None,
+                        };
+                        if let Some(rt) = rt_name {
+                            let val: Value<'c, 'b> = block.append_operation(func::call(
+                                self.ctx, FlatSymbolRefAttribute::new(self.ctx, rt),
+                                &[], &[self.i64_type()], self.loc,
+                            )).result(0)?.into();
+                            return Ok((Some(val), block));
+                        }
+                        // Unknown global property — return UNDEFINED
+                        let undef: Value<'c, 'b> = block.append_operation(arith::constant(
+                            self.ctx, IntegerAttribute::new(self.i64_type(), 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+                        )).result(0)?.into();
+                        return Ok((Some(undef), block));
+                    }
+                }
                 // process.argv → ts_process_argv(); process.env → ts_process_env()
                 if let Expression::Identifier(obj_id) = &member.object {
                     if obj_id.name == "process" {
@@ -3970,28 +3992,50 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         region: &'b Region<'c>,
         scope: &mut HashMap<String, Value<'c, 'b>>,
     ) -> Result<(Option<Value<'c, 'b>>, BlockRef<'c, 'b>)> {
-        // Handle `new X.Y(...)` — static member constructors we don't know about
-        // (e.g. `new Intl.DateTimeFormat(...)`) → evaluate all args for side effects,
-        // then return UNDEFINED as the result.
+        // Handle `new X.Y(...)` — evaluate the callee dynamically and call it as a constructor.
+        // e.g. `new this._Promise(executor)` where `this._Promise` is a Promise constructor function.
         if matches!(&new_expr.callee, Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)) {
             let i64t = self.i64_type();
+            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            // Evaluate the callee to get the constructor function value.
+            let (callee_v, nb) = self.lower_expression(&new_expr.callee, block, region, scope)?;
+            block = nb;
+            let callee_i64 = callee_v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64);
+            // Evaluate arguments.
+            let mut args: Vec<Value<'c, 'b>> = Vec::new();
             for arg in &new_expr.arguments {
                 if let Some(expr) = arg.as_expression() {
                     let (v_opt, nb) = self.lower_expression(expr, block, region, scope)?;
                     block = nb;
-                    if let Some(v) = v_opt {
-                        let v64 = self.ensure_i64(v, block)?;
-                        block.append_operation(func::call(
-                            self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                            &[v64], &[], self.loc,
-                        ));
-                    }
+                    args.push(v_opt.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64));
                 }
             }
-            let undef_val: Value<'c, 'b> = block.append_operation(arith::constant(
-                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            let call_func = match args.len() {
+                0 => "ts_func_call0",
+                1 => "ts_func_call1",
+                2 => "ts_func_call2",
+                3 => "ts_func_call3",
+                _ => "ts_func_call4",
+            };
+            let mut call_args = vec![callee_i64];
+            call_args.extend(args.iter().take(4).copied());
+            let result: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, call_func),
+                &call_args, &[i64t], self.loc,
             )).result(0)?.into();
-            return Ok((Some(undef_val), block));
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[callee_i64], &[], self.loc,
+            ));
+            for a in &args {
+                block.append_operation(func::call(
+                    self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                    &[*a], &[], self.loc,
+                ));
+            }
+            return Ok((Some(result), block));
         }
 
         let Expression::Identifier(callee_id) = &new_expr.callee else {
@@ -4033,6 +4077,30 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 }
             }
             return Ok((Some(target), block));
+        }
+
+        // new Promise(executor) → ts_promise_new(executor)
+        if class_name == "Promise" {
+            let i64t = self.i64_type();
+            let undef_i64: Value<'c, 'b> = block.append_operation(arith::constant(
+                self.ctx, IntegerAttribute::new(i64t, 0x7FF8_0000_0000_0000u64 as i64).into(), self.loc,
+            )).result(0)?.into();
+            let executor = if let Some(arg) = new_expr.arguments.first() {
+                if let Some(expr) = arg.as_expression() {
+                    let (v, nb) = self.lower_expression(expr, block, region, scope)?;
+                    block = nb;
+                    v.map(|v| self.ensure_i64(v, block)).transpose()?.unwrap_or(undef_i64)
+                } else { undef_i64 }
+            } else { undef_i64 };
+            let promise_val: Value<'c, 'b> = block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_promise_new"),
+                &[executor], &[i64t], self.loc,
+            )).result(0)?.into();
+            block.append_operation(func::call(
+                self.ctx, FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[executor], &[], self.loc,
+            ));
+            return Ok((Some(promise_val), block));
         }
 
         // Built-in constructors
@@ -4508,8 +4576,22 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             &result_types,
             self.loc,
         ));
+        let result: Value<'c, 'b> = op.result(0)?.into();
 
-        Ok((Some(op.result(0)?.into()), block))
+        // Release args after the call — callee treats them as borrowed, caller owns them.
+        // ts_release_val is a no-op for non-pointer values (UNDEFINED padding), so it's safe
+        // to release all args unconditionally.
+        for a in &args {
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[*a],
+                &[],
+                self.loc,
+            ));
+        }
+
+        Ok((Some(result), block))
     }
 
     // ── Template literals ─────────────────────────────────────────────────
@@ -5105,7 +5187,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, &name),
             TypeAttribute::new(func_type.into()),
             arrow_region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         );
         self.module.body().append_operation(op);

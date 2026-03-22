@@ -259,6 +259,24 @@ pub unsafe extern "C" fn ts_val_get_key(obj: TsVal, key: TsVal) -> TsVal {
     if tag == 1 && key.is_int32() {
         return super::array::ts_arr_get(obj, key.as_i32());
     }
+    // TsObject with integer key: check if it's a Buffer-like object (_buf → TsBuffer).
+    // Enables `buffer[i]` syntax used by pg-protocol's parser.
+    if tag == 0 && key.is_int32() {
+        let raw_buf = ts_obj_get(obj, b"_buf\0".as_ptr() as *const i8);
+        if raw_buf.is_ptr() && heap_tag(raw_buf) == 17 {
+            let b = &*(raw_buf.as_ptr() as *const crate::node::buffer::TsBuffer);
+            let idx = key.as_i32();
+            let result = if idx >= 0 && (idx as usize) < b.data.len() {
+                TsVal::from_i32(b.data[idx as usize] as i32)
+            } else {
+                UNDEFINED
+            };
+            ts_release_val(raw_buf);
+            return result;
+        }
+        ts_release_val(raw_buf);
+        // Fall through to regular string-key TsObject lookup.
+    }
     // Map or Headers with any key
     if tag == 5 || tag == 7 {
         return ts_map_get(obj, key);
@@ -276,6 +294,12 @@ pub unsafe extern "C" fn ts_val_get_key(obj: TsVal, key: TsVal) -> TsVal {
         let mut bytes = key_str.into_bytes();
         bytes.push(0u8);
         return ts_obj_get(obj, bytes.as_ptr() as *const i8);
+    }
+    // Buffer (tag 17): byte at integer index
+    if tag == 17 && key.is_int32() {
+        let b = &*(obj.as_ptr() as *const crate::node::buffer::TsBuffer);
+        let idx = key.as_i32() as usize;
+        return if idx < b.data.len() { TsVal::from_i32(b.data[idx] as i32) } else { UNDEFINED };
     }
     // String: character at integer index
     if tag == 2 && key.is_int32() {

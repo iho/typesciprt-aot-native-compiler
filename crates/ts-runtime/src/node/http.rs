@@ -14,7 +14,7 @@ use crate::value::{
     ts_obj_new, ts_obj_get, ts_obj_set, ts_obj_set_val_key,
     ts_func_call2,
 };
-use crate::value::promise::{get_runtime, ts_promise_await};
+use crate::value::promise::{get_runtime, ts_promise_await, acquire_js_lock, release_js_lock};
 use super::{new_string, val_to_string, val_to_i32};
 
 use hyper::server::conn::http1;
@@ -31,6 +31,9 @@ pub unsafe extern "C" fn ts_http_server_listen(port: TsVal, handler: TsVal) -> T
     let port_num = val_to_i32(port).max(0) as u16;
     ts_retain_val(handler);
     let handler_raw = handler.0; // Copy as u64 for Send across threads.
+
+    // Release the JS execution lock before entering the blocking server loop.
+    release_js_lock();
 
     get_runtime().block_on(async move {
         let addr = format!("0.0.0.0:{}", port_num);
@@ -65,6 +68,7 @@ pub unsafe extern "C" fn ts_http_server_listen(port: TsVal, handler: TsVal) -> T
 
                         let resp_data = get_runtime()
                             .spawn_blocking(move || unsafe {
+                                acquire_js_lock();
                                 let handler = TsVal(handler_raw);
 
                                 // --- Build req TsObject ---
@@ -130,7 +134,9 @@ pub unsafe extern "C" fn ts_http_server_listen(port: TsVal, handler: TsVal) -> T
                                 ts_release_val(req_obj);
                                 ts_release_val(res_obj);
 
-                                (status, body, resp_headers)
+                                let result = (status, body, resp_headers);
+                                release_js_lock();
+                                result
                             })
                             .await
                             .unwrap_or((500, String::new(), vec![]));

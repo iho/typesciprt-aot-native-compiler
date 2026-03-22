@@ -5,7 +5,7 @@ use super::array::{ts_arr_new, ts_arr_push};
 use super::object::{ts_obj_new, ts_obj_get, ts_obj_set};
 use super::map::{ts_map_set, map_key_eq};
 use super::uri::{rust_str_to_val, str_val_to_rust};
-use super::promise::{ts_promise_resolve, ts_promise_await, get_runtime, make_promise_pair, alloc_promise, resolve_arc};
+use super::promise::{ts_promise_resolve, ts_promise_await, get_runtime, make_promise_pair, alloc_promise, resolve_arc, acquire_js_lock, release_js_lock};
 use super::TsPromise;
 use super::func::dispatch_callback;
 use super::string_val::{ts_string_new, ts_val_to_string};
@@ -409,6 +409,11 @@ pub unsafe extern "C" fn ts_serve(port: i32, fetch_fn: TsVal) -> TsVal {
     ts_retain_val(fetch_fn);
     let fetch_raw = fetch_fn.0; // u64, Copy + Send
 
+    // ts_serve is called from TS code which holds the JS execution lock.
+    // Release it before entering the blocking server loop — per-request
+    // spawn_blocking tasks will re-acquire it around each handler invocation.
+    release_js_lock();
+
     get_runtime().block_on(async move {
         let addr = format!("0.0.0.0:{}", port);
         let listener = TcpListener::bind(&addr)
@@ -455,6 +460,7 @@ pub unsafe extern "C" fn ts_serve(port: i32, fetch_fn: TsVal) -> TsVal {
                         // Call TS handler on a blocking thread (not async-safe).
                         let hyper_resp = get_runtime()
                             .spawn_blocking(move || unsafe {
+                                acquire_js_lock();
                                 let fetch_fn = TsVal(fetch_raw);
                                 let ts_req = build_ts_request_from_parts(
                                     &method, &uri, &headers, body_bytes,
@@ -464,7 +470,9 @@ pub unsafe extern "C" fn ts_serve(port: i32, fetch_fn: TsVal) -> TsVal {
                                 ts_release_val(ts_req);
                                 // Await if Promise (consumes result, returns owned resolved value).
                                 let resolved = ts_promise_await(result);
-                                ts_response_to_hyper(resolved)
+                                let hyper_resp = ts_response_to_hyper(resolved);
+                                release_js_lock();
+                                hyper_resp
                             })
                             .await
                             .unwrap_or_else(|_| {
@@ -706,9 +714,10 @@ pub unsafe extern "C" fn ts_fetch(url: TsVal, init: TsVal) -> TsVal {
     }
 
     // Perform the request asynchronously using reqwest via the Tokio runtime.
-    let (resolved, notify) = make_promise_pair();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
     let r2 = resolved.clone();
     let n2 = notify.clone();
+    let bn2 = blocking_notify.clone();
 
     get_runtime().spawn(async move {
         let client = reqwest::Client::new();
@@ -761,12 +770,12 @@ pub unsafe extern "C" fn ts_fetch(url: TsVal, init: TsVal) -> TsVal {
                 }
             };
             ts_retain_val(ts_resp);
-            resolve_arc(&r2, &n2, ts_resp);
+            resolve_arc(&r2, &n2, &bn2, ts_resp);
             ts_release_val(ts_resp);
         }
     });
 
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────

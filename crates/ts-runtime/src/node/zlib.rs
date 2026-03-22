@@ -76,27 +76,25 @@ pub unsafe extern "C" fn ts_zlib_gunzip_sync(data_val: TsVal) -> TsVal {
 #[no_mangle]
 pub unsafe extern "C" fn ts_zlib_gzip_async(data_val: TsVal) -> TsVal {
     let bytes = val_to_bytes(data_val);
-    let (resolved, notify) = make_promise_pair();
-    let r2 = resolved.clone();
-    let n2 = notify.clone();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
+    let r2 = resolved.clone(); let n2 = notify.clone(); let bn2 = blocking_notify.clone();
     get_runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
             let _ = encoder.write_all(&bytes);
             encoder.finish().unwrap_or_default()
         }).await.unwrap_or_default();
-        resolve_arc(&r2, &n2, unsafe { alloc_buffer(result) });
+        resolve_arc(&r2, &n2, &bn2, unsafe { alloc_buffer(result) });
     });
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }
 
 /// Async gzip decompress. Returns Promise<Buffer>.
 #[no_mangle]
 pub unsafe extern "C" fn ts_zlib_gunzip_async(data_val: TsVal) -> TsVal {
     let bytes = val_to_bytes(data_val);
-    let (resolved, notify) = make_promise_pair();
-    let r2 = resolved.clone();
-    let n2 = notify.clone();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
+    let r2 = resolved.clone(); let n2 = notify.clone(); let bn2 = blocking_notify.clone();
     get_runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut decoder = GzDecoder::new(&bytes[..]);
@@ -104,36 +102,34 @@ pub unsafe extern "C" fn ts_zlib_gunzip_async(data_val: TsVal) -> TsVal {
             let _ = decoder.read_to_end(&mut out);
             out
         }).await.unwrap_or_default();
-        resolve_arc(&r2, &n2, unsafe { alloc_buffer(result) });
+        resolve_arc(&r2, &n2, &bn2, unsafe { alloc_buffer(result) });
     });
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }
 
 /// Async deflate compress. Returns Promise<Buffer>.
 #[no_mangle]
 pub unsafe extern "C" fn ts_zlib_deflate_async(data_val: TsVal) -> TsVal {
     let bytes = val_to_bytes(data_val);
-    let (resolved, notify) = make_promise_pair();
-    let r2 = resolved.clone();
-    let n2 = notify.clone();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
+    let r2 = resolved.clone(); let n2 = notify.clone(); let bn2 = blocking_notify.clone();
     get_runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
             let _ = encoder.write_all(&bytes);
             encoder.finish().unwrap_or_default()
         }).await.unwrap_or_default();
-        resolve_arc(&r2, &n2, unsafe { alloc_buffer(result) });
+        resolve_arc(&r2, &n2, &bn2, unsafe { alloc_buffer(result) });
     });
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }
 
 /// Async deflate decompress. Returns Promise<Buffer>.
 #[no_mangle]
 pub unsafe extern "C" fn ts_zlib_inflate_async(data_val: TsVal) -> TsVal {
     let bytes = val_to_bytes(data_val);
-    let (resolved, notify) = make_promise_pair();
-    let r2 = resolved.clone();
-    let n2 = notify.clone();
+    let (resolved, notify, blocking_notify) = make_promise_pair();
+    let r2 = resolved.clone(); let n2 = notify.clone(); let bn2 = blocking_notify.clone();
     get_runtime().spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut decoder = DeflateDecoder::new(&bytes[..]);
@@ -141,7 +137,7 @@ pub unsafe extern "C" fn ts_zlib_inflate_async(data_val: TsVal) -> TsVal {
             let _ = decoder.read_to_end(&mut out);
             out
         }).await.unwrap_or_default();
-        resolve_arc(&r2, &n2, unsafe { alloc_buffer(result) });
+        resolve_arc(&r2, &n2, &bn2, unsafe { alloc_buffer(result) });
     });
-    alloc_promise(TsPromise { resolved, notify })
+    alloc_promise(TsPromise { resolved, notify, blocking_notify })
 }

@@ -250,7 +250,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
                 StringAttribute::new(self.ctx, &fn_name),
                 TypeAttribute::new(fn_type.into()),
                 region,
-                &[],
+                &[(
+                    Identifier::new(self.ctx, "sym_visibility"),
+                    StringAttribute::new(self.ctx, "private").into(),
+                )],
                 self.loc,
             ));
             self.funcs.insert(fn_name.clone(), FuncSig {
@@ -311,11 +314,14 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         let entry  = region.append_block(Block::new(&param_specs));
         let mut scope: HashMap<String, Value<'_, '_>> = HashMap::new();
 
-        // Bind constructor parameters.
+        // Bind constructor parameters and track them as borrowed (unowned) refs.
+        let mut param_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(ctor) = constructor {
             for (i, param) in ctor.value.params.items.iter().enumerate() {
                 if let BindingPattern::BindingIdentifier(id) = &param.pattern {
-                    scope.insert(id.name.to_string(), entry.argument(i)?.into());
+                    let pname = id.name.to_string();
+                    param_names.insert(pname.clone());
+                    scope.insert(pname, entry.argument(i)?.into());
                 }
             }
         }
@@ -324,6 +330,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             let msg: Value<'_, '_> = entry.argument(0)?.into();
             scope.insert("__implicit_error_msg".to_string(), msg);
         }
+        let saved_fn_params = std::mem::replace(&mut self.current_fn_params, param_names);
 
         let mut current = entry;
 
@@ -651,6 +658,7 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             }
         }
         self.fn_return_type = saved_fn_return_type_cls;
+        self.current_fn_params = saved_fn_params;
 
         // Return `this`.
         if current.terminator().is_none() {
@@ -664,7 +672,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, &func_name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         ));
 
@@ -761,21 +772,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         if current.terminator().is_none() {
             if self.is_async {
-                let result_i64 = self.ensure_i64(result, current)?;
+                // Async implicit return: always resolve with UNDEFINED (void return).
+                // Do NOT use `result` — ExpressionStatement already released it.
+                let undef_i64: melior::ir::Value<'_, '_> = current.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                    self.loc,
+                )).result(0)?.into();
                 let promise: melior::ir::Value<'_, '_> = current.append_operation(melior::dialect::func::call(
                     self.ctx,
                     melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
-                    &[result_i64],
+                    &[undef_i64],
                     &[i64_type],
                     self.loc,
                 )).result(0)?.into();
-                current.append_operation(melior::dialect::func::call(
-                    self.ctx,
-                    melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                    &[result_i64],
-                    &[],
-                    self.loc,
-                ));
                 current.append_operation(melior::dialect::func::r#return(&[promise], self.loc));
             } else {
                 let result_i64 = self.ensure_i64(result, current)?;
@@ -790,7 +800,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, &func_name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         ));
 
@@ -853,7 +866,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, &func_name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         ));
 
@@ -915,7 +931,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, &func_name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         ));
 
@@ -984,21 +1003,20 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         if current.terminator().is_none() {
             if self.is_async {
-                let result_i64 = self.ensure_i64(result, current)?;
+                // Async implicit return: always resolve with UNDEFINED (void return).
+                // Do NOT use `result` — ExpressionStatement already released it.
+                let undef_i64: melior::ir::Value<'_, '_> = current.append_operation(arith::constant(
+                    self.ctx,
+                    IntegerAttribute::new(i64_type, 0x7FF8_0000_0000_0000u64 as i64).into(),
+                    self.loc,
+                )).result(0)?.into();
                 let promise: melior::ir::Value<'_, '_> = current.append_operation(melior::dialect::func::call(
                     self.ctx,
                     melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_promise_resolve"),
-                    &[result_i64],
+                    &[undef_i64],
                     &[i64_type],
                     self.loc,
                 )).result(0)?.into();
-                current.append_operation(melior::dialect::func::call(
-                    self.ctx,
-                    melior::ir::attribute::FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
-                    &[result_i64],
-                    &[],
-                    self.loc,
-                ));
                 current.append_operation(melior::dialect::func::r#return(&[promise], self.loc));
             } else {
                 let result_i64 = self.ensure_i64(result, current)?;
@@ -1012,7 +1030,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, &func_name),
             TypeAttribute::new(func_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         ));
 

@@ -1012,6 +1012,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         block = nb;
         let cond_val = cond_opt.ok_or_else(|| anyhow::anyhow!("if condition must produce a value"))?;
         let cond_i1 = self.ensure_i1(cond_val, block)?;
+        // Release condition if it was a heap value — ensure_i1 doesn't consume it.
+        if cond_val.r#type() == self.i64_type() {
+            block.append_operation(func::call(
+                self.ctx,
+                FlatSymbolRefAttribute::new(self.ctx, "ts_release_val"),
+                &[cond_val],
+                &[],
+                self.loc,
+            ));
+        }
 
         let scope_keys: Vec<String> = scope.keys().cloned().collect();
         // Normalize all scope variable types to i64 for the merge block to avoid type mismatches.
@@ -1036,8 +1046,13 @@ impl<'c, 'm> Lowerer<'c, 'm> {
         ));
 
         // Then branch
+        // Save current_fn_params so the else-branch sees the original state (not mutations
+        // from the then-branch). This prevents a param re-assigned in the then-branch from
+        // being incorrectly treated as "owned" when lowering the else-branch.
+        let saved_fn_params = self.current_fn_params.clone();
         let mut then_scope = scope.clone();
         let (_, then_end) = self.lower_statement(&if_stmt.consequent, then_block, region, &mut then_scope, loops)?;
+        let fn_params_after_then = std::mem::replace(&mut self.current_fn_params, saved_fn_params.clone());
         // Collect values as i64; only if block is not yet terminated.
         let then_vals: Vec<Value<'c, 'b>> = if then_end.terminator().is_none() {
             scope_keys.iter().map(|k| {
@@ -1049,8 +1064,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
 
         // Else branch
         let mut else_scope = scope.clone();
+        let fn_params_after_else;
         if let Some(alt) = &if_stmt.alternate {
             let (_, else_end) = self.lower_statement(alt, else_block, region, &mut else_scope, loops)?;
+            fn_params_after_else = self.current_fn_params.clone();
             let else_vals: Vec<Value<'c, 'b>> = if else_end.terminator().is_none() {
                 scope_keys.iter().map(|k| {
                     let v = *else_scope.get(k).unwrap_or(&scope[k]);
@@ -1059,9 +1076,16 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             } else { scope_keys.iter().map(|k| scope[k]).collect() };
             self.terminate_with_br(else_end, &merge_block, &else_vals);
         } else {
+            fn_params_after_else = saved_fn_params.clone();
             let orig_vals: Vec<Value<'c, 'b>> = scope_keys.iter().map(|k| scope[k]).collect();
             self.terminate_with_br(else_block, &merge_block, &orig_vals);
         }
+
+        // Post-merge fn_params: keep a param as "unowned" only if it remained unowned in
+        // BOTH branches (i.e., was not assigned in either branch). If a param was promoted
+        // to owned in any branch, it must be treated as owned at the merge point so that
+        // scope cleanup correctly releases it.
+        self.current_fn_params = fn_params_after_then.intersection(&fn_params_after_else).cloned().collect();
 
         // Update scope to use merge-block phi arguments.
         for (i, k) in scope_keys.iter().enumerate() {
@@ -2390,7 +2414,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             StringAttribute::new(self.ctx, &fn_name),
             TypeAttribute::new(fn_type.into()),
             region,
-            &[],
+            &[(
+                Identifier::new(self.ctx, "sym_visibility"),
+                StringAttribute::new(self.ctx, "private").into(),
+            )],
             self.loc,
         );
         self.module.body().append_operation(op);
@@ -2597,7 +2624,10 @@ impl<'c, 'm> Lowerer<'c, 'm> {
             self.ctx,
             melior::ir::attribute::StringAttribute::new(self.ctx, &fn_name),
             melior::ir::attribute::TypeAttribute::new(fn_type.into()),
-            region, &[], self.loc,
+            region, &[(
+                melior::ir::Identifier::new(self.ctx, "sym_visibility"),
+                melior::ir::attribute::StringAttribute::new(self.ctx, "private").into(),
+            )], self.loc,
         );
         self.module.body().append_operation(op);
         self.funcs.insert(fn_name.clone(), FuncSig {
