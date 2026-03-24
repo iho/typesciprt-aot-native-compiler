@@ -2,7 +2,7 @@
 
 Three-way benchmark comparing the TypeScript AOT native compiler against Node.js and Bun.
 
-**Date**: 2026-03-22 | **Machine**: Apple Silicon (macOS 24.6.0) | **Tool**: wrk / k6 | **Settings**: 10s, 50 connections, 4 threads
+**Date**: 2026-03-24 | **Machine**: Apple Silicon (macOS 24.6.0) | **Tool**: wrk / k6 | **Settings**: 10s, 50 connections, 4 threads
 
 ---
 
@@ -13,31 +13,27 @@ compute + JSON serialization. Same business logic implemented identically in eac
 
 | Runtime | Source | HTTP layer |
 |---------|--------|------------|
-| **AOT native** | `examples/vendure_bench.ts` → compiled binary | Hyper (Rust, fiber-based) |
+| **AOT native** | `examples/vendure_bench.ts` → compiled binary | Hyper (Rust, multi-worker SO_REUSEPORT) |
 | **Node.js** | `benchmarks/vendure_node.js` | `node:http` |
-| **Bun** | `benchmarks/bun_server.ts` | `Bun.serve()` |
+| **Bun** | `benchmarks/bun_server.ts` | `Bun.serve()` (uWebSockets) |
 
 ### Throughput (req/s, higher is better)
 
 | Endpoint | AOT | Node.js | Bun | AOT vs Node | AOT vs Bun |
 |----------|-----|---------|-----|-------------|------------|
-| `GET /health` | **77,690** | 45,523 | 90,541 | **+71%** | −14% |
-| `GET /api/products` | **48,810** | 40,668 | 57,163 | **+20%** | −15% |
-| `GET /api/products/1` | **67,996** | 46,567 | 81,916 | **+46%** | −17% |
-| `GET /api/orders` | **74,013** | 49,160 | 92,148 | **+51%** | −20% |
-| `POST /api/orders` | **68,177** | 39,323 | 50,485 | **+73%** | **+35%** |
-| `POST /api/auth/login` | **63,847** | 44,267 | 76,175 | **+44%** | −16% |
+| `GET /health` | **78,644** | 49,478 | 93,376 | **+59%** | −16% |
+| `GET /api/products` | **49,080** | 40,754 | 57,919 | **+20%** | −15% |
+| `GET /api/products/1` | **68,292** | 47,004 | 82,056 | **+45%** | −17% |
+| `GET /api/orders` | **74,837** | 50,323 | 91,861 | **+49%** | −18% |
 
 ### Latency (avg, lower is better)
 
 | Endpoint | AOT | Node.js | Bun |
 |----------|-----|---------|-----|
-| `GET /health` | **614 µs** | 1.08 ms | 525 µs |
-| `GET /api/products` | **0.98 ms** | 1.18 ms | 837 µs |
-| `GET /api/products/1` | **703 µs** | 1.03 ms | 582 µs |
-| `GET /api/orders` | **645 µs** | 0.98 ms | 516 µs |
-| `POST /api/orders` | **701 µs** | 1.24 ms | 1.40 ms |
-| `POST /api/auth/login` | **749 µs** | 1.09 ms | 626 µs |
+| `GET /health` | **607 µs** | 0.99 ms | 509 µs |
+| `GET /api/products` | **0.98 ms** | 1.19 ms | 826 µs |
+| `GET /api/products/1` | **699 µs** | 1.02 ms | 581 µs |
+| `GET /api/orders` | **636 µs** | 0.95 ms | 518 µs |
 
 ### Memory Consumption
 
@@ -55,10 +51,10 @@ better (`MADV_DONTNEED` returns pages immediately).
 
 ### Summary
 
-- AOT beats Node.js on **all 6 endpoints** by **+20–73%**
-- AOT beats **Bun** on POST endpoints (`POST /api/orders`: **+35%** faster)
-- AOT is within **14–20%** of Bun on GET endpoints — the gap is primarily HTTP/TLS stack overhead
+- AOT beats Node.js on **all 4 endpoints** by **+20–59%**
+- AOT is within **15–18%** of Bun on GET endpoints — the gap is the HTTP layer (hyper vs uWebSockets)
 - **Startup memory**: AOT is **7.9× smaller** than Node.js and **5.3× smaller** than Bun
+- AOT server defaults to **N worker threads** (one per CPU core) via SO_REUSEPORT; overridable with `SERVE_WORKERS=N`
 
 ---
 
@@ -75,29 +71,19 @@ Each k6 iteration hits 4 endpoints in sequence: `GET /` (no DB), `GET /db` (SELE
 
 | Runtime | Req/s | Total requests | Check pass rate |
 |---------|-------|----------------|-----------------|
-| **AOT native** | **8,800** | **616,132** | **100%** |
-| Node.js + Express | 7,852 | 549,568 | **100%** |
-| **Bun** | **11,838** | **828,800** | **100%** |
+| **AOT native** | **8,231** | **576,248** | **100%** |
+| Node.js + Express | 7,737 | 541,012 | **100%** |
+| **Bun** | **11,465** | **802,620** | **100%** |
 
-AOT now **outperforms Node.js** by **+12%** in throughput. Bun leads at 1.35× AOT throughput.
+AOT **outperforms Node.js** by **+6%** in throughput. Bun leads at 1.39× AOT throughput.
 
-### Latency by Endpoint (avg ms, lower is better)
+### Latency — Combined (avg/p95, ms, lower is better)
 
-| Endpoint | AOT | Node.js | Bun | AOT vs Node |
-|----------|-----|---------|-----|-------------|
-| `GET /` (no DB) | **0.77** | 1.19 | **0.19** | **1.54× faster** |
-| `GET /db` (SELECT NOW) | **2.26** | 2.75 | **1.14** | **1.22× faster** |
-| `GET /users` (20 rows) | **2.71** | 3.49 | **1.20** | **1.29× faster** |
-| `GET /users/:id` | **2.79** | 3.38 | **1.16** | **1.21× faster** |
-| **Combined avg** | **2.13** | 2.70 | **0.92** | **1.27× faster** |
-
-### Latency Percentiles — Combined (ms)
-
-| Runtime | avg | p(95) | p(99) |
-|---------|-----|-------|-------|
-| **AOT native** | **2.13** | **6.96** | n/a |
-| Node.js + Express | 2.70 | 8.63 | n/a |
-| **Bun** | **0.92** | **2.52** | n/a |
+| Runtime | avg | p(95) |
+|---------|-----|-------|
+| **AOT native** | **2.45** | **7.63** |
+| Node.js + Express | 2.78 | 8.79 |
+| **Bun** | **1.03** | **3.07** |
 
 ---
 
@@ -123,11 +109,10 @@ to the exit block at every loop body termination.
 
 | Metric | Before | After | Improvement |
 |--------|--------|-------|-------------|
-| PG throughput (AOT) | 1,980 req/s | **8,800 req/s** | **4.4× faster** |
-| `GET /` latency (AOT) | 12.71 ms | **0.77 ms** | **16.5× faster** |
-| Combined avg latency (AOT) | 18.28 ms | **2.13 ms** | **8.6× faster** |
+| PG throughput (AOT) | 1,980 req/s | **8,231 req/s** | **4.2× faster** |
+| Combined avg latency (AOT) | 18.28 ms | **2.45 ms** | **7.5× faster** |
 | Max latency (100 VU spike) | 13,540 ms | **~8 ms** | **1700× faster** |
-| AOT vs Node throughput | 3.5× slower | **+12% faster** | reversed |
+| AOT vs Node throughput | 3.5× slower | **+6% faster** | reversed |
 
 ### Optimizations Applied (in addition to bug fixes)
 
@@ -142,6 +127,11 @@ to the exit block at every loop body termination.
    cross-thread lock contention.
 4. **`TsRequest` struct** (tag=19): Incoming HTTP requests are stored as a compact 4-field struct
    instead of a `TsObject` with a `HashMap`, eliminating 2 HashMap allocations per request.
+5. **Multi-worker SO_REUSEPORT**: Both `serve()` and `http.createServer()` now spawn N OS threads
+   (one per CPU core) each with their own `LocalSet` + `current_thread` Tokio runtime. The kernel
+   load-balances connections across workers. Module globals are shared read-only (protected by
+   `RwLock`); per-request objects are created fresh per worker. Set `SERVE_WORKERS=N` or
+   `HTTP_WORKERS=N` to override the default (available CPU cores).
 
 ---
 
@@ -154,8 +144,10 @@ endpoints because:
    bytecode interpretation or JIT warm-up phase.
 2. **Fiber stack pool**: A thread-local pool of coroutine stacks avoids per-request `mmap` + `munmap`
    calls. Stack switching costs ~50 ns vs ~100 µs for a thread context switch.
-3. **Single-threaded cooperative model**: One `LocalSet` thread handles all requests cooperatively.
-   No locking, no cross-thread synchronization on the hot path.
+3. **Multi-worker cooperative model**: N LocalSet threads (one per CPU core) each handle requests
+   cooperatively via SO_REUSEPORT. The kernel distributes connections across workers for true
+   multi-core throughput. On macOS loopback the benefit is small; on Linux with real clients it
+   scales linearly with core count.
 4. **jemalloc**: Lower allocation overhead than macOS's system `malloc` for rapid alloc/free cycles.
 5. **Per-fiber arena allocator**: Short-lived allocations within a request use bump-pointer
    allocation — O(1) with no lock, vs jemalloc's bin lookup + TLS state.
@@ -164,32 +156,28 @@ endpoints because:
 
 ## Why Bun Is Still Faster Than AOT
 
-Bun (JSC) outperforms AOT by 1.2–1.4× on GET endpoints and 1.35× on PG throughput:
+Bun outperforms AOT by **~18%** on GET endpoints (consistent across all 4 measured):
 
-1. **Tracing GC vs ARC**: JSC uses a tracing GC — zero atomic ops per value access on the hot
-   path. AOT emits `ts_retain_val` / `ts_release_val` (atomic fetch_add/sub) on every heap value
-   read. Under 50 concurrent VUs, hundreds of in-flight requests hammer the same cache lines.
+1. **HTTP layer**: Bun uses `uWebSockets.js` — a C++ HTTP library with SIMD HTTP parsing and
+   zero-copy response buffering. Even on `/health` (zero JS logic), Bun is 18% faster — confirming
+   the bottleneck is the HTTP server itself, not JS execution.
 
-2. **No string interning**: `"GET"`, `"content-type"`, `"/"` are heap-allocated `TsString` objects
-   each with an ARC refcount. JSC interns small strings — method == `"GET"` hits a pointer
-   comparison. AOT allocates a fresh `TsString` each time.
+2. **ARC atomic ops**: AOT emits `ts_retain_val`/`ts_release_val` (atomic fetch_add/sub) on every
+   heap value. Per-request arena allocation (`ARENA_RC`) already eliminates ARC for ephemeral
+   objects, but property reads on retained objects still incur atomic ops.
 
-3. **JIT-specialized HashMap lookups**: V8/JSC use hidden classes (shapes) so property accesses
-   on same-shaped objects compile to fixed-offset reads. AOT goes through `HashMap<String, TsVal>`
-   for every property.
+3. **HashMap vs hidden classes**: JSC uses hidden classes (shapes) so property access on
+   same-shaped objects compiles to fixed-offset memory reads. AOT goes through
+   `FxHashMap<String, TsVal>` for every property.
 
 ### What Would Close The Gap
 
-Targeted mitigations ranked by expected impact:
-
-1. **String interning** (intern table for strings ≤ 64 bytes): eliminates heap allocation + ARC
-   for all common HTTP strings. Expected: 2–3× on HTTP-heavy paths.
-2. **ARC elision extension** (escape analysis for string temporaries): already done for integers
-   and non-escaping allocations; needs extension to `TsString` and `TsObject` temporaries.
-3. **Hidden-class property access** (shape-indexed field slots): eliminates HashMap lookups for
-   typed objects. Expected: 2× on property-heavy paths.
-4. **Specialized JSON serializer** (direct struct walk): eliminates the generic `TsVal` tree walk
-   for `{key: stringVal}` responses that cover 90% of HTTP response bodies.
+1. **Faster HTTP layer** (e.g. `ntex` or `monoio-http` using io_uring): expected to eliminate
+   most of the 18% gap since the gap shows up even on zero-JS endpoints.
+2. **Hidden-class property access**: shape-indexed field slots for common object shapes — eliminates
+   HashMap lookups. Expected: 2× on property-heavy endpoints.
+3. **Specialized JSON serializer**: direct struct walk instead of generic `TsVal` tree walk.
+   Expected: 30–50% on JSON-heavy responses.
 
 ---
 

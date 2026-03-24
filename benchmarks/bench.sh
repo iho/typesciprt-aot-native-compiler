@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Benchmark: TypeScript AOT native compiler vs Node.js
-# Compares vendure_bench.ts (AOT compiled) against vendure_node.js (Node.js)
+# Benchmark: TypeScript AOT native compiler vs Node.js vs Bun
+# Compares vendure_bench.ts (AOT compiled) against vendure_node.js (Node.js) and bun_server.ts (Bun)
 #
-# Requirements: wrk, node, cargo
+# Requirements: wrk, node, bun, cargo
 # Install wrk: brew install wrk (macOS) / apt install wrk (Linux)
 
 set -euo pipefail
@@ -12,6 +12,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AOT_PORT=19888
 NODE_PORT=19889
+BUN_PORT=19890
 DURATION=10
 CONNECTIONS=50
 THREADS=4
@@ -33,11 +34,15 @@ cleanup() {
   info "Stopping servers..."
   kill "$AOT_PID" 2>/dev/null || true
   kill "$NODE_PID" 2>/dev/null || true
+  kill "$BUN_PID" 2>/dev/null || true
   wait "$AOT_PID" 2>/dev/null || true
   wait "$NODE_PID" 2>/dev/null || true
+  wait "$BUN_PID" 2>/dev/null || true
 }
 
 TOOL=""
+
+HAS_BUN=0
 
 check_deps() {
   if command -v wrk &>/dev/null; then
@@ -53,6 +58,11 @@ check_deps() {
   if ! command -v node &>/dev/null; then
     error "node not found"
     exit 1
+  fi
+  if command -v bun &>/dev/null; then
+    HAS_BUN=1
+  else
+    warn "bun not found — skipping Bun comparison"
   fi
 }
 
@@ -116,14 +126,29 @@ info "Starting Node.js server (port $NODE_PORT)..."
 PORT=$NODE_PORT node "$SCRIPT_DIR/vendure_node.js" &>/dev/null &
 NODE_PID=$!
 
+BUN_PID=""
+if [[ "$HAS_BUN" == "1" ]]; then
+  info "Starting Bun server (port $BUN_PORT)..."
+  PORT=$BUN_PORT bun run "$SCRIPT_DIR/bun_server.ts" &>/dev/null &
+  BUN_PID=$!
+fi
+
 trap cleanup EXIT
 
 wait_for_port $AOT_PORT "AOT" $AOT_PID
 wait_for_port $NODE_PORT "Node.js" $NODE_PID
+if [[ "$HAS_BUN" == "1" ]]; then
+  wait_for_port $BUN_PORT "Bun" $BUN_PID
+fi
+
+HEADER="TypeScript AOT Native Compiler — Multi-Runtime Benchmark"
+if [[ "$HAS_BUN" == "1" ]]; then
+  HEADER="TypeScript AOT Native Compiler vs Node.js vs Bun"
+fi
 
 echo ""
 echo -e "${BOLD}════════════════════════════════════════════════════════${RESET}"
-echo -e "${BOLD}  TypeScript AOT Native Compiler vs Node.js Benchmark    ${RESET}"
+echo -e "${BOLD}  ${HEADER}  ${RESET}"
 echo -e "${BOLD}════════════════════════════════════════════════════════${RESET}"
 echo -e "  Duration: ${DURATION}s | Connections: ${CONNECTIONS} | Threads: ${THREADS}"
 echo ""
@@ -149,6 +174,13 @@ URLS_NODE=(
   "http://$HOST:$NODE_PORT/api/orders"
 )
 
+URLS_BUN=(
+  "http://$HOST:$BUN_PORT/health"
+  "http://$HOST:$BUN_PORT/api/products"
+  "http://$HOST:$BUN_PORT/api/products/1"
+  "http://$HOST:$BUN_PORT/api/orders"
+)
+
 for i in "${!ENDPOINTS[@]}"; do
   endpoint="${ENDPOINTS[$i]}"
   info "Benchmarking: $endpoint"
@@ -161,18 +193,37 @@ for i in "${!ENDPOINTS[@]}"; do
   node_rps=$(echo "$node_out" | extract_rps)
   node_lat=$(echo "$node_out" | extract_latency)
 
-  ratio=$(awk "BEGIN {printf \"%.2f\", $aot_rps / $node_rps}" 2>/dev/null || echo "?")
-
   echo ""
   echo -e "  ${BOLD}$endpoint${RESET}"
   printf "  %-20s  %12s req/s  %10s avg latency\n" "AOT (tscc):" "$aot_rps" "$aot_lat"
   printf "  %-20s  %12s req/s  %10s avg latency\n" "Node.js:" "$node_rps" "$node_lat"
-  cmp=$(awk "BEGIN {print ($aot_rps > $node_rps) ? 1 : 0}" 2>/dev/null || echo 0)
-  if [[ "$cmp" == "1" ]]; then
-    echo -e "  ${GREEN}AOT is ${ratio}x faster${RESET}"
+
+  if [[ "$HAS_BUN" == "1" ]]; then
+    bun_out=$(run_bench "${URLS_BUN[$i]}")
+    bun_rps=$(echo "$bun_out" | extract_rps)
+    bun_lat=$(echo "$bun_out" | extract_latency)
+    printf "  %-20s  %12s req/s  %10s avg latency\n" "Bun:" "$bun_rps" "$bun_lat"
+  fi
+
+  # AOT vs Node.js comparison
+  cmp_node=$(awk "BEGIN {print ($aot_rps > $node_rps) ? 1 : 0}" 2>/dev/null || echo 0)
+  if [[ "$cmp_node" == "1" ]]; then
+    ratio=$(awk "BEGIN {printf \"%.2f\", $aot_rps / $node_rps}" 2>/dev/null || echo "?")
+    echo -e "  ${GREEN}AOT is ${ratio}x faster than Node.js${RESET}"
   else
     inv=$(awk "BEGIN {printf \"%.2f\", $node_rps / $aot_rps}" 2>/dev/null || echo "?")
-    echo -e "  ${YELLOW}Node.js is ${inv}x faster${RESET}"
+    echo -e "  ${YELLOW}Node.js is ${inv}x faster than AOT${RESET}"
+  fi
+
+  if [[ "$HAS_BUN" == "1" ]]; then
+    cmp_bun=$(awk "BEGIN {print ($aot_rps > $bun_rps) ? 1 : 0}" 2>/dev/null || echo 0)
+    if [[ "$cmp_bun" == "1" ]]; then
+      ratio_bun=$(awk "BEGIN {printf \"%.2f\", $aot_rps / $bun_rps}" 2>/dev/null || echo "?")
+      echo -e "  ${GREEN}AOT is ${ratio_bun}x faster than Bun${RESET}"
+    else
+      inv_bun=$(awk "BEGIN {printf \"%.2f\", $bun_rps / $aot_rps}" 2>/dev/null || echo "?")
+      echo -e "  ${YELLOW}Bun is ${inv_bun}x faster than AOT${RESET}"
+    fi
   fi
 done
 

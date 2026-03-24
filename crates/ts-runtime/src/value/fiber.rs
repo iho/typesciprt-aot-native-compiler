@@ -23,41 +23,47 @@
 //! holding the global JS lock on a `spawn_blocking` thread.
 
 use std::cell::{Cell, RefCell};
-use std::sync::OnceLock as StdOnceLock;
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use corosensei::stack::DefaultStack;
 
-// ── Global LocalSet fiber channel ────────────────────────────────────────────
+// ── Per-worker LocalSet fiber channel ────────────────────────────────────────
 //
-// When `ts_serve` (or any LocalSet-based server) starts, it registers an
-// UnboundedSender here.  Any thread can then call `schedule_fiber()` to post
-// a JsFiber onto the LocalSet without needing the global JS lock.
+// Each HTTP worker thread registers its own UnboundedSender here via
+// `register_local_set_tx`.  When `schedule_fiber` is called from within a
+// worker thread (e.g. from a promise .then callback), it sends the fiber to
+// *that worker's* LocalSet — no cross-worker coordination needed.
+//
+// Threads that have no LocalSet (e.g. spawn_blocking threads) see `None` and
+// fall back to the spawn_blocking + JS-lock path in promise.rs.
 
-static LOCAL_FIBER_TX: StdOnceLock<tokio::sync::mpsc::UnboundedSender<JsFiber>> =
-    StdOnceLock::new();
+thread_local! {
+    static WORKER_FIBER_TX: RefCell<Option<tokio::sync::mpsc::UnboundedSender<JsFiber>>> =
+        RefCell::new(None);
+}
 
-/// Register the LocalSet's fiber intake channel.  Called once from `ts_serve`
-/// before entering the event loop.
+/// Register this thread's LocalSet fiber channel.  Called once per worker
+/// thread before it starts accepting connections.
 pub fn register_local_set_tx(tx: tokio::sync::mpsc::UnboundedSender<JsFiber>) {
-    // If already set (e.g. server restarted in tests), ignore — the existing
-    // sender may or may not still be valid, but we can't overwrite an OnceLock.
-    let _ = LOCAL_FIBER_TX.set(tx);
+    WORKER_FIBER_TX.with(|cell| { *cell.borrow_mut() = Some(tx); });
 }
 
-/// Returns a clone of the LocalSet sender, or `None` if no LocalSet is active.
+/// Returns a clone of this thread's LocalSet sender, or `None` if this thread
+/// has no LocalSet (not a worker thread).
 pub fn get_local_set_tx() -> Option<tokio::sync::mpsc::UnboundedSender<JsFiber>> {
-    LOCAL_FIBER_TX.get().cloned()
+    WORKER_FIBER_TX.with(|cell| cell.borrow().clone())
 }
 
-/// Schedule `fiber` to run on the active LocalSet.  Returns `true` if
-/// successfully queued, `false` if no LocalSet is registered (caller should
+/// Schedule `fiber` to run on this thread's LocalSet.  Returns `true` if
+/// successfully queued, `false` if this thread has no LocalSet (caller should
 /// fall back to `spawn_blocking` + JS lock).
 pub fn schedule_fiber(fiber: JsFiber) -> bool {
-    if let Some(tx) = LOCAL_FIBER_TX.get() {
-        tx.send(fiber).is_ok()
-    } else {
-        false
-    }
+    WORKER_FIBER_TX.with(|cell| {
+        if let Some(tx) = &*cell.borrow() {
+            tx.send(fiber).is_ok()
+        } else {
+            false
+        }
+    })
 }
 
 // ── Thread-local suspend handle ───────────────────────────────────────────────

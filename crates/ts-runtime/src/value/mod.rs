@@ -302,7 +302,7 @@ pub use func::{
     ts_method_call0, ts_method_call1, ts_method_call2, ts_method_call3, ts_method_call4,
 };
 pub use object::{
-    ts_obj_new, ts_error_new, ts_obj_get, ts_obj_set, ts_obj_delete, ts_obj_delete_key,
+    ts_obj_new, ts_obj_new_arena, ts_error_new, ts_obj_get, ts_obj_set, ts_obj_delete, ts_obj_delete_key,
     ts_val_has_key, ts_obj_set_val_key, ts_val_get_key,
     ts_obj_rest, ts_obj_keys, ts_obj_values, ts_obj_entries, ts_obj_merge,
     ts_obj_assign, ts_obj_create, ts_obj_from_entries,

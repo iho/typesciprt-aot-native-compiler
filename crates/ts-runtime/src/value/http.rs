@@ -2,7 +2,7 @@
 
 use super::{TsVal, TsMap, TsObject, TsString, TsResponse, TsRequest, UNDEFINED, NULL, heap_tag, ts_retain_val, ts_release_val};
 use super::array::{ts_arr_new, ts_arr_push};
-use super::object::{ts_obj_new, ts_obj_get, ts_obj_set};
+use super::object::{ts_obj_new, ts_obj_new_arena, ts_obj_get, ts_obj_set};
 use super::map::{ts_map_set, map_key_eq};
 use super::uri::{rust_str_to_val, str_val_to_rust};
 use super::promise::{ts_promise_resolve, ts_promise_await, get_runtime, make_promise_pair, alloc_promise, resolve_arc, release_js_lock};
@@ -415,7 +415,7 @@ pub(super) unsafe fn ts_response_to_hyper(
 
 /// Create a TCP socket with SO_REUSEPORT so multiple worker threads can each
 /// bind to the same port and have the kernel load-balance incoming connections.
-unsafe fn bind_reuseport(port: u16) -> std::io::Result<std::net::TcpListener> {
+pub(crate) unsafe fn bind_reuseport(port: u16) -> std::io::Result<std::net::TcpListener> {
     use std::os::unix::io::FromRawFd;
     let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
@@ -539,7 +539,7 @@ pub unsafe extern "C" fn ts_serve(port: i32, fetch_fn: TsVal) -> TsVal {
     let nworkers: usize = std::env::var("SERVE_WORKERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
         .max(1);
 
     // Retain once for the main worker; extra retains for each additional worker.
