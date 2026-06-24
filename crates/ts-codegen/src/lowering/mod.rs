@@ -45,10 +45,18 @@ use crate::CodegenContext;
 
 mod statements;
 mod expressions;
+mod call;
+mod optional;
+mod closures;
+mod free_vars;
+mod analysis;
 mod literals;
 mod operators;
 mod classes;
 mod enums;
+
+pub(crate) use free_vars::{NameSet, collect_free_vars_stmts, compute_cell_vars_for_body, body_uses_arguments, collect_locals_binding, predeclare_binding};
+pub(crate) use analysis::{compute_scalar_vars_for_body, compute_non_escaping_allocs};
 
 // ── Function signature table ──────────────────────────────────────────────────
 
