@@ -600,15 +600,21 @@ curl http://localhost:8080/hello/Alice  # Hello Alice!
 ## CLI
 
 ```bash
-tscc [OPTIONS] <input.ts>
+tscc [OPTIONS] <INPUT>
 
-OPTIONS:
-  -o, --output <PATH>   Output file path (default: strips .ts extension)
-  --emit-mlir           Print MLIR and exit
-  --emit-llvm           Print LLVM IR and exit
-  -O <LEVEL>            Optimization level: 0-3 (default: 2)
-  -v, --verbose         Enable debug logging
-  -h, --help            Show help
+Arguments:
+  <INPUT>  Input TypeScript source file
+
+Options:
+  -o, --output <OUTPUT>  Output file path (default: replaces `.ts` extension with no extension)
+      --emit-mlir        Emit MLIR IR and exit (dont compile to native)
+      --emit-llvm        Emit LLVM IR and exit
+  -O <OPT_LEVEL>         Optimisation level: 0-3 [default: 2]
+  -v, --verbose          Enable verbose logging
+      --link-lib <PATH>  Extra native libraries to link (e.g. --link-lib /path/to/libmydb.a). Use this to link C/Rust FFI libraries called via `declare function`
+      --emit-node-addon  Compile to a Node.js native addon (.node file) instead of a standalone binary. Export functions are exposed as module exports loadable via require('./output.node')
+  -h, --help             Print help
+  -V, --version          Print version
 ```
 
 Debugging:
